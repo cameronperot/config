@@ -155,6 +155,10 @@ include:
           - pattern: '^uv-receipt\.json$'
             optional: true
       - waybar
+      - path: git
+        optional: true
+        include:
+          - ignore
       - path: redshift.conf
         optional: true
       - path: io.datasette.llm
@@ -385,8 +389,6 @@ exclude:
   - pattern: '^\.config/neofetch$'
     optional: true
   - pattern: '^\.config/easyeffects$'
-    optional: true
-  - pattern: '^\.config/git$'
     optional: true
   - pattern: '^\.config/lazygit$'
     optional: true

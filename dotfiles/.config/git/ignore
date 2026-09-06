@@ -1,0 +1,19 @@
+# ---- Temp & backup ----
+*.tmp
+*.bak
+
+# ---- Language caches ----
+__pycache__/
+*.py[cod]
+node_modules/
+venv/
+.venv/
+.cache/
+
+# ---- Credentials / secrets ----
+*.p12
+*.pfx
+.ssh/
+auth.*
+credentials.*
+secrets.*
