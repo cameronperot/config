@@ -1,16 +1,11 @@
 #!/usr/bin/env bash
+# Launch pi, omp, opencode or claude with a restricted filesystem view.
+# Persistent writes go to the workspace and selected agent state; the rest
+# of the home directory is hidden behind tmpfs. Network access is shared.
+# See docs/agent-sandbox.md in the repository for usage and isolation limits.
 #
-# agent-sandbox — launch a terminal LLM coding agent (pi, omp,
-# opencode, claude) inside a bubblewrap sandbox.
-#
-# The sandbox exposes: the read-only system tree, a read-only slice of
-# $HOME (identity + toolchains), the invoked agent's own state dirs
-# (read-write), the current workspace (read-write, same absolute path),
-# and the ssh-agent socket. Everything else is absent or ephemeral.
-# Network is shared (LLM API egress); bwrap cannot filter it.
-#
-# Usage: agent-sandbox [script-flags] <agent> [agent-args...]
-# All arguments after <agent> are passed to the agent verbatim.
+# Usage: agent-sandbox [script-flags] [--] <agent> [agent-args...]
+# Once <agent> is parsed, every remaining argument belongs to that agent.
 
 set -euo pipefail
 
@@ -31,18 +26,54 @@ declare -rA AGENT_EXE=(
     [claude]="${HOME_DIR}/.local/bin/claude"
 )
 
-# $HOME-relative state dirs, space-separated. ~/.agent is shared across
-# all agents by design.
+# Space-separated paths relative to HOME. All agents share .agent;
+# opencode also needs a persistent opentui cache to avoid fetching its
+# tree-sitter assets each session. Its config is mounted separately below.
 declare -rA AGENT_STATE_DIRS=(
     [pi]=".agent .pi"
     [omp]=".agent .omp"
-    [opencode]=".agent .opencode .local/share/opencode .local/state/opencode"
+    [opencode]=".agent .opencode .local/share/opencode .local/state/opencode \
+.local/share/opentui"
     [claude]=".agent .claude .local/state/claude"
 )
 
-# claude needs nested user namespaces for its own bwrap-based bash
-# sandboxing; the others get --disable-userns when the environment
-# allows it (see probe_userns_blockable).
+# Expose individual toolchain and CLI config paths, not all of .local or
+# .config: those trees also hold other agents' credentials and gh login state.
+# Git config is selected by file to exclude .config/git/credentials.
+# Editor config is omitted, so core.editor=nvim uses Neovim's defaults.
+readonly -a HOME_RO_PATHS=(
+    .config/git/config .config/git/ignore .config/git/attributes
+    .config/pip .config/pnpm .config/uv
+    .local/bin .local/lib .local/share/claude .local/share/pnpm
+    .local/share/uv
+)
+
+# Keep npm/bun release-age settings when the lightweight credential scan
+# permits it. Scan whole lines, including comments; this does not parse TOML
+# or decode escapes. These files are expected to contain no secrets.
+readonly -a PACKAGE_RC_FILES=(.npmrc .bunfig.toml)
+readonly PACKAGE_RC_CREDENTIAL_RE='(_auth|token|password|username|://[^/]*@)'
+
+# Mount these paths read-only after their writable state directories.
+# Pin the shared .agent targets as well as agent-local skills/prompts;
+# pi/omp may use symlinks whose entries remain replaceable in writable state.
+# Pin all of opencode's config tree because it discovers plugins and tools
+# by directory name. Its package installs therefore belong on the host.
+# Claude's plugin cache remains writable for installs.
+declare -rA AGENT_RO_PATHS=(
+    [pi]=".agent/skills .agent/prompts .agent/rules .pi/agent/skills \
+.pi/agent/prompts .pi/agent/settings.json .pi/agent/guard-rules.json \
+.pi/agent/AGENTS.md .pi/agent/agents .pi/agent/extensions"
+    [omp]=".agent/skills .agent/prompts .agent/rules .omp/agent/skills \
+.omp/agent/prompts .omp/agent/config.yml .omp/agent/AGENTS.md \
+.omp/agent/extensions"
+    [opencode]=".agent/skills .agent/prompts .agent/rules .config/opencode"
+    [claude]=".agent/skills .agent/prompts .agent/rules .claude/settings.json \
+.claude/skills .claude/rules .claude/agents .claude/commands"
+)
+
+# Claude needs nested user namespaces for its own Bash sandbox. For the
+# other agents, disable nesting only if the runtime probe succeeds.
 declare -rA AGENT_DISABLE_USERNS=(
     [pi]=1
     [omp]=1
@@ -50,18 +81,45 @@ declare -rA AGENT_DISABLE_USERNS=(
     [claude]=0
 )
 
-# Prefixes that must never contain a rw workspace bind: system dirs,
-# plus paths the sandbox shadows with tmpfs (a bind there would be
-# silently hidden, which is worse than an error).
+# Never use system paths as writable workspaces. Paths hidden by later
+# tmpfs/proc/dev mounts are rejected too, rather than accepting a hidden bind.
 readonly -a DENY_PREFIXES=(
     /usr /bin /sbin /lib /lib64 /etc /opt /var /boot /root /srv
     /tmp /run /proc /sys /dev
 )
 
-readonly -a API_KEY_VARS=(OPENROUTER_API_KEY OPENCODE_API_KEY GEMINI_API_KEY)
+readonly -a API_KEY_VARS=(
+    ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY OPENCODE_API_KEY
+    GEMINI_API_KEY
+)
+
+# These values do not name files that need mounting; copy them verbatim.
+readonly -a FORWARD_VARS=(
+    TERM COLORTERM LANG LC_ALL LC_CTYPE LC_MESSAGES LC_COLLATE LC_NUMERIC
+    LC_TIME TZ http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY
+    NO_PROXY
+)
+
+# Validate each path's resolved target against the exposed directory trees.
+# Forward the canonical target so hidden symlink spellings are not needed.
+# Colon-separated SSL_CERT_DIR/TERMINFO_DIRS are omitted
+# because this check handles one path at a time.
+readonly -a FORWARD_PATH_VARS=(
+    TERMINFO SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE
+    CURL_CA_BUNDLE
+)
+
+# Recognized first fields for public-key files. This is a format screen;
+# it does not validate the key blob cryptographically.
+readonly -a SSH_PUBKEY_TYPES=(
+    ssh-ed25519 ssh-rsa ecdsa-sha2-nistp256 ecdsa-sha2-nistp384
+    ecdsa-sha2-nistp521 sk-ssh-ed25519@openssh.com
+    sk-ecdsa-sha2-nistp256@openssh.com
+)
 
 bwrap_args=()
 agent_args=()
+state_dirs=()
 agent=""
 exe=""
 cwd_physical=""
@@ -69,22 +127,27 @@ workspace=""
 git_common_dir=""
 ssh_sock=""
 signing_key_file=""
+signing_pubkey=""
+rc_files=()
+parent_dirs=()
 userns_blockable=0
 dry_run=0
 verbose=0
 
 usage() {
     cat <<EOF
-Usage: ${0##*/} [script-flags] <agent> [agent-args...]
+Usage: ${0##*/} [script-flags] [--] <agent> [agent-args...]
 
 Launch a terminal LLM coding agent inside a bubblewrap sandbox. The
-host home directory is hidden; the agent sees only identity files,
-toolchains, its own state dirs, and the current workspace.
+host home directory is hidden; the agent sees only a read-only
+allowlist (toolchains, non-secret CLI configs, .gitconfig,
+.ssh/allowed_signers, credential-free .npmrc and .bunfig.toml), its own
+state dirs, and the current workspace.
 
 Agents: pi, omp, opencode, claude
 
-Script flags (must precede <agent>; everything after <agent> is passed
-to the agent verbatim):
+Script flags (must precede <agent>; "--" ends them; everything after
+<agent> is passed to the agent verbatim):
   -h, --help     show this help
   -v, --verbose  report resolution decisions on stderr
   --debug        trace execution (set -x); API key values stay hidden
@@ -95,6 +158,7 @@ Examples:
   ${0##*/} pi
   ${0##*/} --dry-run claude
   ${0##*/} claude --dry-run     # --dry-run goes to claude, not this script
+  ${0##*/} -- pi -v             # "--" ends the script flags; -v goes to pi
   ${0##*/} -v opencode
 
 Environment:
@@ -106,12 +170,29 @@ Environment:
 
 Notes:
   Run from inside the project the agent should work on; the git
-  toplevel (or the cwd when outside git) is bind-mounted read-write.
+  toplevel (or the cwd when outside git) is bind-mounted read-write and
+  the directories above it are read-only mounts.
+  \$HOME must be canonical: symlinked components and a trailing slash
+  are refused.
   claude: the sandbox sets CLAUDE_CONFIG_DIR=\$HOME/.claude so all
   state lives in one rw dir; sandboxed and host runs diverge unless the
   same variable is also exported on the host.
   ~/.agent is shared across all agents by design.
-  Commit from inside the sandbox, push from the host (no GH_TOKEN).
+  The agent's config files (settings, instructions, rules, skills,
+  prompts, guard rules, subagents, extensions) are pinned read-only on
+  top of its state dirs, and opencode's whole ~/.config/opencode is
+  read-only; absent JSON files and directories are seeded empty on the
+  host so the pin always applies. Edit them, and install opencode
+  plugins, on the host.
+  pi-create-skill and pi-create-prompt write into pinned paths, so they
+  work only on the host.
+  ~/.local and ~/.config are writable ephemeral directories inside the
+  sandbox; only the allowlisted entries beneath them come from the host.
+  The ssh-agent socket is forwarded only when gpg.format is ssh and the
+  agent holds exactly the configured user.signingkey.
+  Pushes need credentials the sandbox does not forward, and gh is
+  unauthenticated inside (~/.config/gh is not exposed): run GitHub
+  operations on the host.
   A host-set PLANNOTATOR_PORT is passed into the sandbox (with
   PLANNOTATOR_REMOTE, defaulting to 1); with PLANNOTATOR_PORT unset the
   sandbox adds nothing.
@@ -137,13 +218,7 @@ log_verbose() {
     fi
 }
 
-#######################################
-# Parse script flags and split off the agent + its verbatim arguments.
-# Globals: agent, agent_args, dry_run, verbose (modified)
-# Arguments: the script's "$@"
-# Outputs: usage to stdout (-h/--help); errors to stderr
-# Returns: 0, or exits non-zero on a usage error
-#######################################
+# Stop parsing at the agent name so agent flags never become wrapper flags.
 parse_args() {
     while (($# > 0)); do
         case "$1" in
@@ -163,34 +238,36 @@ parse_args() {
             dry_run=1
             shift
             ;;
+        --)
+            shift
+            break
+            ;;
         -*)
             usage >&2
             die "unknown flag: $1"
             ;;
         *)
-            agent="$1"
-            shift
-            agent_args=("$@")
-            return 0
+            break
             ;;
         esac
     done
-    usage >&2
-    die "missing <agent>"
+    if (($# == 0)) || [[ -z "$1" ]]; then
+        usage >&2
+        die "missing <agent>"
+    fi
+    agent="$1"
+    shift
+    agent_args=("$@")
 }
 
-#######################################
-# Look the agent up in the config tables and check its executable.
-# AGENT_SANDBOX_BIN, when set, overrides the table entry.
-# Globals: agent (read), exe (modified)
-# Outputs: usage + error to stderr on failure
-#######################################
+# Overrides replace the executable, but retain the selected agent's policy.
 validate_agent() {
     if [[ -z "${AGENT_EXE[${agent}]:-}" ]]; then
         usage >&2
         die "unknown agent: ${agent}"
     fi
     exe="${AGENT_EXE[${agent}]}"
+    read -ra state_dirs <<<"${AGENT_STATE_DIRS[${agent}]}"
     if [[ -n "${AGENT_SANDBOX_BIN:-}" ]]; then
         exe="${AGENT_SANDBOX_BIN}"
     fi
@@ -199,26 +276,45 @@ validate_agent() {
     fi
 }
 
-#######################################
-# Escape hatches, checked before any sandbox setup: AGENT_SANDBOX_DISABLE
-# execs the agent binary unsandboxed on request; AGENT_SANDBOX_ACTIVE (set
-# by this script inside the sandbox) is the nesting guard — an invocation
-# from within an existing sandbox execs the agent directly instead of
-# stacking a second bwrap.
-# Globals: exe, agent_args (read)
-#######################################
+# Any nonempty bypass variable skips setup, including --dry-run handling.
+# AGENT_SANDBOX_ACTIVE prevents wrappers from stacking another sandbox.
 maybe_exec_agent() {
     if [[ -n "${AGENT_SANDBOX_DISABLE:-}" || -n "${AGENT_SANDBOX_ACTIVE:-}" ]]; then
         exec "${exe}" "${agent_args[@]}"
     fi
 }
 
-#######################################
-# Refuse kernels where the TIOCSTI terminal-injection escape works
-# (sysctl missing = kernel < 6.2; value != 0 = legacy mode allowed).
-# Interactive TUIs preclude the --new-session mitigation, so fail
-# closed rather than run with a known escape open.
-#######################################
+# $1 is a canonical absolute path; call after workspace resolution.
+# This prefix check covers the main exposed trees, not every individual bind
+# or symlink spelling. It is used for executable and environment validation.
+path_is_exposed() {
+    local path="$1" rel prefix
+    local -a prefixes=(/usr /etc /opt/mamba "${workspace}")
+    if [[ -n "${git_common_dir}" ]]; then
+        prefixes+=("${git_common_dir}")
+    fi
+    for rel in "${HOME_RO_PATHS[@]}" "${state_dirs[@]}"; do
+        prefixes+=("${HOME_DIR}/${rel}")
+    done
+    for prefix in "${prefixes[@]}"; do
+        if [[ "${path}" == "${prefix}" || "${path}" == "${prefix}"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Catch executable targets outside the mounts before bwrap reports ENOENT.
+check_exe_visible() {
+    local real
+    real="$(realpath -e "${exe}")" || die "agent executable unresolvable: ${exe}"
+    if ! path_is_exposed "${real}"; then
+        die "agent executable ${exe} resolves to ${real}, which the sandbox does not expose"
+    fi
+}
+
+# Keep the controlling terminal for interactive agents. Since --new-session
+# would break that setup, require the kernel's legacy TIOCSTI switch to be off.
 check_tiocsti() {
     local file="/proc/sys/dev/tty/legacy_tiocsti" value
     if [[ ! -r "${file}" ]]; then
@@ -230,25 +326,26 @@ check_tiocsti() {
     fi
 }
 
-#######################################
-# Resolve the physical cwd and the workspace root: the git toplevel, or
-# — for a .bare-style repo (git-bareify layout) — the directory holding
-# .bare, and the cwd when outside git.
-# Globals: cwd_physical, workspace, git_common_dir (modified)
-#######################################
+# Rewriting HOME would invalidate absolute paths stored in agent config.
+# Reject symlink components and trailing slashes instead.
+check_home_canonical() {
+    if [[ "$(realpath "${HOME_DIR}")" != "${HOME_DIR}" ]]; then
+        die "HOME is not canonical (symlinked components and trailing slashes are refused): ${HOME_DIR}"
+    fi
+}
+
+# Use the Git toplevel, or the physical cwd outside Git. A .bare common
+# directory selects its entire container so sibling worktrees remain visible.
+# Reject other Git directories without a worktree and cwd outside the result.
 resolve_workspace() {
-    local common
+    local common gitdir
     cwd_physical="$(pwd -P)"
     if workspace="$(git rev-parse --show-toplevel 2>/dev/null)"; then
         common="$(git rev-parse --path-format=absolute --git-common-dir)"
         common="$(realpath "${common}")"
         if [[ "${common##*/}" == ".bare" ]]; then
-            # The container of .bare holds the .git pointer file and every
-            # worktree sibling, and is what the pi worktree extension
-            # anchors on. Binding only the current worktree would leave
-            # the container a gitless stub inside the sandbox (its git
-            # discovery stops at the /home mount boundary). The common
-            # dir sits inside it, so no separate bind is needed.
+            # Include the .git pointer and sibling worktrees used by pi's
+            # worktree extension. The common dir is already inside this bind.
             workspace="${common%/*}"
             log_verbose ".bare-style repo; workspace: ${workspace}"
         elif [[ "${common}" != "${workspace}" &&
@@ -256,20 +353,25 @@ resolve_workspace() {
             git_common_dir="${common}"
             log_verbose "git common dir outside workspace: ${common}"
         fi
+    elif gitdir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)"; then
+        gitdir="$(realpath "${gitdir}")"
+        if [[ "${gitdir##*/}" != ".bare" ]]; then
+            die "inside a git directory without a work tree: ${cwd_physical}"
+        fi
+        workspace="${gitdir%/*}"
+        log_verbose ".bare-style repo without a work tree; workspace: ${workspace}"
     else
         workspace="${cwd_physical}"
+    fi
+    if [[ "${cwd_physical}" != "${workspace}" &&
+        "${cwd_physical}" != "${workspace}"/* ]]; then
+        die "cwd ${cwd_physical} is outside the workspace ${workspace}"
     fi
     log_verbose "workspace: ${workspace}"
 }
 
-#######################################
-# Die when a candidate rw bind path is one we refuse to expose: /,
-# $HOME, an ancestor of $HOME, a dot-entry at/under $HOME (covers all
-# agent state dirs, .ssh, .gnupg, ...), or anything at/under a denied
-# prefix.
-# Arguments: $1 = canonical absolute path, $2 = label for the error
-# Outputs: error to stderr on refusal
-#######################################
+# $1 is a canonical bind source; $2 labels errors. Reject broad home access,
+# hidden top-level home entries, and the system/temporary prefixes above.
 refuse_denied_path() {
     local path="$1" label="$2" prefix
     if [[ "${path}" == / ]]; then
@@ -291,13 +393,8 @@ refuse_denied_path() {
     done
 }
 
-#######################################
-# Apply the deny rules to the workspace root and, when present, the
-# canonicalized git common dir. A .git *file* indirection is repository
-# content (attacker-controllable) and must not steer a rw bind into a
-# denied path.
-# Globals: workspace, git_common_dir (read)
-#######################################
+# A repository-controlled .git file can redirect the common directory.
+# Apply the same deny rules to that extra writable bind as to the workspace.
 validate_workspace() {
     refuse_denied_path "${workspace}" "workspace root"
     if [[ -n "${git_common_dir}" ]]; then
@@ -305,17 +402,40 @@ validate_workspace() {
     fi
 }
 
-#######################################
-# Resolve and vet $SSH_AUTH_SOCK. Only an invoker-owned unix socket is
-# accepted: its bind is the last filesystem op, so a rw bind of
-# anything else could shadow an earlier ro mount. Invalid or unset →
-# warn and continue without forwarding (signing fails at use time).
-# GIT_SIGNING_DISABLED (set by c for --no-git-signing containers)
-# marks the unset socket as deliberate: skip that warning.
-# Globals: ssh_sock (modified)
-# Outputs: warnings to stderr
-#######################################
+# Collect unique ancestors, with each parent before its children. They get
+# separate read-only mounts so a sibling worktree cannot be created in an
+# ephemeral directory while its registration persists in the Git common dir.
+resolve_parent_chain() {
+    local -a binds=("${workspace}") chain
+    local -A seen=()
+    local bind dir
+    if [[ -n "${git_common_dir}" ]]; then
+        binds+=("${git_common_dir}")
+    fi
+    for bind in "${binds[@]}"; do
+        chain=()
+        dir="${bind%/*}"
+        while [[ -n "${dir}" && "${dir}" != "${HOME_DIR}" ]]; do
+            chain=("${dir}" "${chain[@]}")
+            dir="${dir%/*}"
+        done
+        for dir in "${chain[@]}"; do
+            if [[ -z "${seen[${dir}]:-}" ]]; then
+                seen[${dir}]=1
+                parent_dirs+=("${dir}")
+            fi
+        done
+    done
+}
+
+# Only forward an owned Unix socket advertising exactly the configured key.
+# A general-purpose ssh-agent would also expose login/deploy signing powers.
+# This checks identities at launch; it does not restrict later socket requests.
+# Bound identity discovery to 3 seconds, then allow 1 second before SIGKILL.
+# Probe failures (including a missing timeout utility) disable forwarding.
 resolve_ssh_sock() {
+    local listing
+    local -a keys fields
     if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
         if [[ -z "${GIT_SIGNING_DISABLED:-}" ]]; then
             warn "SSH_AUTH_SOCK unset: ssh-agent not forwarded"
@@ -331,68 +451,160 @@ resolve_ssh_sock() {
         ssh_sock=""
         return 0
     fi
+    if [[ -z "${signing_pubkey}" ]]; then
+        warn "no ssh signing key configured: ssh-agent not forwarded"
+        ssh_sock=""
+        return 0
+    fi
+    if ! listing="$(SSH_AUTH_SOCK="${ssh_sock}" timeout --kill-after=1s 3s ssh-add -L 2>/dev/null)"; then
+        warn "ssh-agent must hold exactly the signing key: not forwarded"
+        ssh_sock=""
+        return 0
+    fi
+    readarray -t keys <<<"${listing}"
+    read -ra fields <<<"${keys[0]}"
+    if ((${#keys[@]} != 1)) ||
+        [[ "${fields[0]:-} ${fields[1]:-}" != "${signing_pubkey}" ]]; then
+        warn "ssh-agent must hold exactly the signing key: not forwarded"
+        ssh_sock=""
+        return 0
+    fi
     log_verbose "ssh-agent socket: ${ssh_sock}"
 }
 
-#######################################
-# When user.signingkey in the *global* git config is a path to an
-# existing file (ssh signing with a key-file path), remember it for a
-# read-only bind. Repo-local config is deliberately ignored: it is
-# workspace content and could point the bind at an arbitrary host file.
-# Globals: signing_key_file (modified)
-#######################################
+# Read global Git config only: repository config must not choose a host file
+# to mount. Accept a public-key literal (with optional key:: prefix) or a file
+# passing the single-record/type check. Keep its type/blob for socket matching.
 resolve_signing_key() {
-    local key
+    local format key lines line type blob rest
+    format="$(git config --global --get gpg.format 2>/dev/null || true)"
     key="$(git config --global --get user.signingkey 2>/dev/null || true)"
-    if [[ "${key}" == "~/"* ]]; then
+    if [[ "${format}" != ssh || -z "${key}" ]]; then
+        return 0
+    fi
+    key="${key#key::}"
+    if [[ "${key}" == \~/* ]]; then
         key="${HOME_DIR}/${key#\~/}"
     fi
-    if [[ -n "${key}" && -f "${key}" ]]; then
+    if [[ -f "${key}" ]]; then
+        # The whole file becomes readable. Require one nonblank line and a
+        # recognized key type. Allow grep's no-match status and read's EOF
+        # status so empty files and a missing final newline reach the checks.
+        lines="$(grep -c '[^[:space:]]' "${key}")" || true
+        read -r line <"${key}" || true
+        read -r type blob rest <<<"${line}"
+        if ((lines != 1)) || [[ " ${SSH_PUBKEY_TYPES[*]} " != *" ${type} "* ]]; then
+            warn "user.signingkey ${key} is not a public key file: not exposed"
+            return 0
+        fi
         signing_key_file="$(realpath "${key}")"
         log_verbose "signing key file: ${signing_key_file}"
+    else
+        read -r type blob rest <<<"${key}"
     fi
+    signing_pubkey="${type} ${blob}"
 }
 
-#######################################
-# Create (host-side) and vet the invoked agent's rw state dirs, and
-# seed claude's .claude.json into its config dir once. Never called
-# under --dry-run. Symlinked dirs are refused: bwrap resolves bind
-# sources on the host, so a symlink would expose its target rw.
-# Globals: agent (read)
-#######################################
+# Omit files on scan errors as well as credential matches. Do not use grep
+# -q: it can return success despite a read error. Never print matched lines.
+resolve_package_rc() {
+    local rel file status
+    for rel in "${PACKAGE_RC_FILES[@]}"; do
+        file="${HOME_DIR}/${rel}"
+        if [[ ! -f "${file}" ]]; then
+            continue
+        fi
+        if grep -Ei -- "${PACKAGE_RC_CREDENTIAL_RE}" "${file}" >/dev/null 2>&1; then
+            warn "${file} contains credentials: not bound"
+        else
+            status=$?
+            if ((status == 1)); then
+                rc_files+=("${file}")
+            else
+                warn "${file}: cannot inspect package config (status ${status}): not bound"
+            fi
+        fi
+    done
+}
+
+# $1 is a canonical target. Pinned symlinks may resolve only within these
+# state trees, which have already been selected for host write access.
+path_in_state_dirs() {
+    local path="$1" dir prefix
+    for dir in "${state_dirs[@]}"; do
+        prefix="${HOME_DIR}/${dir}"
+        if [[ "${path}" == "${prefix}" || "${path}" == "${prefix}"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Prepare persistent state on the host; dry runs skip this function.
+# Reject symlinked state roots before mounting them writable. Recheck pinned
+# symlinks on every launch because a previous session could replace the link.
 ensure_state_dirs() {
-    local -a dirs
-    local dir path
-    read -ra dirs <<<"${AGENT_STATE_DIRS[${agent}]}"
-    for dir in "${dirs[@]}"; do
+    local -a pinned
+    local dir path rel real
+    for dir in "${state_dirs[@]}"; do
         path="${HOME_DIR}/${dir}"
+        if [[ "$(realpath -m -- "${path}")" != "${path}" ]]; then
+            die "state dir has symlinked components: ${path}"
+        fi
         mkdir -p "${path}"
-        if [[ "$(realpath "${path}")" != "${path}" ]]; then
+        if [[ "$(realpath -e -- "${path}")" != "${path}" ]]; then
             die "state dir has symlinked components: ${path}"
         fi
         if [[ ! -O "${path}" ]]; then
             die "state dir not owned by invoker: ${path}"
         fi
     done
-    # Not cp -n: coreutils >= 9.2 exits non-zero when dest exists.
+    # --ro-bind-try cannot protect a missing entry. Seed JSON files with {}
+    # and extensionless paths as directories so those mounts always apply.
+    # Other file formats are left to the dotfiles; inventing empty YAML or
+    # Markdown content could change how an agent loads its configuration.
+    read -ra pinned <<<"${AGENT_RO_PATHS[${agent}]}"
+    for rel in "${pinned[@]}"; do
+        path="${HOME_DIR}/${rel}"
+        if [[ -e "${path}" || -L "${path}" ]]; then
+            real="$(realpath -e -- "${path}" 2>/dev/null)" ||
+                die "pinned path ${path} resolves outside the agent's state dirs: dangling symlink"
+        else
+            # Resolve missing paths too, before mkdir/redirect can follow an
+            # existing parent symlink into an unrelated host directory.
+            real="$(realpath -m -- "${path}")"
+        fi
+        if [[ "${real}" != "${path}" ]] && ! path_in_state_dirs "${real}"; then
+            die "pinned path ${path} resolves outside the agent's state dirs: ${real}"
+        fi
+        if [[ -e "${path}" ]]; then
+            continue
+        fi
+        case "${rel##*/}" in
+        *.json)
+            mkdir -p "${path%/*}"
+            printf '{}\n' >"${path}"
+            ;;
+        *.*) ;;
+        *)
+            mkdir -p "${path}"
+            ;;
+        esac
+    done
+    # Copy host Claude state once; later sandbox sessions keep their own copy.
     if [[ "${agent}" == claude && ! -e "${HOME_DIR}/.claude/.claude.json" &&
         -f "${HOME_DIR}/.claude.json" ]]; then
         cp "${HOME_DIR}/.claude.json" "${HOME_DIR}/.claude/.claude.json"
     fi
 }
 
-#######################################
-# Probe whether bwrap's --disable-userns works here. bwrap implements
-# it by writing the per-userns sysctl user.max_user_namespaces via
-# /proc/sys, which read-only container roots (e.g. this Podman image)
-# refuse. The probe is a throwaway bwrap with exactly the flags the
-# real run would pass, so its exit status predicts the real run's.
-# Globals: userns_blockable (modified)
-# Outputs: warning to stderr when nested user namespaces stay possible
-#######################################
+# Test --disable-userns under the same outer namespace setup as the launch.
+# Some containers deny the user.max_user_namespaces write it needs; warn and
+# keep nesting available there instead of making the agent unusable.
 probe_userns_blockable() {
     local out
-    if out="$(bwrap --unshare-user --disable-userns \
+    if out="$(unshare --user --map-user="${UID_NUM}" --map-group="${GID_NUM}" \
+        --fork --pid -- bwrap --unshare-user --disable-userns \
         --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib64 /lib64 \
         --dev /dev -- /usr/bin/true 2>&1 >/dev/null)"; then
         userns_blockable=1
@@ -402,30 +614,20 @@ probe_userns_blockable() {
     warn "--disable-userns unavailable here (${out}); nested user namespaces stay possible"
 }
 
-#######################################
-# Process/isolation options for bwrap (order-insensitive; grouped
-# first). IPC/UTS stay unshared and --die-with-parent applies; network
-# stays shared (LLM API egress); the user and PID namespaces are
-# pre-created by run_agent's unshare, not by bwrap. --disable-userns
-# also requires --unshare-user, and both apply only when the probe
-# proved the sysctl write works here.
-# Globals: bwrap_args (modified); agent, userns_blockable (read)
-#######################################
+# run_agent creates the outer user/PID namespaces. bwrap adds IPC/UTS
+# isolation and, when supported and requested, a user namespace with nesting
+# disabled. Network and cgroup namespaces stay shared.
 add_namespace_args() {
     bwrap_args+=(--die-with-parent --unshare-ipc --unshare-uts)
-    if ((userns_blockable && AGENT_DISABLE_USERNS[${agent}])); then
+    if ((userns_blockable && ${AGENT_DISABLE_USERNS[${agent}]})); then
         bwrap_args+=(--unshare-user --disable-userns)
     fi
 }
 
-#######################################
-# Clear the host environment and re-set the allowlist. xtrace is
-# suppressed while API key values are appended so --debug never prints
-# secrets.
-# Globals: bwrap_args (modified); agent, cwd_physical, ssh_sock (read)
-#######################################
+# Start from an empty environment and restore only explicit settings.
+# Suppress xtrace while adding API_KEY_VARS; other forwarded values are traced.
 add_env_args() {
-    local var xtrace_on=0
+    local var real xtrace_on=0
     bwrap_args+=(
         --clearenv
         --setenv HOME "${HOME_DIR}"
@@ -436,17 +638,30 @@ add_env_args() {
         --setenv SHELL /bin/bash
         --setenv XDG_RUNTIME_DIR "/run/user/${UID_NUM}"
     )
-    for var in TERM COLORTERM LANG; do
+    for var in "${FORWARD_VARS[@]}"; do
         if [[ -n "${!var:-}" ]]; then
             bwrap_args+=(--setenv "${var}" "${!var}")
             log_verbose "forwarding ${var}"
         fi
     done
+    for var in "${FORWARD_PATH_VARS[@]}"; do
+        if [[ -z "${!var:-}" ]]; then
+            continue
+        fi
+        if ! real="$(realpath -e "${!var}" 2>/dev/null)"; then
+            warn "${var} does not exist: not forwarded"
+        elif path_is_exposed "${real}"; then
+            bwrap_args+=(--setenv "${var}" "${real}")
+            log_verbose "forwarding ${var}"
+        else
+            warn "${var} points outside the sandbox: not forwarded"
+        fi
+    done
     if [[ -n "${ssh_sock}" ]]; then
         bwrap_args+=(--setenv SSH_AUTH_SOCK "${ssh_sock}")
     fi
-    # Plannotator plan UI: forward a host-set port; with the port unset
-    # the sandbox adds nothing and the choice stays with the caller.
+    # A host-selected port enables remote Plannotator setup. Without it,
+    # leave both variables out so the caller keeps its normal UI behavior.
     if [[ -n "${PLANNOTATOR_PORT:-}" ]]; then
         bwrap_args+=(
             --setenv PLANNOTATOR_PORT "${PLANNOTATOR_PORT}"
@@ -473,13 +688,10 @@ add_env_args() {
     fi
 }
 
-#######################################
-# Read-only system tree, fresh proc/dev, private /tmp and /run, DNS
-# plumbing. Order matters: /run/systemd/resolve must follow the /run
-# tmpfs.
-# Globals: bwrap_args (modified)
-#######################################
+# Rebuild the system view with read-only tools/config and fresh proc/dev.
+# Any DNS target under /run must be mounted after /run's tmpfs.
 add_system_args() {
+    local resolv
     bwrap_args+=(
         --ro-bind /usr /usr
         --symlink usr/bin /bin
@@ -493,138 +705,118 @@ add_system_args() {
         --tmpfs /tmp
         --tmpfs /run
         --perms 0700 --dir "/run/user/${UID_NUM}"
-        --ro-bind-try /run/systemd/resolve /run/systemd/resolve
     )
+    # The /etc bind preserves resolv.conf symlinks, but /run was replaced.
+    # Restore just the resolved DNS file when the link points there.
+    resolv="$(realpath -e /etc/resolv.conf 2>/dev/null || true)"
+    if [[ "${resolv}" == /run/* ]]; then
+        bwrap_args+=(--ro-bind-try "${resolv}" "${resolv}")
+    fi
 }
 
-#######################################
-# Ephemeral tmpfs home, then ro identity/toolchain binds, then rw
-# state-dir holes. Order matters: tmpfs first; ro ~/.local before its
-# rw children (.local/share/*, .local/state/*).
-# Globals: bwrap_args (modified); agent, signing_key_file (read)
-#######################################
-add_home_args() {
-    local -a dirs
-    local dir path
-    bwrap_args+=(
-        --perms 0700 --tmpfs "${HOME_DIR}"
-        --ro-bind "${HOME_DIR}/.config" "${HOME_DIR}/.config"
-        --ro-bind "${HOME_DIR}/.gitconfig" "${HOME_DIR}/.gitconfig"
-        --ro-bind "${HOME_DIR}/.local" "${HOME_DIR}/.local"
-        --ro-bind-try "${HOME_DIR}/.npmrc" "${HOME_DIR}/.npmrc"
-        --ro-bind-try "${HOME_DIR}/.ssh/allowed_signers"
-        "${HOME_DIR}/.ssh/allowed_signers"
-    )
-    if [[ -n "${signing_key_file}" ]]; then
-        bwrap_args+=(--ro-bind-try "${signing_key_file}" "${signing_key_file}")
-    fi
-    read -ra dirs <<<"${AGENT_STATE_DIRS[${agent}]}"
-    for dir in "${dirs[@]}"; do
-        path="${HOME_DIR}/${dir}"
-        bwrap_args+=(--bind "${path}" "${path}")
+# Mount ancestors above HOME first; mounting them later would hide the home
+# tmpfs. The final remount pass locks them after all child mounts exist.
+add_home_ancestor_args() {
+    local dir
+    for dir in "${parent_dirs[@]}"; do
+        if [[ "${HOME_DIR}/" == "${dir}"/* ]]; then
+            bwrap_args+=(--tmpfs "${dir}")
+        fi
     done
 }
 
-#######################################
-# rw workspace at the same absolute path (keeps worktrees, lockfiles
-# and venvs valid), plus the git common dir when it lies outside.
-# The directories between $HOME (or /) and each bind are created
-# read-only first, shallowest first: bwrap would otherwise auto-create
-# them as writable tmpfs directories, and a `git worktree add` from
-# inside would land in the ephemeral home while registering itself
-# permanently in the common dir. Read-only, it fails at mkdir and git
-# drops its half-made entry. Sibling worktrees are not bound and
-# worktrees cannot be created from inside by design — except that a
-# .bare repo's workspace is the whole .bare container directory, so
-# its sibling worktrees resolve inside.
-# Globals: bwrap_args (modified); workspace, git_common_dir (read)
-#######################################
+# Mount order is policy: empty home, read-only allowlist, writable state,
+# then read-only pins inside that state. Intermediate directories such as
+# .local and .config remain writable tmpfs and disappear when the run ends.
+add_home_args() {
+    local -a pinned
+    local dir path
+    bwrap_args+=(--perms 0700 --tmpfs "${HOME_DIR}")
+    for dir in "${HOME_RO_PATHS[@]}"; do
+        path="${HOME_DIR}/${dir}"
+        bwrap_args+=(--ro-bind-try "${path}" "${path}")
+    done
+    bwrap_args+=(
+        --ro-bind "${HOME_DIR}/.gitconfig" "${HOME_DIR}/.gitconfig"
+        --ro-bind-try "${HOME_DIR}/.ssh/allowed_signers"
+        "${HOME_DIR}/.ssh/allowed_signers"
+    )
+    for path in "${rc_files[@]}"; do
+        bwrap_args+=(--ro-bind-try "${path}" "${path}")
+    done
+    for dir in "${state_dirs[@]}"; do
+        path="${HOME_DIR}/${dir}"
+        bwrap_args+=(--bind "${path}" "${path}")
+    done
+    read -ra pinned <<<"${AGENT_RO_PATHS[${agent}]}"
+    for dir in "${pinned[@]}"; do
+        path="${HOME_DIR}/${dir}"
+        bwrap_args+=(--ro-bind-try "${path}" "${path}")
+    done
+}
+
+# Preserve absolute paths for Git metadata, virtualenvs and lockfiles.
+# Create the remaining ancestor mounts before the writable binds. The final
+# remount pass locks each ancestor without making its child binds read-only.
+# Ordinary sibling worktrees stay hidden; a .bare container includes them.
 add_workspace_args() {
-    local -a binds=("${workspace}") chain
-    local -A seen=()
+    local -a binds=("${workspace}")
     local bind dir
     if [[ -n "${git_common_dir}" ]]; then
         binds+=("${git_common_dir}")
     fi
-    for bind in "${binds[@]}"; do
-        chain=()
-        dir="$(dirname "${bind}")"
-        while [[ "${dir}" != "${HOME_DIR}" && "${dir}" != / ]]; do
-            chain=("${dir}" "${chain[@]}")
-            dir="$(dirname "${dir}")"
-        done
-        for dir in "${chain[@]}"; do
-            if [[ -z "${seen[${dir}]:-}" ]]; then
-                seen[${dir}]=1
-                bwrap_args+=(--perms 0555 --dir "${dir}")
-            fi
-        done
+    for dir in "${parent_dirs[@]}"; do
+        if [[ "${HOME_DIR}/" != "${dir}"/* ]]; then
+            bwrap_args+=(--tmpfs "${dir}")
+        fi
     done
     for bind in "${binds[@]}"; do
         bwrap_args+=(--bind "${bind}" "${bind}")
     done
 }
 
-#######################################
-# ssh-agent socket, bound at its resolved path so SSH_AUTH_SOCK stays
-# valid. Kept as the last filesystem op: wherever the socket lives
-# (/run, $HOME, /tmp), earlier tmpfs mounts have shadowed it, and a
-# late bind punches the single hole back in.
-# Globals: bwrap_args (modified); ssh_sock (read)
-#######################################
-add_ssh_agent_args() {
+# Add signing mounts after all tmpfs mounts so /run, /tmp or home overlays
+# cannot hide them. Use resolved source paths; only remounts follow this step.
+add_signing_args() {
+    if [[ -n "${signing_key_file}" ]]; then
+        bwrap_args+=(--ro-bind-try "${signing_key_file}" "${signing_key_file}")
+    fi
     if [[ -n "${ssh_sock}" ]]; then
         bwrap_args+=(--bind "${ssh_sock}" "${ssh_sock}")
     fi
 }
 
-#######################################
-# Print an argv with %q quoting, replacing the value after any
-# "--setenv <VAR ending in _API_KEY>" with ***.
-# Arguments: the argv words
-# Outputs: the redacted argv on stdout
-#######################################
-print_redacted_argv() {
-    local -a words=("$@") out=()
-    local word i=0
-    while ((i < ${#words[@]})); do
-        if [[ "${words[i]}" == --setenv &&
-            "${words[i + 1]:-}" == *_API_KEY ]]; then
-            out+=(--setenv "${words[i + 1]}" '***')
-            ((i += 3))
-        else
-            out+=("${words[i]}")
-            ((i += 1))
-        fi
+# All mount points must exist before their parents become read-only.
+# Mount flags enforce this even when the directory owner could change modes.
+add_remount_args() {
+    local dir
+    for dir in "${parent_dirs[@]}"; do
+        bwrap_args+=(--remount-ro "${dir}")
     done
-    for word in "${out[@]}"; do
-        if [[ "${word}" == '***' ]]; then
-            printf '*** '
+}
+
+# Print shell-quoted arguments, masking only --setenv values in API_KEY_VARS.
+# Agent arguments and other environment values are not redacted.
+print_redacted_argv() {
+    while (($#)); do
+        if (($# >= 3)) && [[ "$1" == --setenv &&
+            " ${API_KEY_VARS[*]} " == *" $2 "* ]]; then
+            printf '%q %q *** ' "$1" "$2"
+            shift 3
         else
-            printf '%q ' "${word}"
+            printf '%q ' "$1"
+            shift
         fi
     done
     printf '\n'
 }
 
-#######################################
-# Compose the final argv, then either print it (--dry-run) or exec into
-# bwrap. The user and PID namespaces are pre-created with unshare(1)
-# instead of being created by bwrap: this container's kernel refuses a
-# fresh /proc for a PID namespace bwrap creates itself (EPERM, "Mount
-# too revealing"), while a /proc mounted by bwrap inside pre-created
-# namespaces is allowed. The identity mapping keeps the sandbox uid
-# equal to the invoker's uid (agents like claude refuse running as
-# root). bwrap still unshares IPC/UTS (see add_namespace_args); network
-# stays shared (LLM API egress) and the cgroup namespace stays shared.
-# --dry-run launches nothing, so the probe never runs and its argv
-# never shows the --disable-userns flags. Nested bwrap inside
-# containers is known to fail (bwrap: open /proc/N/ns/ns), so claude's
-# own bwrap sandboxing is host-only for now. xtrace stays off from
-# here on so --debug never prints the secret values embedded in the
-# argv.
-# Globals: bwrap_args, cwd_physical, exe, agent_args, dry_run (read)
-#######################################
+# Create user/PID namespaces before bwrap: this container setup rejects a
+# fresh /proc when bwrap creates the PID namespace itself ("Mount too revealing").
+# Preserve the invoker's UID/GID instead of mapping to root. Nested bwrap may
+# still fail in containers, including Claude's own Bash sandbox.
+# Dry runs skip the namespace probe, so their argv omits --disable-userns.
+# Leave xtrace off from here: argv now contains the forwarded API keys.
 run_agent() {
     set +x
     local -a argv=(
@@ -643,11 +835,15 @@ main() {
     parse_args "$@"
     validate_agent
     maybe_exec_agent
+    check_home_canonical
     check_tiocsti
     resolve_workspace
     validate_workspace
-    resolve_ssh_sock
+    check_exe_visible
+    resolve_parent_chain
     resolve_signing_key
+    resolve_ssh_sock
+    resolve_package_rc
     if ((!dry_run)); then
         ensure_state_dirs
         if ((${AGENT_DISABLE_USERNS[${agent}]})); then
@@ -657,9 +853,11 @@ main() {
     add_namespace_args
     add_env_args
     add_system_args
+    add_home_ancestor_args
     add_home_args
     add_workspace_args
-    add_ssh_agent_args
+    add_signing_args
+    add_remount_args
     run_agent
 }
 
