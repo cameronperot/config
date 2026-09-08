@@ -35,10 +35,27 @@ GIT_SIGNING_KEY="$(cat ~/.ssh/llm_agent_ed25519.pub)" ./dev-container/build.sh  
 `compose.yml` mounts its own directory at `/work`, Jupyter's root. Keep machine-specific additions such as project mounts or the signing socket in a second compose file passed with another `-f`.
 
 ## Isolation
-Three layers, each bounding something the previous one does not:
-- **Container** (`c`, compose): bounds what the host exposes. Only the repository, the agent dotfiles and the signing socket are mounted, and no API keys are forwarded. It shares the host kernel, so on its own it is not a security boundary.
-- **Agent sandbox** (`agent-sandbox`, bubblewrap): bounds what the agent process can touch inside the container. The system tree, `/etc` and `/opt/mamba` are read-only; of `$HOME` only an allowlist is visible, read-only: `.gitconfig`, `.ssh/allowed_signers`, `.npmrc` and `.bunfig.toml` files that pass a lightweight grep credential scan (no TOML parsing or Python dependency; unreadable files are omitted), and under `.config` and `.local` the toolchain stores and non-secret CLI configs the agents need, so `~/.config/gh` is not exposed and `gh` is unauthenticated inside the sandbox; `$HOME`, `/tmp` and `/run` are ephemeral tmpfs; only the workspace (the git toplevel, or the directory holding `.bare`) and the agent's own state directories are writable, at their real paths, with selected agent config files and directories (settings, instructions, rules, skills, prompts, guard rules, subagents, extensions) pinned read-only on top of them, opencode's whole `~/.config/opencode` read-only, and the directories above the workspace mounted read-only; the environment is cleared down to an allowlist (a host-set `PLANNOTATOR_PORT` is forwarded, with `PLANNOTATOR_REMOTE` defaulting to 1); IPC, UTS, PID and user namespaces are unshared, with nested user namespaces disabled where the kernel allows; and the sandbox refuses to start while the TIOCSTI terminal-injection escape is open. This hides unrelated repositories and unselected agents' state, and prevents writes through the read-only mounts. Credentials in exposed files remain readable, and the package-config screen has known limits; the `skills` and `prompts` entries of pi and omp are symlinks into `~/.agent` whose targets are pinned but whose link entries remain replaceable. Network stays shared for LLM API egress, since bubblewrap cannot filter it.
-- **microVM** (`c -k`, libkrun): boots the container on its own guest kernel (libkrunfw), so a kernel exploit or container escape stays inside the VM instead of reaching the host. The rootfs and bind mounts are shared into the guest over virtio-fs, which passes files but not Unix-domain socket endpoints, so the ssh-agent is bridged over TCP instead: `c -k` adds `--network=pasta:-T,7777` (TSI proxies the guest's TCP connections into the container's network namespace, and pasta forwards port 7777 from there to the host's loopback) and the entrypoint bridges `127.0.0.1:7777` to the socket `SSH_AUTH_SOCK` expects. This requires the host-side TCP bridge of [Signing under `c -k`](#signing-under-c--k-pasta-bridge) to be running; before booting, `c` probes host port 7777 with an ssh-agent identity request and warns when no signer answers. While the bridge runs, the ssh-agent protocol's lack of authentication lets any local host user request signatures over `127.0.0.1:7777`, so only use it on a single-user machine.
+Three layers, each bounding what the previous one leaves open.
+
+| Layer | Runs | Bounds |
+| :--- | :--- | :--- |
+| Container | `c`, `c -r`, compose | What the host exposes to the container |
+| Agent sandbox | agent processes | What an agent can see and write inside the container |
+| microVM | `c -k` | The kernel the container runs on |
+
+### Container
+Only the repository, the agent dotfiles and the signing socket are mounted, and no API keys are forwarded. The container shares the host kernel, so on its own it is not a security boundary.
+
+### Agent sandbox
+`agent-sandbox` (bubblewrap) wraps each agent process in a restricted view of the container, so an agent sees only its workspace and its own configuration — not unrelated repositories or other agents' state:
+
+- **Read-only:** the system tree, and most of `$HOME`; only an allowlisted set of config files is visible, screened for credentials.
+- **Writable:** only the workspace (the git toplevel, or the directory holding `.bare`) and the agent's own state directories; everything else in `$HOME`, `/tmp` and `/run` is ephemeral tmpfs.
+- **Hardened:** the environment is reduced to an allowlist, IPC/UTS/PID/user namespaces are unshared, and the sandbox refuses to start while the TIOCSTI terminal-injection escape is open.
+- **Limits:** credentials in the exposed config files remain readable, the package-config screen has known gaps, and the network stays shared because bubblewrap cannot filter it (LLM API egress must work).
+
+### microVM
+`c -k` boots the container on its own guest kernel (libkrun), so a kernel exploit or container escape stays inside the VM instead of reaching the host. Unix-domain sockets cannot cross the shared filesystem, so the ssh-agent is bridged over TCP (see [Signing under `c -k`](#signing-under-c--k-pasta-bridge)); `c` probes the bridge before booting and warns when no signer answers. The bridge is unauthenticated — any local host user can request signatures while it runs — so use it only on a single-user machine.
 
 ## Agents
 `pi`, `omp` and `opencode` resolve to shadows in `~/bin` that launch the real binary through `agent-sandbox` (the bubblewrap layer above) from every entry point: `c`, `c -r`, zsh, bash. Escape hatches: `AGENT_SANDBOX_DISABLE=1 pi …` runs one invocation unsandboxed, `AGENT_SANDBOX_BIN=<path> pi …` launches that executable in place of the table entry, and an absolute path bypasses the shadow.
