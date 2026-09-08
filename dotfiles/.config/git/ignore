@@ -1,3 +1,6 @@
+# ---- Ignored directories ----
+/scratch/
+
 # ---- Temp & backup ----
 *.tmp
 *.bak
