@@ -1,0 +1,16 @@
+[Unit]
+Description=Isolated SSH agent for LLM coding agent
+
+[Service]
+Type=exec
+Environment=SSH_AUTH_SOCK=%t/llm-agent.sock
+Environment=SSH_ASKPASS_REQUIRE=never
+ExecStartPre=/usr/bin/rm -f %t/llm-agent.sock
+ExecStart=/usr/bin/ssh-agent -D -P '' -a %t/llm-agent.sock
+ExecStartPost=/usr/bin/sh -c 'for i in $(seq 1 50); do if [ -S "$$SSH_AUTH_SOCK" ]; then exec /usr/bin/ssh-add "%h/.ssh/llm_agent_ed25519"; fi; sleep 0.05; done; echo "LLM SSH agent socket did not become ready" >&2; exit 1'
+TimeoutStartSec=10
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target

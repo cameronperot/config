@@ -12,6 +12,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 # Env vars
 ENV COLORTERM=truecolor \
+    container=oci \
     EDITOR=nvim \
     LANG=en_US.UTF-8 \
     CLAUDE_CONFIG_DIR="${HOME_DIR}/.claude" \

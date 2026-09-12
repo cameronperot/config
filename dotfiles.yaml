@@ -147,7 +147,17 @@ include:
       - rofi
       - sway/config
       - swaylock/config
+      - path: systemd/user
+        include:
+          - ssh-agent.service
+          - llm-ssh-agent.service
+          - llm-ssh-agent-tcp.service
+          - llm-ssh-agent-tcp.socket
+        exclude:
+          - pattern: '^(?!ssh-agent\.service$|llm-ssh-agent\.service$|llm-ssh-agent-tcp\.(service|socket)$)'
+            optional: true
       - tmux
+      - zsh
       - path: uv
         include:
           - uv.toml
@@ -394,7 +404,7 @@ exclude:
     optional: true
   - pattern: '^\.config/libinput-gestures\.conf$'
     optional: true
-  - pattern: '^\.config/systemd$'
+  - pattern: '^\.config/systemd/(?!user(?:/|$))'
     optional: true
   # --- tmux plugin manager state ---
   - pattern: '^\.tmux$'

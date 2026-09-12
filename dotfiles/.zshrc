@@ -16,8 +16,6 @@ fi
 source "${HOME}/.antidote/antidote.zsh"
 
 # oh-my-zsh settings
-# Start the agent and load keys on first ssh, not at shell startup
-zstyle :omz:plugins:ssh-agent lazy yes
 # Disable omz's update checker
 zstyle :omz:update mode disabled
 
@@ -75,7 +73,7 @@ KEYTIMEOUT=1                # for esc in zsh vim mode
 [[ -t 0 ]] && export GPG_TTY="$(tty)"
 
 # Source files
-for file in .bash_aliases .local_aliases .local_exports
+for file in .config/zsh/ssh-agent.zsh .bash_aliases .local_aliases .local_exports
 do
     if [ -f "${HOME}/${file}" ]; then
         source "${HOME}/${file}"

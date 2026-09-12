@@ -30,6 +30,7 @@ dev-container/compose*.yml
 
 # host-only tooling: c drives podman, which the image does not have
 dotfiles/bin/c
+dotfiles/.config/systemd
 
 # agent runtime state and credentials: gitignored, bind-mounted at run time
 dotfiles/.aider*

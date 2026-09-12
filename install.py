@@ -87,19 +87,6 @@ class EnvironmentInstaller:
             self._logger.error(f"Missing required commands: {', '.join(missing)}")
             raise SystemExit(1)
 
-    def _comment_out_lines(self, file_path: Path, prefixes: tuple[str, ...]) -> None:
-        """Comment out any lines starting with one of the given prefixes."""
-        with open(file_path, encoding="utf-8") as f:
-            lines = f.readlines()
-
-        lines = [
-            f"# {line}" if any(line.startswith(prefix) for prefix in prefixes) else line
-            for line in lines
-        ]
-
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-
     def _replace_line_prefix(
         self, file_path: Path, prefix: str, replacement: str
     ) -> None:
@@ -186,12 +173,6 @@ class EnvironmentInstaller:
         the repository untouched.
         """
         self._logger.info("Applying host adjustments")
-
-        # comment out lines that might cause issues on remote hosts
-        self._comment_out_lines(
-            self._home_dir / ".zsh_plugins.txt",
-            ("ohmyzsh/ohmyzsh path:plugins/ssh-agent",),
-        )
 
         # if MAMBA_ROOT_PREFIX is set on the host, use it in the deployed .mamba_init.sh
         mamba_root_prefix = os.environ.get("MAMBA_ROOT_PREFIX")

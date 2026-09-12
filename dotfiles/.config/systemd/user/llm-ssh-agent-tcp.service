@@ -1,0 +1,7 @@
+[Unit]
+Description=TCP bridge to the isolated LLM ssh-agent
+Requires=llm-ssh-agent.service
+After=llm-ssh-agent.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd %t/llm-agent.sock

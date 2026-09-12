@@ -1,0 +1,12 @@
+[Unit]
+Description=Personal SSH agent
+
+[Service]
+Type=exec
+ExecStartPre=/usr/bin/rm -f %t/ssh-agent.sock
+ExecStart=/usr/bin/ssh-agent -D -a %t/ssh-agent.sock
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target

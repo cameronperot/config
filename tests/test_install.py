@@ -193,18 +193,6 @@ def test_copy_dotfiles_previews_under_dry_run(tmp_path):
     assert recorder[0][0][-1] == "--dry-run"
 
 
-def test_comment_out_lines_only_touches_matching_prefixes(tmp_path):
-    target = tmp_path / "plugins.txt"
-    target.write_text("keep/me\nohmyzsh/ohmyzsh path:plugins/ssh-agent\nkeep/too\n")
-    installer = make_installer(tmp_path, [])
-
-    installer._comment_out_lines(target, ("ohmyzsh/ohmyzsh path:plugins/ssh-agent",))
-
-    assert target.read_text() == (
-        "keep/me\n# ohmyzsh/ohmyzsh path:plugins/ssh-agent\nkeep/too\n"
-    )
-
-
 def test_replace_line_prefix_rewrites_the_whole_line(tmp_path):
     target = tmp_path / "mamba_init.sh"
     target.write_text('export MAMBA_ROOT_PREFIX="/old"\nexport OTHER=1\n')
@@ -221,12 +209,10 @@ def test_host_adjustments_rewrite_mamba_prefix_when_set(tmp_path, monkeypatch):
     monkeypatch.setenv("MAMBA_ROOT_PREFIX", "/opt/mamba")
     installer = make_installer(tmp_path, [])
     home = tmp_path / "home"
-    (home / ".zsh_plugins.txt").write_text("ohmyzsh/ohmyzsh path:plugins/ssh-agent\n")
     (home / ".mamba_init.sh").write_text('export MAMBA_ROOT_PREFIX="/old"\n')
 
     installer.apply_host_adjustments()
 
-    assert (home / ".zsh_plugins.txt").read_text().startswith("# ohmyzsh")
     assert (
         home / ".mamba_init.sh"
     ).read_text() == 'export MAMBA_ROOT_PREFIX="/opt/mamba"\n'
@@ -236,7 +222,6 @@ def test_host_adjustments_leave_mamba_init_alone_when_unset(tmp_path, monkeypatc
     monkeypatch.delenv("MAMBA_ROOT_PREFIX", raising=False)
     installer = make_installer(tmp_path, [])
     home = tmp_path / "home"
-    (home / ".zsh_plugins.txt").write_text("ohmyzsh/ohmyzsh path:plugins/ssh-agent\n")
     (home / ".mamba_init.sh").write_text('export MAMBA_ROOT_PREFIX="/old"\n')
 
     installer.apply_host_adjustments()

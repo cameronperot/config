@@ -10,7 +10,6 @@ ohmyzsh/ohmyzsh path:lib pin:a5ecff7560b2e26f612032c632a12c75a3048bd0 # master 2
 ohmyzsh/ohmyzsh path:plugins/git pin:a5ecff7560b2e26f612032c632a12c75a3048bd0 # master 2026-08-30
 ohmyzsh/ohmyzsh path:plugins/vi-mode pin:a5ecff7560b2e26f612032c632a12c75a3048bd0 # master 2026-08-30
 ohmyzsh/ohmyzsh path:plugins/dnf pin:a5ecff7560b2e26f612032c632a12c75a3048bd0 # master 2026-08-30
-ohmyzsh/ohmyzsh path:plugins/ssh-agent pin:a5ecff7560b2e26f612032c632a12c75a3048bd0 # master 2026-08-30
 ohmyzsh/ohmyzsh path:plugins/colored-man-pages pin:a5ecff7560b2e26f612032c632a12c75a3048bd0 # master 2026-08-30
 # fzf-tab must load after the completion plugins above and before the
 # widget-wrapping plugins below; it supports initializing before compinit runs
