@@ -11,7 +11,7 @@ entrypoint connects to SSH_AUTH_SOCK). If the signing socket does not exist,
 commit time. Under -k, before booting, `c` probes the host's bridge port with
 an ssh-agent identity request and warns when no signer answers. With
 --no-git-signing (or a non-empty GIT_SIGNING_DISABLED), both checks are
-skipped, no socket is mounted, and commit.gpgsign=false is injected via
+skipped, no agent socket is mounted or bridged, and commit.gpgsign=false is injected via
 GIT_CONFIG_* so commits succeed unsigned; GIT_SIGNING_DISABLED=1 is passed
 into the container so agent-sandbox does not warn about the unset socket.
 
@@ -356,8 +356,8 @@ def run_argv(
         plannotator_port: Host port for the Plannotator plan UI, published to
             the same port in the container with ``PLANNOTATOR_REMOTE=1`` and
             ``PLANNOTATOR_PORT`` set; omitted when None.
-        signing_disabled: When true, inject ``commit.gpgsign=false`` via
-            ``GIT_CONFIG_*`` so commits succeed unsigned, and set
+        signing_disabled: When true, omit agent access and inject
+            ``commit.gpgsign=false`` via ``GIT_CONFIG_*`` for unsigned commits, and set
             ``GIT_SIGNING_DISABLED=1`` in the container so ``agent-sandbox``
             does not warn about the unset ssh-agent socket.
         extra_args: Additional ``podman run`` arguments, placed before the image.
@@ -384,7 +384,7 @@ def run_argv(
             "-v",
             f"{agent_config_dir / host_rel}:{CONTAINER_HOME / container_rel}",
         ]
-    if krun or ssh_sock is not None:
+    if not signing_disabled and (krun or ssh_sock is not None):
         argv += ["-e", f"SSH_AUTH_SOCK={CONTAINER_SSH_SOCK}"]
     if krun:
         # virtio-fs passes files but not Unix-socket endpoints, so instead of
@@ -393,14 +393,14 @@ def run_argv(
         argv += [
             "--runtime=krun",
             "--network",
-            f"pasta:-T,{KRUN_SSH_PORT}",
+            "pasta" if signing_disabled else f"pasta:-T,{KRUN_SSH_PORT}",
             "--annotation",
             f"krun.cpus={cpus}",
             "--annotation",
             f"krun.ram_mib={ram_mib}",
         ]
     else:
-        if ssh_sock is not None:
+        if not signing_disabled and ssh_sock is not None:
             argv += ["-v", f"{ssh_sock}:{CONTAINER_SSH_SOCK}"]
         if cpus is not None:
             argv += ["--cpus", str(cpus)]

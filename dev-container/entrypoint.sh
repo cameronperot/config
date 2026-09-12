@@ -26,8 +26,24 @@ if [[ -e /.krun_config.json && "$(id -u)" -eq 0 ]]; then
     # reached over TCP: `c -k` has pasta forward guest connections on port 7777
     # to the host's loopback (see dev-container/README.md). Bridge it to the
     # socket path SSH_AUTH_SOCK expects; /run rejects the bind in the guest,
-    # hence /tmp.
-    socat UNIX-LISTEN:/tmp/ssh-agent.sock,fork,mode=0666 TCP:127.0.0.1:7777 &
+    # hence /tmp. The socket is owned by the workload user so agent-sandbox's
+    # invoker-ownership check accepts it.
+    if [[ -n "${GIT_SIGNING_DISABLED:-}" ]]; then
+        unset SSH_AUTH_SOCK
+    else
+        socat "UNIX-LISTEN:/tmp/ssh-agent.sock,fork,mode=0600,user=${uid},group=${gid}" TCP:127.0.0.1:7777 &
+        bridge_pid=$!
+        if ! timeout 3s bash -c '
+            while kill -0 "$1" 2>/dev/null; do
+                [[ -S /tmp/ssh-agent.sock ]] && exit 0
+                sleep 0.05
+            done
+            exit 1
+        ' bash "${bridge_pid}"; then
+            echo "entrypoint: warning: signing agent socket did not become ready; running without SSH_AUTH_SOCK" >&2
+            unset SSH_AUTH_SOCK
+        fi
+    fi
     exec setpriv --reuid="${uid}" --regid="${gid}" "${groups_arg}" -- "$@"
 fi
 

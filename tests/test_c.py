@@ -650,8 +650,6 @@ def test_run_argv_signing_disabled_appends_git_config() -> None:
     without_socket = run_argv(ssh_sock=None, signing_disabled=True)
 
     assert with_socket[len(EXPECTED_HEAD) :] == [
-        *SSH_ENV,
-        *SOCKET_MOUNT,
         *SIGNING_OFF_ENV,
         "dev:latest",
         "bash",
@@ -667,8 +665,7 @@ def test_run_argv_signing_disabled_under_krun() -> None:
     argv = run_argv(krun=True, cpus=4, ram_mib=8192, signing_disabled=True)
 
     assert argv[len(EXPECTED_HEAD) :] == [
-        *SSH_ENV,
-        *("--runtime=krun", "--network", "pasta:-T,7777"),
+        *("--runtime=krun", "--network", "pasta"),
         *("--annotation", "krun.cpus=4", "--annotation", "krun.ram_mib=8192"),
         *SIGNING_OFF_ENV,
         "dev:latest",
@@ -1051,7 +1048,8 @@ def test_main_dry_run_krun_no_git_signing_skips_probe(
     c.main(["--dry-run", "-k", "--no-git-signing", "bash"])
 
     read = capsys.readouterr()
-    assert f" --runtime=krun --network pasta:-T,{port} " in read.out
+    assert " --runtime=krun --network pasta " in read.out
+    assert f"pasta:-T,{port}" not in read.out
     assert (
         " -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=commit.gpgsign "
         "-e GIT_CONFIG_VALUE_0=false " in read.out
