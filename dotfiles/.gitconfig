@@ -10,6 +10,11 @@
     allowedSignersFile = ~/.ssh/allowed_signers
 [core]
     editor = nvim
+    pager = delta
+[interactive]
+    diffFilter = delta --color-only
+[delta]
+    navigate = true
 [pull]
     rebase = false
 [gc]
