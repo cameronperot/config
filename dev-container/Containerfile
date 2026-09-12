@@ -6,7 +6,6 @@ ARG NEW_USER=user
 ARG NEW_UID=1000
 ARG NEW_GID=1000
 ARG HOME_DIR=/home/${NEW_USER}
-ARG GIT_DELTA_VERSION=0.19.2
 ARG GIT_SIGNING_KEY=""
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -29,6 +28,7 @@ RUN apt-get update \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
     aggregate \
+    bat \
     btop \
     bubblewrap \
     build-essential \
@@ -43,6 +43,7 @@ RUN apt-get update \
     gdb \
     gh \
     git \
+    git-delta \
     gnupg2 \
     iproute2 \
     ipset \
@@ -78,6 +79,7 @@ RUN apt-get update \
     tree \
     unzip \
     wget \
+    yq \
     zip \
     zsh \
     # Chromium/Playwright
@@ -101,13 +103,6 @@ RUN apt-get update \
 
 RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
     && locale-gen
-
-# Install Git delta
-RUN ARCH=$(dpkg --print-architecture) \
-    && curl -fsSL -o /tmp/git-delta.deb \
-    "https://github.com/dandavison/delta/releases/download/${GIT_DELTA_VERSION}/git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb" \
-    && dpkg -i /tmp/git-delta.deb \
-    && rm /tmp/git-delta.deb
 
 # Create dev user with sudo access
 RUN groupadd -g "${NEW_GID}" "${NEW_USER}" \
