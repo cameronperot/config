@@ -1,6 +1,41 @@
-#!/usr/bin/env bash
+#!/bin/sh
 
-# Install as ~/.ssh/rc to refresh the remote-only agent symlink on SSH login
-if [ -z "${container:-}" ] && [ -n "${SSH_AUTH_SOCK:-}" ] && [ "$SSH_AUTH_SOCK" != "$HOME/.ssh/ssh_auth_sock" ]; then
-    ln -sfn -- "$SSH_AUTH_SOCK" "$HOME/.ssh/ssh_auth_sock"
+ssh_rc_status=0
+
+if [ -z "${container:-}" ] && [ -n "${SSH_AUTH_SOCK:-}" ]; then
+    (
+        if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ]; then
+            echo "ssh rc: XDG_RUNTIME_DIR is unavailable; cannot refresh the forwarded SSH agent" >&2
+            exit 1
+        fi
+        if [ "$SSH_AUTH_SOCK" = "$XDG_RUNTIME_DIR/ssh-forwarded-agent.sock" ]; then
+            exit 0
+        fi
+        if [ ! -S "$SSH_AUTH_SOCK" ]; then
+            echo "ssh rc: $SSH_AUTH_SOCK is not a socket; keeping the existing forwarded SSH agent link" >&2
+            exit 1
+        fi
+
+        # Rename within the runtime directory so readers always see a complete link
+        ssh_agent_tmp=$(mktemp -d "$XDG_RUNTIME_DIR/ssh-forwarded-agent.XXXXXXXX") || exit $?
+        trap 'rm -f -- "$ssh_agent_tmp/socket"; rmdir -- "$ssh_agent_tmp"' EXIT
+        ln -s -- "$SSH_AUTH_SOCK" "$ssh_agent_tmp/socket" || exit $?
+        mv -Tf -- "$ssh_agent_tmp/socket" "$XDG_RUNTIME_DIR/ssh-forwarded-agent.sock" || exit $?
+    ) || ssh_rc_status=$?
 fi
+
+# A user rc replaces sshd's automatic X11 cookie installation
+if [ -n "${DISPLAY:-}" ]; then
+    if read -r proto cookie; then
+        case "$DISPLAY" in
+            localhost:*) xauth_display="unix:${DISPLAY#localhost:}" ;;
+            *) xauth_display="$DISPLAY" ;;
+        esac
+        printf 'add %s %s %s\n' "$xauth_display" "$proto" "$cookie" | xauth -q - >/dev/null || ssh_rc_status=$?
+    else
+        echo "ssh rc: missing X11 authentication cookie" >&2
+        ssh_rc_status=1
+    fi
+fi
+
+exit "$ssh_rc_status"

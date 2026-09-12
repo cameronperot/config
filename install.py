@@ -174,6 +174,14 @@ class EnvironmentInstaller:
         """
         self._logger.info("Applying host adjustments")
 
+        ssh_dir = self._home_dir / ".ssh"
+        ssh_dir.mkdir(mode=0o700, exist_ok=True)
+        ssh_rc = ssh_dir / "rc"
+        ssh_rc_source = self._home_dir / ".config/tmux/ssh_rc"
+        if ssh_rc.resolve() != ssh_rc_source.resolve():
+            shutil.copyfile(src=ssh_rc_source, dst=ssh_rc)
+        ssh_rc.chmod(0o600)
+
         # if MAMBA_ROOT_PREFIX is set on the host, use it in the deployed .mamba_init.sh
         mamba_root_prefix = os.environ.get("MAMBA_ROOT_PREFIX")
         if mamba_root_prefix:

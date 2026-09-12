@@ -46,6 +46,9 @@ def make_installer(tmp_path, recorder, **kwargs):
     repo = tmp_path / "repo"
     (repo / "dotfiles").mkdir(parents=True, exist_ok=True)
     home.mkdir(exist_ok=True)
+    ssh_rc = home / ".config/tmux/ssh_rc"
+    ssh_rc.parent.mkdir(parents=True, exist_ok=True)
+    ssh_rc.write_text("#!/bin/sh\nexit 0\n")
 
     return RecordingInstaller(recorder, home_dir=home, repo_dir=repo, **kwargs)
 
@@ -227,6 +230,32 @@ def test_host_adjustments_leave_mamba_init_alone_when_unset(tmp_path, monkeypatc
     installer.apply_host_adjustments()
 
     assert (home / ".mamba_init.sh").read_text() == 'export MAMBA_ROOT_PREFIX="/old"\n'
+
+
+def test_host_adjustments_install_private_ssh_rc(tmp_path, monkeypatch):
+    monkeypatch.delenv("MAMBA_ROOT_PREFIX", raising=False)
+    installer = make_installer(tmp_path, [])
+    ssh_dir = tmp_path / "home/.ssh"
+
+    installer.apply_host_adjustments()
+
+    assert (ssh_dir / "rc").read_text() == "#!/bin/sh\nexit 0\n"
+    assert (ssh_dir / "rc").stat().st_mode & 0o777 == 0o600
+    assert ssh_dir.stat().st_mode & 0o777 == 0o700
+
+
+def test_host_adjustments_preserve_existing_ssh_rc_link(tmp_path, monkeypatch):
+    monkeypatch.delenv("MAMBA_ROOT_PREFIX", raising=False)
+    installer = make_installer(tmp_path, [])
+    ssh_dir = tmp_path / "home/.ssh"
+    ssh_dir.mkdir()
+    ssh_rc = ssh_dir / "rc"
+    ssh_rc.symlink_to("../.config/tmux/ssh_rc")
+
+    installer.apply_host_adjustments()
+
+    assert ssh_rc.is_symlink()
+    assert ssh_rc.read_text() == "#!/bin/sh\nexit 0\n"
 
 
 def test_run_skips_neovim_and_adjustments_under_dry_run(tmp_path, monkeypatch, caplog):
