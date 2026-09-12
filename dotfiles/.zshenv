@@ -15,9 +15,6 @@ export HISTFILE="$HOME/.zsh_history"
 export HISTSIZE=1000000
 export SAVEHIST=$HISTSIZE
 
-# hstr
-export HSTR_CONFIG="hicolor prompt-bottom" # get more colors, place prompt at bottom
-
 # Ruby
 export BUNDLE_FORCE_RUBY_PLATFORM=true
 export GEM_HOME="$HOME/gems"
