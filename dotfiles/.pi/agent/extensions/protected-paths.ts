@@ -8,6 +8,8 @@
  *
  * Matching is per path segment, so a `.env` rule no longer catches
  * `.env-example` or a directory called `environments/`.
+ * Explicit `grep` targets also obey zero-access rules; recursive searches and
+ * shell indirection are not contained by this filename-based guard.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -15,7 +17,7 @@ import { blockReason, type GuardAudit, readOnlyMatch, takeLoadIssue, zeroAccessM
 
 export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
-		if (event.toolName !== "write" && event.toolName !== "edit") {
+		if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "grep") {
 			return undefined;
 		}
 
@@ -24,9 +26,9 @@ export default function (pi: ExtensionAPI) {
 			if (issue) ctx.ui.notify(`Guard policy: ${issue}`, "warning");
 		}
 
-		const path = event.input.path as string;
+		const path = (event.input.path as string | undefined) ?? ".";
 		const secret = zeroAccessMatch(path, ctx.cwd);
-		const readOnly = secret ? undefined : readOnlyMatch(path, ctx.cwd);
+		const readOnly = secret || event.toolName === "grep" ? undefined : readOnlyMatch(path, ctx.cwd);
 		const rule = secret
 			? `zero-access path "${secret}"`
 			: readOnly

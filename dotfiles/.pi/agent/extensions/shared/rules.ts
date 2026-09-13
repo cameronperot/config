@@ -3,11 +3,8 @@
  *
  * The three guard extensions (`protected-paths.ts`, `protected-paths-bash.ts`,
  * `permission-gate.ts`) and the `read` guard in `built-in-tool-renderer.ts` are
- * the *mechanism*. The *policy* they enforce lives in `guard-rules.json`, looked
- * up in this order, first hit wins:
- *
- *   1. `<cwd>/.pi/guard-rules.json`      — per-repo policy
- *   2. `~/.pi/agent/guard-rules.json`    — global policy
+ * the *mechanism*. Global `~/.pi/agent/guard-rules.json` defines the policy;
+ * `<cwd>/.pi/guard-rules.json` may add restrictions but cannot weaken it.
  *
  * Rule classes:
  *
@@ -31,17 +28,21 @@
  * recursion) does not try to load it as an extension.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 const HOME = homedir();
+// This is the launcher's mode indicator, not independent proof of isolation.
+const SANDBOX_ACTIVE = process.env.AGENT_SANDBOX_ACTIVE === "1" && !process.env.AGENT_SANDBOX_DISABLE;
 
 export interface BashPattern {
 	pattern: string;
 	reason: string;
 	ask?: boolean;
+	sandboxExemption?: "host" | "tmp-cleanup" | "tmp-permissions";
+	commandExemption?: "git-index" | "git-dry-run";
 }
 
 export interface Rules {
@@ -73,8 +74,13 @@ const SAFETY_FLOOR: Rules = {
 	readOnlyPaths: [".git/"],
 	noDeletePaths: [".git/"],
 	bashPatterns: [
-		{ pattern: "\\brm\\s+(-[^\\s]*)*-[rRf]", reason: "rm with recursive or force flags", ask: true },
-		{ pattern: "\\bsudo\\b", reason: "sudo (runs as root)", ask: true },
+		{
+			pattern: "\\brm\\s+(-[^\\s]*)*-[rRf]",
+			reason: "rm with recursive or force flags",
+			ask: true,
+			sandboxExemption: "tmp-cleanup",
+		},
+		{ pattern: "\\bsudo\\b", reason: "sudo (runs as root)", ask: true, sandboxExemption: "host" },
 	],
 };
 
@@ -101,7 +107,15 @@ function isBashPatternArray(value: unknown): value is BashPattern[] {
 				!!entry &&
 				typeof entry === "object" &&
 				typeof (entry as BashPattern).pattern === "string" &&
-				typeof (entry as BashPattern).reason === "string",
+				typeof (entry as BashPattern).reason === "string" &&
+				((entry as BashPattern).ask === undefined || typeof (entry as BashPattern).ask === "boolean") &&
+				((entry as BashPattern).sandboxExemption === undefined ||
+					(entry as BashPattern).sandboxExemption === "host" ||
+					(entry as BashPattern).sandboxExemption === "tmp-cleanup" ||
+					(entry as BashPattern).sandboxExemption === "tmp-permissions") &&
+				((entry as BashPattern).commandExemption === undefined ||
+					(entry as BashPattern).commandExemption === "git-index" ||
+					(entry as BashPattern).commandExemption === "git-dry-run"),
 		)
 	);
 }
@@ -111,13 +125,13 @@ function isBashPatternArray(value: unknown): value is BashPattern[] {
  * value, so leaving one out cannot silently disable it; a class the file states
  * replaces the floor's entirely, so it can be narrowed on purpose.
  */
-function coerce(parsed: unknown): { rules: Rules; problems: string[] } {
+function coerce(parsed: unknown, defaults: Rules = SAFETY_FLOOR): { rules: Rules; problems: string[] } {
 	const problems: string[] = [];
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		return { rules: SAFETY_FLOOR, problems: ["policy is not a JSON object"] };
+		return { rules: defaults, problems: ["policy is not a JSON object"] };
 	}
 	const raw = parsed as Record<string, unknown>;
-	const rules: Rules = { ...SAFETY_FLOOR };
+	const rules: Rules = { ...defaults };
 
 	for (const key of ["zeroAccessPaths", "zeroAccessAllowPaths", "readOnlyPaths", "noDeletePaths"] as const) {
 		if (raw[key] === undefined) continue;
@@ -139,7 +153,7 @@ function coerce(parsed: unknown): { rules: Rules; problems: string[] } {
 					problems.push(`bashPatterns entry is not a valid regex: ${entry.pattern}`);
 				}
 			}
-			rules.bashPatterns = valid;
+			rules.bashPatterns = problems.length > 0 ? [...defaults.bashPatterns, ...valid] : valid;
 		} else {
 			problems.push("bashPatterns is not an array of {pattern, reason}");
 		}
@@ -152,15 +166,15 @@ export function getRules(cwd: string): LoadedRules {
 	const cached = cache.get(cwd);
 	if (cached) return cached;
 
-	const candidates = [join(cwd, ".pi", "guard-rules.json"), join(getAgentDir(), "guard-rules.json")];
-	const found = candidates.find((candidate) => existsSync(candidate));
+	const globalFile = join(getAgentDir(), "guard-rules.json");
+	const found = existsSync(globalFile) ? globalFile : undefined;
 
 	let loaded: LoadedRules;
 	if (!found) {
 		loaded = {
 			rules: SAFETY_FLOOR,
 			source: "built-in safety floor",
-			error: `No guard-rules.json at ${candidates.join(" or ")} — falling back to the built-in safety floor.`,
+			error: `No guard-rules.json at ${globalFile} — falling back to the built-in safety floor.`,
 		};
 	} else {
 		try {
@@ -176,6 +190,32 @@ export function getRules(cwd: string): LoadedRules {
 				source: "built-in safety floor",
 				error: `${found} could not be parsed (${err instanceof Error ? err.message : String(err)}) — falling back to the built-in safety floor.`,
 			};
+		}
+	}
+
+	const projectFile = join(cwd, ".pi", "guard-rules.json");
+	if (existsSync(projectFile)) {
+		try {
+			const { rules: extra, problems } = coerce(JSON.parse(readFileSync(projectFile, "utf-8")), {
+				zeroAccessPaths: [],
+				zeroAccessAllowPaths: [],
+				readOnlyPaths: [],
+				noDeletePaths: [],
+				bashPatterns: [],
+			});
+			if (extra.zeroAccessAllowPaths.length > 0) problems.push("zeroAccessAllowPaths may only be set in global policy");
+			for (const key of ["zeroAccessPaths", "readOnlyPaths", "noDeletePaths", "bashPatterns"] as const) {
+				loaded.rules = { ...loaded.rules, [key]: [...loaded.rules[key], ...extra[key]] };
+			}
+			loaded.source += ` + ${projectFile}`;
+			if (problems.length > 0) {
+				loaded.error = [loaded.error, `${projectFile}: ${problems.join("; ")}`].filter(Boolean).join("; ");
+			}
+		} catch (err) {
+			loaded.error = [
+				loaded.error,
+				`${projectFile} could not be parsed (${err instanceof Error ? err.message : String(err)}). Global policy remains active.`,
+			].filter(Boolean).join("; ");
 		}
 	}
 
@@ -305,12 +345,114 @@ export interface CompiledBashPattern {
 	ask: boolean;
 }
 
-export function bashPatterns(cwd: string): CompiledBashPattern[] {
-	return getRules(cwd).rules.bashPatterns.map((entry) => ({
-		regex: new RegExp(entry.pattern),
-		reason: entry.reason,
-		ask: entry.ask === true,
-	}));
+/** Parse only standalone literal words; shell expansion and operators stay on the conservative path. */
+function literalWords(command: string): { value: string; quoted: boolean }[] | undefined {
+	if (/[\r\n]/.test(command)) return undefined;
+	const tokens = /(?:'[^']*'|"[^"$`\\]*"|[^\s'"\\$`|&;()<>{}*?!#\[\]])+/y;
+	const words: { value: string; quoted: boolean }[] = [];
+	let offset = 0;
+	while (offset < command.length) {
+		if (/[ \t]/.test(command[offset])) { offset++; continue; }
+		tokens.lastIndex = offset;
+		const match = tokens.exec(command);
+		if (!match) return undefined;
+		const raw = match[0];
+		words.push({
+			value: raw.replace(/'([^']*)'|"([^"]*)"/g, (_match, single, double) => single ?? double),
+			quoted: /['"]/.test(raw),
+		});
+		offset = tokens.lastIndex;
+	}
+	return words;
+}
+
+/** Missing targets are safe only when their nearest existing ancestor resolves inside /tmp. */
+function isTemporaryTarget(target: string): boolean {
+	if (!target.startsWith("/tmp/") || target.split("/").includes("..") || resolve(target) === "/tmp") return false;
+	let ancestor = target;
+	while (!lstatSync(ancestor, { throwIfNoEntry: false })) ancestor = dirname(ancestor);
+	try {
+		const real = realpathSync(ancestor);
+		return real === "/tmp" || real.startsWith("/tmp/");
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw err;
+	}
+}
+
+/** Only exempt a standalone rm with literal targets beneath ephemeral /tmp. */
+function isTemporaryCleanup(command: string): boolean {
+	const parsed = literalWords(command);
+	if (!parsed) return false;
+	const words = parsed.map((word) => word.value);
+	if (words.shift() !== "rm") return false;
+	while (words.length > 0 && /^(?:-[rRf]+|--recursive|--force)$/.test(words[0])) words.shift();
+	if (words[0] === "--") words.shift();
+	return words.length > 0 && words.every(isTemporaryTarget);
+}
+
+/** Permission changes affect inodes, so exclude other filesystems, special files and shared hard links. */
+function isTemporaryPermissionChange(command: string): boolean {
+	const parsed = literalWords(command);
+	if (!parsed) return false;
+	const words = parsed.map((word) => word.value);
+	if (!["chmod", "chown"].includes(words.shift() ?? "")) return false;
+	while (words.length > 0 && /^(?:-[vcf]+|--verbose|--changes|--silent|--quiet)$/.test(words[0])) words.shift();
+	if (words[0] === "--") words.shift();
+	const modeOrOwner = words.shift();
+	if (!modeOrOwner || modeOrOwner.startsWith("-")) return false;
+	if (words[0] === "--") words.shift();
+	return words.length > 0 && words.every((target) => {
+		if (!isTemporaryTarget(target)) return false;
+		const stat = statSync(target, { throwIfNoEntry: false });
+		return stat !== undefined && stat.dev === statSync("/tmp").dev &&
+			(stat.isDirectory() || (stat.isFile() && stat.nlink === 1));
+	});
+}
+
+function isHarmlessGitCommand(command: string, exemption: BashPattern["commandExemption"]): boolean {
+	const words = literalWords(command)?.map((word) => word.value);
+	if (!words || words[0] !== "git") return false;
+	const separator = words.indexOf("--");
+	const options = separator < 0 ? words : words.slice(0, separator);
+	if (exemption === "git-index" && words[1] === "restore") {
+		const flags = options.slice(2).filter((word) => word.startsWith("-"));
+		return flags.some((flag) => flag === "--staged" || flag === "-S") &&
+			flags.every((flag) => ["--staged", "-S", "--quiet", "-q"].includes(flag));
+	}
+	if (exemption !== "git-dry-run") return false;
+	const offset = words[1] === "clean" ? 2 : words[1] === "worktree" && words[2] === "prune" ? 3 : 0;
+	if (!offset) return false;
+	const flags = options.slice(offset).filter((word) => word.startsWith("-"));
+	return flags.some((flag) => flag === "--dry-run" || /^-[ndfxXv]*n[ndfxXv]*$/.test(flag)) &&
+		flags.every((flag) => ["--dry-run", "--verbose"].includes(flag) || /^-[ndfxXv]+$/.test(flag));
+}
+
+/** Match both the original command and common Git global-option spellings. */
+export function matchingBashPatterns(command: string, cwd: string): CompiledBashPattern[] {
+	const words = literalWords(command);
+	// Quoted search/print arguments are data. Keep raw inspection for pipelines,
+	// substitutions, interpreters and rg's executable preprocessor option.
+	const textOnly = words && ["echo", "printf", "rg", "grep"].includes(words[0]?.value) &&
+		!words.some((word) => word.value === "--pre" || word.value.startsWith("--pre="));
+	const inspected = textOnly
+		? words.map((word, index) => index > 0 && word.quoted ? "__quoted_data__" : word.value).join(" ")
+		: command;
+	const normalized = inspected.replace(
+		/\bgit\s+(?:(?:-C|-c|--git-dir|--work-tree)\s+(?:"[^"\n]*"|'[^'\n]*'|[^\s|;&]+)\s+|--(?:git-dir|work-tree)=[^\s|;&]+\s+|--(?:no-pager|paginate|bare|no-optional-locks)\s+)*/g,
+		"git ",
+	);
+	return getRules(cwd).rules.bashPatterns.flatMap((entry) => {
+		const regex = new RegExp(entry.pattern);
+		if (!regex.test(inspected) && !regex.test(normalized)) return [];
+		if (entry.commandExemption && isHarmlessGitCommand(normalized, entry.commandExemption)) return [];
+		if (
+			SANDBOX_ACTIVE && (entry.sandboxExemption === "host" ||
+				(entry.sandboxExemption === "tmp-cleanup" && isTemporaryCleanup(command)) ||
+				(entry.sandboxExemption === "tmp-permissions" && isTemporaryPermissionChange(command)))
+		) return [];
+		return [{ regex, reason: entry.reason, ask: entry.ask === true }];
+	});
 }
 
 /** Commands that can remove or move a path away from where it is. */

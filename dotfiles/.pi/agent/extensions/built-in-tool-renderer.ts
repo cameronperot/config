@@ -199,7 +199,7 @@ export default function (pi: ExtensionAPI) {
 				if (issue) ctx.ui.notify(`Guard policy: ${issue}`, "warning");
 			}
 
-			const secret = zeroAccessMatch(absolutePath, ctx.cwd);
+			const secret = zeroAccessMatch(params.path, ctx.cwd);
 			if (secret) {
 				const rule = `zero-access path "${secret}"`;
 				await logAccess(absolutePath, false, `matches zero-access rule "${secret}"`);

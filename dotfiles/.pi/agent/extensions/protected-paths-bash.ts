@@ -21,6 +21,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { approvalRequiredReason } from "./shared/approval.ts";
 import { logAccess } from "./shared/access-log.ts";
 import {
 	blockReason,
@@ -100,7 +101,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			return {
 				block: true,
-				reason: blockReason(`Possible write to ${rule} (no UI for confirmation).`),
+				reason: approvalRequiredReason("bash", event.input, ctx.cwd, `Possible write to ${rule}.`),
 			};
 		}
 

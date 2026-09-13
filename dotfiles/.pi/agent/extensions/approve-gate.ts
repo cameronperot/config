@@ -35,13 +35,14 @@ import {
 	type ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { approvalRequiredReason } from "./shared/approval.ts";
 import {
-	bashPatterns,
 	blockReason,
 	commandPathMatch,
 	DELETE_INDICATORS,
 	getRules,
 	type GuardAudit,
+	matchingBashPatterns,
 	readOnlyMatch,
 	WRITE_INDICATORS,
 	zeroAccessMatch,
@@ -252,7 +253,7 @@ function guardHandles(event: ToolCallEvent, cwd: string): boolean {
 	if (!isToolCallEventType("bash", event)) return false;
 
 	const command = event.input.command;
-	if (bashPatterns(cwd).some((rule) => rule.regex.test(command))) return true;
+	if (matchingBashPatterns(command, cwd).length > 0) return true;
 
 	const { rules } = getRules(cwd);
 	if (commandPathMatch(command, rules.zeroAccessPaths, cwd)) return true;
@@ -311,7 +312,7 @@ export default function (pi: ExtensionAPI) {
 			pi.appendEntry<GuardAudit>("guard-block", { tool: event.toolName, rule, action: "blocked", detail });
 			return {
 				block: true,
-				reason: blockReason(`${event.toolName} needs approval in ${rule}, and there is no UI to ask through.`),
+				reason: approvalRequiredReason(event.toolName, event.input, ctx.cwd, rule),
 			};
 		}
 

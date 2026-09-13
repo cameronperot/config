@@ -10,7 +10,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { bashPatterns, blockReason, type GuardAudit, takeLoadIssue } from "./shared/rules.ts";
+import { approvalRequiredReason } from "./shared/approval.ts";
+import { blockReason, type GuardAudit, matchingBashPatterns, takeLoadIssue } from "./shared/rules.ts";
 
 export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
@@ -22,8 +23,13 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const command = event.input.command as string;
-		const hit = bashPatterns(ctx.cwd).find((rule) => rule.regex.test(command));
-		if (!hit) return undefined;
+		const hits = matchingBashPatterns(command, ctx.cwd);
+		if (hits.length === 0) return undefined;
+		const blocked = hits.filter((rule) => !rule.ask);
+		const hit = {
+			ask: blocked.length === 0,
+			reason: [...new Set((blocked.length > 0 ? blocked : hits).map((rule) => rule.reason))].join("; "),
+		};
 
 		if (!hit.ask) {
 			if (ctx.hasUI) {
@@ -45,7 +51,7 @@ export default function (pi: ExtensionAPI) {
 				action: "blocked",
 				detail: command,
 			});
-			return { block: true, reason: blockReason(`${hit.reason} (no UI for confirmation).`) };
+			return { block: true, reason: approvalRequiredReason("bash", event.input, ctx.cwd, hit.reason) };
 		}
 
 		const choice = await ctx.ui.select(`⚠️ ${hit.reason}:\n\n  ${command}\n\nAllow?`, ["Yes", "No"]);
