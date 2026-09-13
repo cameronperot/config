@@ -10,7 +10,7 @@ The extensions themselves, by what they do:
   - [Guard policy](#guard-policy) — the `guard-rules.json` classes they enforce
 - [Tools](#tools) — `built-in-tool-renderer.ts`, `todo.ts`, `questionnaire.ts`
 - [Workflow](#workflow) — `preset.ts`, `tools.ts`, `handoff.ts`, `commands.ts`, `subagent/`
-  - [Subagent roles](#subagent-roles) — where `subagent/` reads its agent definitions (nine, in `~/.pi/agent/agents/`)
+  - [Subagent roles](#subagent-roles) — where `subagent/` reads its agent definitions (ten, in `~/.pi/agent/agents/`)
 - [Worktree](#worktree) — `worktree.ts`
 - [Display](#display) — `custom-footer.ts`, `notify.ts`, `system-prompt-header.ts`, `system-prompt-dump.ts.disabled`
 - [Context](#context) — `claude-rules.ts`, `rules-loader.ts`, `shake.ts`
@@ -29,8 +29,8 @@ The guards are the *mechanism*; the policy they enforce is data, in [`guard-rule
 
 | Extension | What it does | Registers |
 |---|---|---|
-| `permission-gate.ts` | Applies `bashPatterns` to every bash command. `ask: true` confirms, otherwise blocks. | — |
-| `protected-paths.ts` | Blocks `write`/`edit` to `zeroAccessPaths` and `readOnlyPaths`. | — |
+| `permission-gate.ts` | Applies all matching `bashPatterns`, with sandbox exemptions. Hard blocks win; otherwise one confirmation lists all reasons. | — |
+| `protected-paths.ts` | Blocks `write`/`edit` to `zeroAccessPaths` and `readOnlyPaths`, and explicit `grep` targets in `zeroAccessPaths`. | — |
 | `protected-paths-bash.ts` | Applies the same path policy to `bash`: blocks `zeroAccessPaths` references and `noDeletePaths` deletions, confirms writes to `readOnlyPaths`. | — |
 | `approve-gate.ts` | Two opt-in modes, both off by default: `/approve` confirms every `write`/`edit`, `/approve-all` confirms every tool bar the read-only ones. | `/approve`, `/approve-all` |
 
@@ -38,7 +38,7 @@ The other three are policy-driven — they act only on a `guard-rules.json` matc
 
 Neither mode ever gates reading. `read`, `grep`, `find` and `ls` pass without a prompt under `/approve-all` too — they cannot modify the filesystem, and approving every file the model opens makes the mode unusable, which means it gets switched off. `todo` and `questionnaire` pass for the same reason; gating `questionnaire` would mean approving the model's request to ask you a question. The principle is **gate side effects, not information**. `bash` is gated in full under `/approve-all`, read-only commands included: the read-only allowlist in `plan-mode/utils.ts` admits `curl` and `env`, so reusing it would punch a hole in the tool with the widest blast radius.
 
-`subagent` is the highest-value gate of the set. The child runs headless in its own context and you never see its tool calls, so approving the delegation is the only control point over that whole session — worth keeping gated, the more so now that `engineer` and `debugger` are write-capable.
+`subagent` runs headless in its own context, so `/approve-all` gates delegation before the child starts. The child's guard confirmations return to the parent as approval requests; ordinary ungated child tool calls do not prompt individually.
 
 Path policy is read through `shared/rules.ts`, shared with the `read` guard in `built-in-tool-renderer.ts` so the two cannot drift — a path blocked for `read` must also be blocked for `cat`, or the block is decoration. `shared/access-log.ts` holds the access log both write to.
 
@@ -47,26 +47,39 @@ Every block and every answered confirmation — including a blocked `read` — i
 **Known gaps.** These are speed bumps, not a security boundary:
 
 - Path matching tokenizes the command on shell metacharacters, so indirection defeats it — `sh -c`, `python -c`, base64, or a path built from a variable.
+- Recursive `grep` or shell searches can read protected files without naming them as the search target. Paths are matched by spelling, not by resolving symlinks. Filename guards cannot identify secrets in otherwise permitted files such as `.envrc` or `server.pem`.
 - Secrets held in **environment variables** cannot be protected at all. The `bash` tool inherits the process environment and `echo $TOKEN` is indistinguishable from any other `echo`. Anything in the environment is readable by the agent; treat it that way when deciding what to export.
 - Overriding a built-in tool does **not** bypass the guards: `tool_call` fires on the tool *name*, before execution, regardless of which implementation backs it.
 
 ## Guard policy
 
-Policy is looked up per cwd, first hit wins: `<cwd>/.pi/guard-rules.json` for per-repo rules, then `~/.pi/agent/guard-rules.json` for global ones.
+Global policy comes from `~/.pi/agent/guard-rules.json`. `<cwd>/.pi/guard-rules.json` may append path restrictions and command rules, but cannot clear global classes or add `zeroAccessAllowPaths`. Project exceptions are ignored with a warning in interactive sessions; edit global policy on the host to permit an exception. Policy is cached per cwd for the process lifetime.
 
 | Class | Effect |
 |---|---|
-| `zeroAccessPaths` | No read, no write, no bash reference. Secrets. |
+| `zeroAccessPaths` | Blocks direct read/write/edit, explicit grep targets and literal bash references. |
 | `zeroAccessAllowPaths` | Exceptions to the above, e.g. `.env.example`. |
-| `readOnlyPaths` | Reads fine; `write`/`edit` and bash writes refused. Lockfiles, build output, shell rc files. |
+| `readOnlyPaths` | Reads fine; `write`/`edit` blocked and suspected bash writes confirmed. |
 | `noDeletePaths` | Deletion and move-away refused. |
-| `bashPatterns` | `{pattern, reason, ask?}` regexes over the command string. |
+| `bashPatterns` | `{pattern, reason, ask?, sandboxExemption?, commandExemption?}` regexes over the command string. |
 
-Severity is a property of the rule, not of the extension enforcing it: `ask: true` prompts, its absence blocks. That is why `git reset --hard` can confirm while `git filter-branch` refuses, from one list. Rules that ask still block when there is no UI to ask through. Path classes carry no per-rule `ask` flag — severity is fixed per class, and `zeroAccessPaths` and `noDeletePaths` always block — so a path pattern that misfires is a hard stop with no keypress to get past it.
+Severity is a property of the rule: `ask: true` prompts, its absence blocks. Every matching rule is considered: any hard block wins; otherwise a single confirmation lists all matching reasons. Common Git global options (`-C`, `-c`, `--git-dir`, `--work-tree`, `--no-pager`, `--paginate`, `--bare`, `--no-optional-locks`) are also matched after normalization. This remains a heuristic, not a shell parser. Rules that ask still block when there is no UI to ask through. Path classes carry no per-rule `ask` flag, and `zeroAccessPaths` and `noDeletePaths` always block.
+
+`sandboxExemption` accepts `host`, `tmp-cleanup` or `tmp-permissions`. Exemptions apply only when the process starts with `AGENT_SANDBOX_ACTIVE=1` and no nonempty `AGENT_SANDBOX_DISABLE`. This trusts the wrapper's mode indicator; it is not independent proof of isolation, so do not export the active marker on the host. `host` skips the annotated `sudo`, `mkfs` and raw-device rules. `tmp-cleanup` skips annotated deletion rules only for a standalone `rm` with `-r`/`-R`/`-f` combinations, `--recursive`, `--force`, or `--`, and literal targets beneath `/tmp`. Single and double quotes, spaces inside quoted paths, and missing targets are supported. The nearest existing ancestor must resolve inside `/tmp`; dangling symlinks, symlinks escaping `/tmp`, `..` components and deletion of `/tmp` itself retain confirmation. Shell expansions, unquoted globs, escapes and compound commands also retain confirmation. The exemption never overrides another matching rule or `/approve-all`. Use `/tmp` for disposable builds; project output directories are not automatically disposable.
+
+`tmp-permissions` exempts the annotated permission/ownership rule for standalone, nonrecursive `chmod` and `chown` calls on literal existing files or directories beneath `/tmp`. Targets must pass the temporary-path check and be on `/tmp`'s filesystem; regular files must have only one hard link. Special files, other filesystems, shared hard links, missing targets and recursive operations retain the guard. Verbose, changes-only and quiet flags (`-v`, `-c`, `-f` and their long forms), quoting and `--` are supported. Other modes of `chmod`/`chown` remain subject to whichever policy rules match; the shipped rule specifically matches commands involving `777`.
+
+`commandExemption` accepts `git-index` or `git-dry-run`, independently of sandbox mode. The shipped restore rule permits standalone `git restore --staged` or `-S`, optionally with `--quiet`/`-q`, and literal paths. Any other option, including worktree restoration, retains the guard. Clean and worktree-prune rules permit literal `--dry-run`/`-n` commands with supported verbosity/clean flags; unknown or negated options retain the guard. Exemptions apply only to their annotated rules, so project restrictions and `/approve-all` still apply.
+
+Quoted arguments to standalone `echo`, `printf`, `rg` and `grep` are omitted from command-rule matching: searching for `DROP DATABASE` or printing `git push --force` does not execute those commands. The literal-word scanner declines shell operators, expansions, escapes and multiline commands, which retain raw inspection. Interpreters such as `bash -c` or `psql -c`, pipelines, and `rg --pre` also retain inspection. Path guards are separate and still inspect quoted path references.
+
+When no UI is available, a confirmation returns an `Approval required (no UI)` result with exact tool input, cwd and reason. `shared/approval.ts` collects these from failed tool-result messages. The subagent extension includes outstanding requests in returned text and `approvalRequests` details, reports those children as needing approval, and stops dependent chain steps even if the child exits successfully or omits the request from its final text. The parent must use its normal approval guards to execute the action in the stated cwd before delegating remaining work. This does not approve anything automatically or convert hard blocks into approval requests.
 
 Matching is per **path segment**, with `*`/`?` confined to one segment, `~` expanded, and relative patterns matching a contiguous run of segments at any depth, so `node_modules/` catches it however deep it is nested.
 
-`shared/rules.ts` holds a small `SAFETY_FLOOR`. A missing, malformed or partial policy falls back to it rather than to no protection, and the problem is announced once per cwd. A class the file omits keeps the floor's value, so leaving one out cannot quietly disable it; a class the file states replaces the floor's, so it can be narrowed on purpose.
+`shared/rules.ts` holds a small `SAFETY_FLOOR`. A missing, malformed or partial global policy falls back to it, and the problem is announced once per cwd in interactive sessions. A class the global file omits keeps the floor's value; a class it states replaces the floor's, so it can be narrowed on purpose. Invalid command regexes retain the fallback command rules. Malformed project policy leaves global protection active.
+
+Run the guard regression tests from the repository root with `node --test tests/test_pi_guards.mjs` (tested with Node 26.5.1). They exercise the guard modules with a mocked Pi UI, without starting an agent or contacting a provider. Run `npm run typecheck` from this directory to check against the installed Pi types.
 
 ## Tools
 
@@ -88,7 +101,7 @@ Two choices are worth knowing. Glyphs are Nerd Font with no ascii fallback, and 
 | `tools.ts` | Interactive checklist to enable/disable tools mid-session; persists to the session and restores on start and on `/tree` navigation. | `/tools` |
 | `handoff.ts` | `/handoff <goal>` summarises the session into a self-contained prompt and opens it in a fresh session. Non-lossy alternative to `/compact`. Costs one LLM call. | `/handoff` |
 | `commands.ts` | Lists every slash command, filterable by source. | `/commands` |
-| `subagent/` | Delegates a task to a child `pi` process with its own context window; only the child's final output returns. Single, parallel (max 8, 4 concurrent) and chain modes. | tool `subagent` |
+| `subagent/` | Delegates a task to a child `pi` process with its own context window; returns final output or outstanding approval requests. Single, parallel (max 8, 4 concurrent) and chain modes. | tool `subagent` |
 
 The `plan-mode/` directory is staged as `index.ts.disabled`, so Pi's loader skips it: `/plan` and `/steps` do not exist, and the `--plan` flag and Ctrl+Alt+P shortcut it used to register now belong to plannotator — re-enabling it would overlap both. Its design property still holds for when it returns: it only ever *removes* tools (`edit`, `write`), so entering it can never hand back something the active mode withheld on purpose.
 
@@ -129,9 +142,9 @@ Two consequences to plan around. Rewriting an old message invalidates the provid
 
 ## Subagent roles
 
-`subagent/` reads its agent definitions from `~/.pi/agent/agents/*.md` (user scope) and the nearest `.pi/agents/` directory up the tree (project scope), outside this directory. Nine roles are defined in `~/.pi/agent/agents/` — scout, docs-researcher, planner, engineer, test-runner, debugger, reviewer, security-auditor, pr-summarizer — matching the descriptions in `../AGENTS.md`; tool grants, model pins and output contracts are tabulated in [`../agents/README.md`](../agents/README.md). On a name conflict under the `both` scope, the project definition wins.
+`subagent/` reads its agent definitions from `~/.pi/agent/agents/*.md` (user scope) and the nearest `.pi/agents/` directory up the tree (project scope), outside this directory. Ten roles are defined in `~/.pi/agent/agents/` — scout, docs-researcher, planner, engineer, linter, test-runner, debugger, reviewer, security-auditor, pr-summarizer — matching the descriptions in `../AGENTS.md`; tool grants, model pins and output contracts are tabulated in [`../agents/README.md`](../agents/README.md). On a name conflict under the `both` scope, the project definition wins.
 
-A `tools:` list in frontmatter becomes the child's `--tools` allowlist, so a role without `subagent` cannot recurse and a role without `bash` cannot run commands. A `model:` string is passed to the child as `--model` and needs the provider prefix (`provider/model`) — all nine roles pin one.
+A `tools:` list in frontmatter becomes the child's `--tools` allowlist, so a role without `subagent` cannot recurse and a role without `bash` cannot run commands. A `model:` string is passed to the child as `--model` and needs the provider prefix (`provider/model`) — all ten roles pin one.
 
 ## npm packages
 

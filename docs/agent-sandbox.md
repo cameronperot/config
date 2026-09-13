@@ -65,12 +65,14 @@ All paths in this table are relative to `$HOME`. Each agent also receives writab
 
 | Agent | Additional writable state | Additional read-only pins |
 | :--- | :--- | :--- |
-| `pi` | `.pi` | Under `.pi/agent/`: `skills`, `prompts`, `settings.json`, `guard-rules.json`, `AGENTS.md`, `agents`, `extensions` |
+| `pi` | `.pi` | Under `.pi/agent/`: `skills`, `prompts`, `settings.json`, `models.json`, `worktree.json`, `guard-rules.json`, `AGENTS.md`, `agents`, `extensions` |
 | `omp` | `.omp` | Under `.omp/agent/`: `skills`, `prompts`, `config.yml`, `AGENTS.md`, `extensions` |
 | `opencode` | `.opencode`, `.local/share/opencode`, `.local/state/opencode`, `.local/share/opentui` | Entire `.config/opencode` directory |
 | `claude` | `.claude`, `.local/state/claude` | Under `.claude/`: `settings.json`, `skills`, `rules`, `agents`, `commands` |
 
-Before a real launch, the wrapper creates missing state directories on the host and verifies that they are owned by the invoking user and have no symlinked components. Pinned symlinks must resolve within the selected agent's state directories. Missing pinned JSON files are seeded with `{}`, and missing pinned directory paths are created; absent `AGENTS.md` and `config.yml` files are not seeded. Existing pins are mounted read-only over the writable state.
+Before a real launch, the wrapper creates missing state directories on the host and verifies that they are owned by the invoking user and have no symlinked components. Pinned symlinks must resolve within the selected agent's state directories. Missing pinned JSON files are seeded with `{}` (`{"providers": {}}` for Pi's `models.json`), and missing pinned directory paths are created; absent `AGENTS.md` and `config.yml` files are not seeded. Existing pins are mounted read-only over the writable state.
+
+Pi's `trust.json` remains writable so `/trust` can save decisions. Sessions, credentials and other unpinned state also remain accessible inside the sandbox. Model/provider configuration and global worktree setup commands must be edited from the host.
 
 Edit protected configuration and install OpenCode plugins from the host. `pi-create-skill` and `pi-create-prompt` target pinned paths and therefore need to run on the host. Other writes beneath the sandbox's `.local` and `.config` disappear on exit unless covered by a persistent bind.
 
