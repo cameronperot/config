@@ -16,8 +16,7 @@ Trailing input after `/skill:changelog` selects the workflow:
 - `release`, optionally with a version (e.g. `release 2.0.0`) → Cut a release.
 - Any other text → a description of changes for Add entries.
 
-Conversational requests map the same way.
-With no input, default to Add entries.
+Conversational requests map the same way. With no input, default to Add entries. A request only to draft release notes produces notes in the requested destination or conversation; it does not implicitly modify CHANGELOG.md or cut a release.
 
 ## Format rules
 
@@ -26,22 +25,22 @@ With no input, default to Add entries.
 - Version headings are `## [X.Y.Z] - YYYY-MM-DD`. Dates are ISO 8601; get today's date with `date +%F`, never from memory.
 - Group entries under these headings in this order, omitting empty ones: `### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security`.
 - One change per bullet, verb-first sentence style ("Added retry logic to the order client"). Reference issue or PR numbers where they help readers.
-- Prefix breaking changes with `**Breaking:**` — they force a major version bump.
-- Version headings are markdown link references. Maintain the link block at the bottom of the file: `[Unreleased]` compares the latest tag to `HEAD`, each version compares to its predecessor, and the oldest version links to its release tag. Derive URLs from `git remote get-url origin`; if there is no remote, omit the link block entirely rather than writing placeholder links.
+- Prefix breaking changes with `**Breaking:**`; use the project's version policy, with a major bump for incompatible public API changes at or after 1.0.0.
+- Version headings are markdown link references. Maintain the link block at the bottom of the file: `[Unreleased]` compares the latest tag to `HEAD`, each version compares to its predecessor, and the oldest version links to its release tag. Derive URLs from the repository's actual remote and tag naming convention, preserving existing links. Convert SSH remotes to the host's web URL; do not assume every host uses GitHub compare paths. If no valid link can be derived, omit that new link instead of inventing one. Before the first release, leave Unreleased unlinked if no comparison base exists.
 - Keep yanked releases listed and mark them: `## [0.4.0] - 2026-01-10 [YANKED]`.
 - Record every deprecation under `### Deprecated` — it is the warning users need before a removal.
 - Never rewrite released sections except to fix factual errors or add `[YANKED]`.
 
 ## Add entries
 
-1. Locate `CHANGELOG.md` at the repo root. If it is missing, run Initialize first.
-2. Determine what changed. Prefer the user's description or the current session's edits. Otherwise inspect history: find the last release tag with `git describe --tags --abbrev=0`, then read `git log <tag>..HEAD` and the corresponding diffs; if no tags exist, use the commits since the last change to `CHANGELOG.md`.
-3. Rewrite each change as a user-facing entry under the correct category in `[Unreleased]`. Skip internal-only noise (CI tweaks, refactors with no observable effect) unless the user asks to include it.
+1. Locate the changelog requested by the user or used by the project; default to root `CHANGELOG.md`. If it is missing and an update was requested, initialize it.
+2. Determine changes from the user's description, session edits, or history and diffs since the relevant release. Resolve the baseline from the latest release for this package; the nearest tag from `git describe --tags --abbrev=0` may belong to another package or release line. If no release baseline exists, inspect available history and existing entries; ask only if the intended range remains material and unclear.
+3. Merge each change into a user-facing entry under the correct category in `[Unreleased]`, avoiding duplicates. Skip internal-only noise (CI tweaks, refactors with no observable effect) unless the user asks to include it.
 
 ## Cut a release
 
 1. Confirm `[Unreleased]` is non-empty and covers everything since the last tag; run Add entries for anything missing.
-2. Use the version the user named. Otherwise derive it from the `[Unreleased]` content: any breaking change → major, anything under Added, Changed, Deprecated, or Removed → minor, only Fixed or Security → patch. Before 1.0.0, breaking changes may ship in a minor bump.
+2. Use the version the user named, checking for duplicate or non-increasing versions and policy conflicts before editing. Otherwise derive the bump from compatibility impact, not category headings alone: incompatible public API changes → major, compatible additions or public deprecations → minor, compatible fixes → patch. Follow the project's pre-1.0 and prerelease policy; ask if an initial version or unresolved compatibility choice would change the release.
 3. Rename `[Unreleased]` to `[X.Y.Z] - <today>` and insert a fresh `## [Unreleased]` heading above it.
 4. Update the link block: add the new version's compare link and repoint `[Unreleased]` to compare from the new tag.
 5. Do not tag, commit, or publish unless asked.
@@ -49,7 +48,7 @@ With no input, default to Add entries.
 ## Initialize
 
 Create `CHANGELOG.md` at the repo root with the preamble and empty `[Unreleased]` section shown in the example.
-Offer to backfill released versions from existing git tags, but only do so if the user accepts; date each backfilled version from its tag (`git log -1 --format=%as <tag>`).
+Backfill releases only when requested. Use recorded release dates where available; an annotated tag date or tagged commit date is only a fallback, and `git log -1 --format=%as <tag>` is the commit author date, not necessarily the release date. Identify inferred dates rather than presenting them as verified.
 
 ## Example
 
@@ -96,3 +95,7 @@ Rewriting a commit into an entry:
 ## Existing non-standard changelogs
 
 If the repo already maintains its changelog in a different consistent format, follow that format and tell the user, instead of converting it unasked.
+
+## Completion
+
+Inspect the final diff: entries match the evidence and requested range, Unreleased appears once, categories and versions are ordered, links use the correct tags, and released history is preserved except for authorized corrections. Report the file or notes produced, release version if applicable, and any uncertain dates or missing history. This skill does not itself authorize tags, commits, or publication.
