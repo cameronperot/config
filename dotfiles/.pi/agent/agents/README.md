@@ -1,48 +1,57 @@
 # Pi Sub-Agents
 
-Nine sub-agent definitions for the Pi coding harness. Pi core ships no sub-agents; this repo bundles its own extension (`dotfiles/.pi/agent/extensions/subagent/`), which `install.py` deploys to `~/.pi/agent/extensions/subagent/` (auto-loaded by pi). The definitions follow current best practices: single responsibility, minimal tool grants, read-only by default, and explicit output contracts.
+Ten sub-agent definitions for the Pi coding harness, loaded by this repo's [subagent extension](../extensions/subagent/index.ts). `install.py` deploys the definitions to `~/.pi/agent/agents/` and the extension to `~/.pi/agent/extensions/subagent/`. The `agents` directory is included in the `.pi/agent` scope in `dotfiles.yaml`.
 
 ## How the extension runs agents
 
-Each invocation spawns an isolated `pi` process:
+Each invocation starts a separate Pi process with its own conversation context, using the current executable when possible. The effective arguments are:
 
 ```
-pi --mode json -p --no-session [--model <model>] [--tools <tools>] --append-system-prompt <body> "Task: ..."
+pi --mode json -p --no-session [--model <model>] [--thinking <level>] [--tools <tools>] --append-system-prompt <temporary-prompt-file> "Task: ..."
 ```
 
 Consequences for the agent files:
 
 - Frontmatter fields the extension reads: `name` and `description` (required strings) and `tools` / `model` (optional). Any other field (e.g. `thinking`, `systemPromptMode`) is ignored.
 - `description` is what the parent agent sees when deciding which agent to delegate to — keep it specific about when to use the agent and what it returns.
-- The markdown body is appended to pi's built-in system prompt; AGENTS.md context files, skills, and extensions still apply to the sub-agent.
-- `model` pins the sub-agent's model, with an optional `:<thinking>` suffix (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) to fix its thinking/reasoning level. Without the suffix, a pinned model falls back to `defaultThinkingLevel` from `settings.json`, then pi's built-in default (`medium`). Without a `model` field, the sub-agent inherits the dispatching session's model and thinking level. There is no dedicated `thinking` frontmatter field — the extension ignores it.
+- The markdown body is written to a temporary file and appended to Pi's system prompt. AGENTS.md context files, skills, and extensions still load; this README is not appended as shared agent instructions.
+- `model` is passed through to Pi, including any `:<thinking>` suffix. Without a `model` field, the extension passes the dispatching session's model and thinking level. With a model pin, it does not separately pass `--thinking`. There is no dedicated `thinking` frontmatter field.
 - `tools` is a strict allowlist over built-in, extension, and custom tools. Names that aren't registered are silently ignored (they do not cause an error).
-- Agents run in the dispatching session's working directory (or an explicit `cwd` per task) with the user's full permissions.
+- Agents run in the dispatching session's working directory, or an explicit `cwd` per task. Separate processes share the workspace; they do not get separate checkouts or filesystems.
+- None of these definitions grants `todo`, `questionnaire`, or `subagent`. Children return material questions and suggested handoffs in their final output; the parent handles interaction and further delegation.
 
 ## Install
 
 - User scope (all projects): `~/.pi/agent/agents/` — what this repo deploys.
-- Project scope: `.pi/agents/` from the project root. Project agents override user agents on name conflicts, and pi asks for confirmation before first use in an untrusted repo.
+- Project scope: the nearest `.pi/agents/` directory found by walking upward from the dispatching session's working directory. The default scope is user-only; `agentScope: "both"` enables project overrides by name, and `"project"` selects only project agents. With a UI and `confirmProjectAgents` enabled (the default), the extension asks before each invocation that selects project agents; it does not store a first-use trust decision.
 
 ## Agents
 
-| Agent | Tools | Writes? | Purpose |
+| Agent | Tools | Source edits? | Purpose |
 |---|---|---|---|
 | scout | read, grep, find, ls | No | Codebase recon → compact map |
-| docs-researcher | read, grep, find, ls | No | External/API research brief (needs web tools) |
+| docs-researcher | read, grep, find, ls | No | Version-aware API/spec brief from available sources; external verification gaps |
 | planner | read, grep, find, ls | No | Minimal numbered implementation plan |
 | engineer | read, grep, find, ls, bash, edit, write | Yes | Implements a plan/task: writes code, runs tests |
-| test-runner | read, grep, find, ls, bash | No (runs cmds) | Run tests/build, structured triage |
+| linter | read, grep, find, ls, bash, edit | Yes (existing files only; check-only supported) | Python lint/format/type fixes using py-lint-fix and py-typecheck |
+| test-runner | read, grep, find, ls, bash | No | Existing tests/builds, results and failure triage |
 | debugger | read, grep, find, ls, bash, edit | Yes (existing files only) | Reproduce → isolate → fix one bug |
 | reviewer | read, grep, find, ls, bash | No | Independent severity-ranked review |
 | security-auditor | read, grep, find, ls, bash | No | Vulnerability audit with attack scenarios |
 | pr-summarizer | read, grep, find, ls, bash | No | PR/commit summary from git diff |
 
-`scout`, `docs-researcher`, `test-runner`, and `pr-summarizer` pin `openrouter/z-ai/glm-5.3-flash:low` (cheap/fast, low thinking); `engineer` pins `openrouter/z-ai/glm-5.3-flash:max` (cheap model, maximum thinking effort); `planner`, `debugger`, `reviewer`, and `security-auditor` pin `openrouter/z-ai/glm-5.3:high` (stronger reasoning, thinking pinned high). Both models resolve via `pi --list-models`. Remove the `model:` field to inherit the session model and thinking level instead.
+`scout`, `docs-researcher`, `test-runner`, and `pr-summarizer` pin `openrouter/z-ai/glm-5.3-flash:low`; `engineer` and `linter` pin `openrouter/z-ai/glm-5.3-flash:max`; `planner`, `debugger`, `reviewer`, and `security-auditor` pin `openrouter/z-ai/glm-5.3:high`. These are configured model choices, not a guarantee of provider availability. Remove `model:` to inherit the dispatching session's model and thinking level.
 
-## Notes
+## Dev-container boundaries
 
-- `web_search`/`web_fetch` are not pi built-ins and no web-access extension is installed in this setup, so docs-researcher grants only read/grep/find/ls. A comment in `docs-researcher.md` marks where to re-add the web tools once a web extension is available (unregistered tool names would be silently ignored).
-- Pi runs with your full user permissions and no built-in approval prompts — sandbox (container/micro-VM) before trusting write-capable agents (debugger) or bash.
-- Note the agent files are not yet covered by the `.pi/agent` scope in `dotfiles.yaml`, so `sync_dotfiles.py` reports them as orphaned repo files.
-- Recommended chain: scout → planner → implement in main session (or delegate a concrete plan to engineer) → test-runner → reviewer.
+- The [dev-container setup](../../../../dev-container/README.md) routes agent commands through `agent-sandbox`. Children inherit the parent's sandbox: the workspace is writable, system and agent configuration paths are restricted, and network access remains shared. The dispatching working directory is not necessarily `/work`; `c` preserves the mounted project path.
+- The image provides tools including `git`, `rg`, `fd`, `curl`, `uv`, and the micromamba `dev` environment. Availability in the image does not grant an agent shell access. Use project-defined commands and check their prerequisites; do not assume host services or credentials are available. The sandbox does not expose host `gh` authentication.
+- `docs-researcher` has neither shell nor web tools. It can inspect local or supplied source content and return precise requests for external verification to the parent. Live web research requires a separately authorized tool/configuration change.
+- Read-only roles with `bash` rely on their instructions to restrict command side effects; the allowlist is not a read-only shell sandbox. Test-runner and reviewer may produce ordinary check artifacts, but must not edit source, configuration, or snapshots. Debugger and linter edit existing files only; engineer can create files.
+- Guard extensions still apply in children. Commands requiring guard confirmation are blocked in headless mode; the child reports the denial to the parent rather than attempting an interactive prompt or bypass.
+
+## Handoffs
+
+Give each task its scope, expected behavior, relevant findings, and acceptance criteria; children cannot see the parent's conversation. For review or summarization, specify refs or which working-tree changes to include. Only the child's final output is forwarded as the textual result, so it must include verification evidence and blockers.
+
+A typical sequence is scout → planner → engineer (or implementation in the parent) → test-runner → reviewer. Use linter for Python lint and type diagnostics, debugger for a concrete failure, security-auditor for security-sensitive scope, docs-researcher for source verification, and pr-summarizer for the final draft. In chain mode, include `{previous}` in a task to pass the preceding child's final output; earlier task context is not carried forward automatically. The parent must inspect blocked or partial results before continuing: a process can exit successfully even when its final text reports incomplete work.
