@@ -9,6 +9,7 @@ Configuration and setup scripts for a Linux development environment built around
 | `install.py` | Rsyncs `dotfiles/` into `$HOME`, installs Neovim, and adjusts the deployed copies to the host |
 | `dotfiles/` | Tracked dotfiles |
 | `dotfiles/bin/` | User scripts deployed to `~/bin` |
+| `dotfiles/bin/agent-sandbox` | Python 3.12+ wrapper for `unshare`/bubblewrap isolation |
 | `dotfiles.yaml` | Manifest for `sync_dotfiles.py`: what to sync, exclude and watch |
 | `sync_dotfiles.py` | Copies dotfiles from `$HOME` back into `dotfiles/` |
 | `environment.yml` | Micromamba environment `dev` (Python and core tooling) |
@@ -16,7 +17,7 @@ Configuration and setup scripts for a Linux development environment built around
 | `julia/julia-setup.jl` | Installs the default Julia package set |
 | `dev-container/` | Dev container image, compose file, and entrypoint |
 | `dev-vm/` | KVM + QEMU + libvirt VM instructions |
-| `tests/` | Pytest coverage for installation, dotfile sync, and container tools |
+| `tests/` | Pytest coverage for installation, dotfile sync, container tools, and `agent-sandbox` |
 | `pyproject.toml` | Pytest and coverage configuration (the repo is not a Python package) |
 | `Makefile` | Shortcuts for the commands below (`make help`) |
 

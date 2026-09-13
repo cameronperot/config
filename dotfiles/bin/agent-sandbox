@@ -1,142 +1,109 @@
-#!/usr/bin/env bash
-# Launch pi, omp, opencode or claude with a restricted filesystem view.
-# Persistent writes go to the workspace and selected agent state; the rest
-# of the home directory is hidden behind tmpfs. Network access is shared.
-# See docs/agent-sandbox.md in the repository for usage and isolation limits.
-#
-# Usage: agent-sandbox [script-flags] [--] <agent> [agent-args...]
-# Once <agent> is parsed, every remaining argument belongs to that agent.
+#!/usr/bin/env python3
+"""Launch coding agents with unshare and Bubblewrap filesystem isolation."""
 
-set -euo pipefail
+import errno
+import os
+import pwd
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import MappingProxyType
+from typing import Never
 
-readonly HOME_DIR="${HOME}"
-UID_NUM="$(id -u)"
-readonly UID_NUM
-GID_NUM="$(id -g)"
-readonly GID_NUM
-USER_NAME="$(id -un)"
-readonly USER_NAME
-readonly SANDBOX_PATH="/opt/mamba/envs/dev/bin:${HOME_DIR}/.local/bin:\
-/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
-
-declare -rA AGENT_EXE=(
-    [pi]="${HOME_DIR}/.local/bin/pi"
-    [omp]="${HOME_DIR}/.local/bin/omp"
-    [opencode]="${HOME_DIR}/.local/bin/opencode"
-    [claude]="${HOME_DIR}/.local/bin/claude"
+HOME_RO_PATHS = (
+    ".config/git/config",
+    ".config/git/ignore",
+    ".config/git/attributes",
+    ".config/pip",
+    ".config/pnpm",
+    ".config/uv",
+    ".local/bin",
+    ".local/lib",
+    ".local/share/claude",
+    ".local/share/pnpm",
+    ".local/share/uv",
 )
 
-# Space-separated paths relative to HOME. All agents share .agent;
-# opencode also needs a persistent opentui cache to avoid fetching its
-# tree-sitter assets each session. Its config is mounted separately below.
-declare -rA AGENT_STATE_DIRS=(
-    [pi]=".agent .pi"
-    [omp]=".agent .omp"
-    [opencode]=".agent .opencode .local/share/opencode .local/state/opencode \
-.local/share/opentui"
-    [claude]=".agent .claude .local/state/claude"
+PACKAGE_RC_FILES = (
+    ".npmrc",
+    ".bunfig.toml",
 )
 
-# Expose individual toolchain and CLI config paths, not all of .local or
-# .config: those trees also hold other agents' credentials and gh login state.
-# Git config is selected by file to exclude .config/git/credentials.
-# Editor config is omitted, so core.editor=nvim uses Neovim's defaults.
-readonly -a HOME_RO_PATHS=(
-    .config/git/config .config/git/ignore .config/git/attributes
-    .config/pip .config/pnpm .config/uv
-    .local/bin .local/lib .local/share/claude .local/share/pnpm
-    .local/share/uv
+DENY_PREFIXES = (
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/etc",
+    "/opt",
+    "/var",
+    "/boot",
+    "/root",
+    "/srv",
+    "/tmp",
+    "/run",
+    "/proc",
+    "/sys",
+    "/dev",
 )
 
-# Keep npm/bun release-age settings when the lightweight credential scan
-# permits it. Scan whole lines, including comments; this does not parse TOML
-# or decode escapes. These files are expected to contain no secrets.
-readonly -a PACKAGE_RC_FILES=(.npmrc .bunfig.toml)
-readonly PACKAGE_RC_CREDENTIAL_RE='(_auth|token|password|username|://[^/]*@)'
-
-# Mount these paths read-only after their writable state directories.
-# Pin the shared .agent targets as well as agent-local skills/prompts;
-# pi/omp may use symlinks whose entries remain replaceable in writable state.
-# Pin all of opencode's config tree because it discovers plugins and tools
-# by directory name. Its package installs therefore belong on the host.
-# Claude's plugin cache remains writable for installs.
-declare -rA AGENT_RO_PATHS=(
-    [pi]=".agent/skills .agent/prompts .agent/rules .pi/agent/skills \
-.pi/agent/prompts .pi/agent/settings.json .pi/agent/guard-rules.json \
-.pi/agent/AGENTS.md .pi/agent/agents .pi/agent/extensions"
-    [omp]=".agent/skills .agent/prompts .agent/rules .omp/agent/skills \
-.omp/agent/prompts .omp/agent/config.yml .omp/agent/AGENTS.md \
-.omp/agent/extensions"
-    [opencode]=".agent/skills .agent/prompts .agent/rules .config/opencode"
-    [claude]=".agent/skills .agent/prompts .agent/rules .claude/settings.json \
-.claude/skills .claude/rules .claude/agents .claude/commands"
+API_KEY_VARS = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "OPENCODE_API_KEY",
+    "GEMINI_API_KEY",
 )
 
-# Claude needs nested user namespaces for its own Bash sandbox. For the
-# other agents, disable nesting only if the runtime probe succeeds.
-declare -rA AGENT_DISABLE_USERNS=(
-    [pi]=1
-    [omp]=1
-    [opencode]=1
-    [claude]=0
+FORWARD_VARS = (
+    "TERM",
+    "COLORTERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_COLLATE",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TZ",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
 )
 
-# Never use system paths as writable workspaces. Paths hidden by later
-# tmpfs/proc/dev mounts are rejected too, rather than accepting a hidden bind.
-readonly -a DENY_PREFIXES=(
-    /usr /bin /sbin /lib /lib64 /etc /opt /var /boot /root /srv
-    /tmp /run /proc /sys /dev
+FORWARD_PATH_VARS = (
+    "TERMINFO",
+    "SSL_CERT_FILE",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
 )
 
-readonly -a API_KEY_VARS=(
-    ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY OPENCODE_API_KEY
-    GEMINI_API_KEY
+SSH_PUBKEY_TYPES = (
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
 )
 
-# These values do not name files that need mounting; copy them verbatim.
-readonly -a FORWARD_VARS=(
-    TERM COLORTERM LANG LC_ALL LC_CTYPE LC_MESSAGES LC_COLLATE LC_NUMERIC
-    LC_TIME TZ http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY
-    NO_PROXY
+PACKAGE_RC_CREDENTIAL_RE = re.compile(
+    pattern=rb"(_auth|token|password|username|://[^/]*@)", flags=re.I
 )
 
-# Validate each path's resolved target against the exposed directory trees.
-# Forward the canonical target so hidden symlink spellings are not needed.
-# Colon-separated SSL_CERT_DIR/TERMINFO_DIRS are omitted
-# because this check handles one path at a time.
-readonly -a FORWARD_PATH_VARS=(
-    TERMINFO SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE
-    CURL_CA_BUNDLE
-)
-
-# Recognized first fields for public-key files. This is a format screen;
-# it does not validate the key blob cryptographically.
-readonly -a SSH_PUBKEY_TYPES=(
-    ssh-ed25519 ssh-rsa ecdsa-sha2-nistp256 ecdsa-sha2-nistp384
-    ecdsa-sha2-nistp521 sk-ssh-ed25519@openssh.com
-    sk-ecdsa-sha2-nistp256@openssh.com
-)
-
-bwrap_args=()
-agent_args=()
-state_dirs=()
-agent=""
-exe=""
-cwd_physical=""
-workspace=""
-git_common_dir=""
-ssh_sock=""
-signing_key_file=""
-signing_pubkey=""
-rc_files=()
-parent_dirs=()
-userns_blockable=0
-dry_run=0
-verbose=0
-
-usage() {
-    cat <<EOF
-Usage: ${0##*/} [script-flags] [--] <agent> [agent-args...]
+USAGE = """Usage: agent-sandbox [script-flags] [--] <agent> [agent-args...]
 
 Launch a terminal LLM coding agent inside a bubblewrap sandbox. The
 host home directory is hidden; the agent sees only a read-only
@@ -144,22 +111,26 @@ allowlist (toolchains, non-secret CLI configs, .gitconfig,
 .ssh/allowed_signers, credential-free .npmrc and .bunfig.toml), its own
 state dirs, and the current workspace.
 
+Requires Python 3.12+, unshare, bubblewrap, git and ssh-add. Python runs
+the wrapper; unshare and bubblewrap provide the isolation.
+
 Agents: pi, omp, opencode, claude
 
 Script flags (must precede <agent>; "--" ends them; everything after
 <agent> is passed to the agent verbatim):
   -h, --help     show this help
   -v, --verbose  report resolution decisions on stderr
-  --debug        trace execution (set -x); API key values stay hidden
+  --debug        verbose output plus resolution summary and launch argv;
+                 API key values are redacted (not a line-by-line trace)
   --dry-run      print the sandbox argv (API key values redacted) without
                  touching the host or launching anything
 
 Examples:
-  ${0##*/} pi
-  ${0##*/} --dry-run claude
-  ${0##*/} claude --dry-run     # --dry-run goes to claude, not this script
-  ${0##*/} -- pi -v             # "--" ends the script flags; -v goes to pi
-  ${0##*/} -v opencode
+  agent-sandbox pi
+  agent-sandbox --dry-run claude
+  agent-sandbox claude --dry-run     # --dry-run goes to claude, not this script
+  agent-sandbox -- pi -v             # "--" ends the script flags; -v goes to pi
+  agent-sandbox -v opencode
 
 Environment:
   AGENT_SANDBOX_DISABLE=1   exec the agent binary unsandboxed (escape hatch)
@@ -169,12 +140,17 @@ Environment:
                             (nesting guard)
 
 Notes:
+  Network access remains shared. Credential screening scans plain text,
+  including comments; it does not parse TOML or decode escapes. Secrets
+  in exposed files remain readable. The signing socket identity check
+  applies at launch and does not restrict later socket requests.
   Run from inside the project the agent should work on; the git
   toplevel (or the cwd when outside git) is bind-mounted read-write and
   the directories above it are read-only mounts.
-  \$HOME must be canonical: symlinked components and a trailing slash
+  $HOME must be canonical: symlinked components and a trailing slash
   are refused.
-  claude: the sandbox sets CLAUDE_CONFIG_DIR=\$HOME/.claude so all
+  TERM defaults to dumb when unset; an explicitly empty TERM is omitted.
+  claude: the sandbox sets CLAUDE_CONFIG_DIR=$HOME/.claude so all
   state lives in one rw dir; sandboxed and host runs diverge unless the
   same variable is also exported on the host.
   ~/.agent is shared across all agents by design.
@@ -200,667 +176,1311 @@ Notes:
   from inside the sandbox by design; manage them from the host.
   Exception: for a .bare layout the whole .bare container directory is
   the workspace, so sibling worktrees resolve inside.
-EOF
-}
+"""
 
-die() {
-    echo "${0##*/}: error: $*" >&2
-    exit 1
-}
 
-warn() {
-    echo "${0##*/}: warning: $*" >&2
-}
+class SandboxError(Exception):
+    """An expected launch failure reported without a traceback.
 
-log_verbose() {
-    if ((verbose)); then
-        echo "${0##*/}: $*" >&2
-    fi
-}
+    Attributes:
+        usage: Whether the CLI should include usage text with the error.
+        exit_code: Process status returned by the CLI.
+    """
 
-# Stop parsing at the agent name so agent flags never become wrapper flags.
-parse_args() {
-    while (($# > 0)); do
-        case "$1" in
-        -h | --help)
-            usage
-            exit 0
-            ;;
-        -v | --verbose)
-            verbose=1
-            shift
-            ;;
-        --debug)
-            set -x
-            shift
-            ;;
-        --dry-run)
-            dry_run=1
-            shift
-            ;;
-        --)
-            shift
-            break
-            ;;
-        -*)
-            usage >&2
-            die "unknown flag: $1"
-            ;;
-        *)
-            break
-            ;;
-        esac
-    done
-    if (($# == 0)) || [[ -z "$1" ]]; then
-        usage >&2
-        die "missing <agent>"
-    fi
-    agent="$1"
-    shift
-    agent_args=("$@")
-}
+    def __init__(
+        self, message: str, *, usage: bool = False, exit_code: int = 1
+    ) -> None:
+        """Initialize an expected launch failure.
 
-# Overrides replace the executable, but retain the selected agent's policy.
-validate_agent() {
-    if [[ -z "${AGENT_EXE[${agent}]:-}" ]]; then
-        usage >&2
-        die "unknown agent: ${agent}"
-    fi
-    exe="${AGENT_EXE[${agent}]}"
-    read -ra state_dirs <<<"${AGENT_STATE_DIRS[${agent}]}"
-    if [[ -n "${AGENT_SANDBOX_BIN:-}" ]]; then
-        exe="${AGENT_SANDBOX_BIN}"
-    fi
-    if [[ ! -x "${exe}" ]]; then
-        die "agent executable missing or not executable: ${exe}"
-    fi
-}
+        Args:
+            message: Description of the failure.
+            usage: Whether to display usage text.
+            exit_code: Process status to return.
+        """
+        super().__init__(message)
+        self.usage = usage
+        self.exit_code = exit_code
 
-# Any nonempty bypass variable skips setup, including --dry-run handling.
-# AGENT_SANDBOX_ACTIVE prevents wrappers from stacking another sandbox.
-maybe_exec_agent() {
-    if [[ -n "${AGENT_SANDBOX_DISABLE:-}" || -n "${AGENT_SANDBOX_ACTIVE:-}" ]]; then
-        exec "${exe}" "${agent_args[@]}"
-    fi
-}
 
-# $1 is a canonical absolute path; call after workspace resolution.
-# This prefix check covers the main exposed trees, not every individual bind
-# or symlink spelling. It is used for executable and environment validation.
-path_is_exposed() {
-    local path="$1" rel prefix
-    local -a prefixes=(/usr /etc /opt/mamba "${workspace}")
-    if [[ -n "${git_common_dir}" ]]; then
-        prefixes+=("${git_common_dir}")
-    fi
-    for rel in "${HOME_RO_PATHS[@]}" "${state_dirs[@]}"; do
-        prefixes+=("${HOME_DIR}/${rel}")
-    done
-    for prefix in "${prefixes[@]}"; do
-        if [[ "${path}" == "${prefix}" || "${path}" == "${prefix}"/* ]]; then
-            return 0
-        fi
-    done
-    return 1
-}
+@dataclass(frozen=True)
+class AgentPolicy:
+    """Define persistent state, read-only pins and nested namespace policy.
 
-# Catch executable targets outside the mounts before bwrap reports ENOENT.
-check_exe_visible() {
-    local real
-    real="$(realpath -e "${exe}")" || die "agent executable unresolvable: ${exe}"
-    if ! path_is_exposed "${real}"; then
-        die "agent executable ${exe} resolves to ${real}, which the sandbox does not expose"
-    fi
-}
+    Args:
+        state_dirs: Writable state directories relative to the invoker's home.
+        ro_paths: Read-only paths relative to the invoker's home.
+        disable_userns: Whether to block nested user namespaces when supported.
+    """
 
-# Keep the controlling terminal for interactive agents. Since --new-session
-# would break that setup, require the kernel's legacy TIOCSTI switch to be off.
-check_tiocsti() {
-    local file="/proc/sys/dev/tty/legacy_tiocsti" value
-    if [[ ! -r "${file}" ]]; then
-        die "${file} missing (kernel < 6.2): TIOCSTI escape unmitigated"
-    fi
-    read -r value <"${file}"
-    if [[ "${value}" != 0 ]]; then
-        die "dev.tty.legacy_tiocsti=${value}: TIOCSTI escape unmitigated"
-    fi
-}
+    state_dirs: tuple[str, ...]
+    ro_paths: tuple[str, ...]
+    disable_userns: bool = True
 
-# Rewriting HOME would invalidate absolute paths stored in agent config.
-# Reject symlink components and trailing slashes instead.
-check_home_canonical() {
-    if [[ "$(realpath "${HOME_DIR}")" != "${HOME_DIR}" ]]; then
-        die "HOME is not canonical (symlinked components and trailing slashes are refused): ${HOME_DIR}"
-    fi
-}
 
-# Use the Git toplevel, or the physical cwd outside Git. A .bare common
-# directory selects its entire container so sibling worktrees remain visible.
-# Reject other Git directories without a worktree and cwd outside the result.
-resolve_workspace() {
-    local common gitdir
-    cwd_physical="$(pwd -P)"
-    if workspace="$(git rev-parse --show-toplevel 2>/dev/null)"; then
-        common="$(git rev-parse --path-format=absolute --git-common-dir)"
-        common="$(realpath "${common}")"
-        if [[ "${common##*/}" == ".bare" ]]; then
-            # Include the .git pointer and sibling worktrees used by pi's
-            # worktree extension. The common dir is already inside this bind.
-            workspace="${common%/*}"
-            log_verbose ".bare-style repo; workspace: ${workspace}"
-        elif [[ "${common}" != "${workspace}" &&
-            "${common}" != "${workspace}"/* ]]; then
-            git_common_dir="${common}"
-            log_verbose "git common dir outside workspace: ${common}"
-        fi
-    elif gitdir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)"; then
-        gitdir="$(realpath "${gitdir}")"
-        if [[ "${gitdir##*/}" != ".bare" ]]; then
-            die "inside a git directory without a work tree: ${cwd_physical}"
-        fi
-        workspace="${gitdir%/*}"
-        log_verbose ".bare-style repo without a work tree; workspace: ${workspace}"
-    else
-        workspace="${cwd_physical}"
-    fi
-    if [[ "${cwd_physical}" != "${workspace}" &&
-        "${cwd_physical}" != "${workspace}"/* ]]; then
-        die "cwd ${cwd_physical} is outside the workspace ${workspace}"
-    fi
-    log_verbose "workspace: ${workspace}"
-}
+POLICIES = MappingProxyType(
+    {
+        "pi": AgentPolicy(
+            state_dirs=(
+                ".agent",
+                ".pi",
+            ),
+            ro_paths=(
+                ".agent/skills",
+                ".agent/prompts",
+                ".agent/rules",
+                ".pi/agent/skills",
+                ".pi/agent/prompts",
+                ".pi/agent/settings.json",
+                ".pi/agent/guard-rules.json",
+                ".pi/agent/AGENTS.md",
+                ".pi/agent/agents",
+                ".pi/agent/extensions",
+            ),
+            disable_userns=True,
+        ),
+        "omp": AgentPolicy(
+            state_dirs=(
+                ".agent",
+                ".omp",
+            ),
+            ro_paths=(
+                ".agent/skills",
+                ".agent/prompts",
+                ".agent/rules",
+                ".omp/agent/skills",
+                ".omp/agent/prompts",
+                ".omp/agent/config.yml",
+                ".omp/agent/AGENTS.md",
+                ".omp/agent/extensions",
+            ),
+            disable_userns=True,
+        ),
+        "opencode": AgentPolicy(
+            state_dirs=(
+                ".agent",
+                ".opencode",
+                ".local/share/opencode",
+                ".local/state/opencode",
+                ".local/share/opentui",
+            ),
+            ro_paths=(
+                ".agent/skills",
+                ".agent/prompts",
+                ".agent/rules",
+                ".config/opencode",
+            ),
+            disable_userns=True,
+        ),
+        "claude": AgentPolicy(
+            state_dirs=(
+                ".agent",
+                ".claude",
+                ".local/state/claude",
+            ),
+            ro_paths=(
+                ".agent/skills",
+                ".agent/prompts",
+                ".agent/rules",
+                ".claude/settings.json",
+                ".claude/skills",
+                ".claude/rules",
+                ".claude/agents",
+                ".claude/commands",
+            ),
+            disable_userns=False,
+        ),
+    }
+)
 
-# $1 is a canonical bind source; $2 labels errors. Reject broad home access,
-# hidden top-level home entries, and the system/temporary prefixes above.
-refuse_denied_path() {
-    local path="$1" label="$2" prefix
-    if [[ "${path}" == / ]]; then
-        die "${label} is /: refusing to sandbox here"
-    fi
-    if [[ "${path}" == "${HOME_DIR}" ]]; then
-        die "${label} is \$HOME: refusing to rw-bind the home directory"
-    fi
-    if [[ "${HOME_DIR}/" == "${path}"/* ]]; then
-        die "${label} ${path} is an ancestor of \$HOME: refusing"
-    fi
-    if [[ "${path}" == "${HOME_DIR}"/.* ]]; then
-        die "${label} ${path} is a hidden entry under \$HOME: refusing"
-    fi
-    for prefix in "${DENY_PREFIXES[@]}"; do
-        if [[ "${path}" == "${prefix}" || "${path}" == "${prefix}"/* ]]; then
-            die "${label} ${path} is at/under ${prefix}: refusing"
-        fi
-    done
-}
 
-# A repository-controlled .git file can redirect the common directory.
-# Apply the same deny rules to that extra writable bind as to the workspace.
-validate_workspace() {
-    refuse_denied_path "${workspace}" "workspace root"
-    if [[ -n "${git_common_dir}" ]]; then
-        refuse_denied_path "${git_common_dir}" "git common dir"
-    fi
-}
+@dataclass(frozen=True)
+class Options:
+    """Store wrapper flags and the untouched agent argument boundary.
 
-# Collect unique ancestors, with each parent before its children. They get
-# separate read-only mounts so a sibling worktree cannot be created in an
-# ephemeral directory while its registration persists in the Git common dir.
-resolve_parent_chain() {
-    local -a binds=("${workspace}") chain
-    local -A seen=()
-    local bind dir
-    if [[ -n "${git_common_dir}" ]]; then
-        binds+=("${git_common_dir}")
-    fi
-    for bind in "${binds[@]}"; do
-        chain=()
-        dir="${bind%/*}"
-        while [[ -n "${dir}" && "${dir}" != "${HOME_DIR}" ]]; do
-            chain=("${dir}" "${chain[@]}")
-            dir="${dir%/*}"
-        done
-        for dir in "${chain[@]}"; do
-            if [[ -z "${seen[${dir}]:-}" ]]; then
-                seen[${dir}]=1
-                parent_dirs+=("${dir}")
-            fi
-        done
-    done
-}
+    Args:
+        agent: Supported agent name.
+        agent_args: Arguments forwarded verbatim to the agent.
+        dry_run: Whether to print the command without changing state or launching.
+        verbose: Whether to report resolution decisions.
+        debug: Whether to emit detailed redacted diagnostics.
+    """
 
-# Only forward an owned Unix socket advertising exactly the configured key.
-# A general-purpose ssh-agent would also expose login/deploy signing powers.
-# This checks identities at launch; it does not restrict later socket requests.
-# Bound identity discovery to 3 seconds, then allow 1 second before SIGKILL.
-# Probe failures (including a missing timeout utility) disable forwarding.
-resolve_ssh_sock() {
-    local listing
-    local -a keys fields
-    if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
-        if [[ -z "${GIT_SIGNING_DISABLED:-}" ]]; then
-            warn "SSH_AUTH_SOCK unset: ssh-agent not forwarded"
-        fi
-        return 0
-    fi
-    if ! ssh_sock="$(realpath -e "${SSH_AUTH_SOCK}" 2>/dev/null)"; then
-        warn "SSH_AUTH_SOCK dangling: ssh-agent not forwarded"
-        return 0
-    fi
-    if [[ ! -S "${ssh_sock}" || ! -O "${ssh_sock}" ]]; then
-        warn "SSH_AUTH_SOCK not an invoker-owned socket: not forwarded"
-        ssh_sock=""
-        return 0
-    fi
-    if [[ -z "${signing_pubkey}" ]]; then
-        warn "no ssh signing key configured: ssh-agent not forwarded"
-        ssh_sock=""
-        return 0
-    fi
-    if ! listing="$(SSH_AUTH_SOCK="${ssh_sock}" timeout --kill-after=1s 3s ssh-add -L 2>/dev/null)"; then
-        warn "ssh-agent must hold exactly the signing key: not forwarded"
-        ssh_sock=""
-        return 0
-    fi
-    readarray -t keys <<<"${listing}"
-    read -ra fields <<<"${keys[0]}"
-    if ((${#keys[@]} != 1)) ||
-        [[ "${fields[0]:-} ${fields[1]:-}" != "${signing_pubkey}" ]]; then
-        warn "ssh-agent must hold exactly the signing key: not forwarded"
-        ssh_sock=""
-        return 0
-    fi
-    log_verbose "ssh-agent socket: ${ssh_sock}"
-}
+    agent: str
+    agent_args: tuple[str, ...] = ()
+    dry_run: bool = False
+    verbose: bool = False
+    debug: bool = False
 
-# Read global Git config only: repository config must not choose a host file
-# to mount. Accept a public-key literal (with optional key:: prefix) or a file
-# passing the single-record/type check. Keep its type/blob for socket matching.
-resolve_signing_key() {
-    local format key lines line type blob rest
-    format="$(git config --global --get gpg.format 2>/dev/null || true)"
-    key="$(git config --global --get user.signingkey 2>/dev/null || true)"
-    if [[ "${format}" != ssh || -z "${key}" ]]; then
-        return 0
-    fi
-    key="${key#key::}"
-    if [[ "${key}" == \~/* ]]; then
-        key="${HOME_DIR}/${key#\~/}"
-    fi
-    if [[ -f "${key}" ]]; then
-        # The whole file becomes readable. Require one nonblank line and a
-        # recognized key type. Allow grep's no-match status and read's EOF
-        # status so empty files and a missing final newline reach the checks.
-        lines="$(grep -c '[^[:space:]]' "${key}")" || true
-        read -r line <"${key}" || true
-        read -r type blob rest <<<"${line}"
-        if ((lines != 1)) || [[ " ${SSH_PUBKEY_TYPES[*]} " != *" ${type} "* ]]; then
-            warn "user.signingkey ${key} is not a public key file: not exposed"
-            return 0
-        fi
-        signing_key_file="$(realpath "${key}")"
-        log_verbose "signing key file: ${signing_key_file}"
-    else
-        read -r type blob rest <<<"${key}"
-    fi
-    signing_pubkey="${type} ${blob}"
-}
 
-# Omit files on scan errors as well as credential matches. Do not use grep
-# -q: it can return success despite a read error. Never print matched lines.
-resolve_package_rc() {
-    local rel file status
-    for rel in "${PACKAGE_RC_FILES[@]}"; do
-        file="${HOME_DIR}/${rel}"
-        if [[ ! -f "${file}" ]]; then
-            continue
-        fi
-        if grep -Ei -- "${PACKAGE_RC_CREDENTIAL_RE}" "${file}" >/dev/null 2>&1; then
-            warn "${file} contains credentials: not bound"
-        else
-            status=$?
-            if ((status == 1)); then
-                rc_files+=("${file}")
-            else
-                warn "${file}: cannot inspect package config (status ${status}): not bound"
-            fi
-        fi
-    done
-}
+@dataclass(frozen=True)
+class Runtime:
+    """Capture the invoker context before sandbox setup.
 
-# $1 is a canonical target. Pinned symlinks may resolve only within these
-# state trees, which have already been selected for host write access.
-path_in_state_dirs() {
-    local path="$1" dir prefix
-    for dir in "${state_dirs[@]}"; do
-        prefix="${HOME_DIR}/${dir}"
-        if [[ "${path}" == "${prefix}" || "${path}" == "${prefix}"/* ]]; then
-            return 0
-        fi
-    done
-    return 1
-}
+    Args:
+        home: Invoker's home directory.
+        cwd: Physical working directory.
+        env: Invoker environment, excluded from the instance representation.
+        uid: Invoker's user ID.
+        gid: Invoker's group ID.
+        user: Invoker's account name.
+        verbose: Whether to report resolution decisions.
+        debug: Whether to emit detailed redacted diagnostics.
+    """
 
-# Prepare persistent state on the host; dry runs skip this function.
-# Reject symlinked state roots before mounting them writable. Recheck pinned
-# symlinks on every launch because a previous session could replace the link.
-ensure_state_dirs() {
-    local -a pinned
-    local dir path rel real
-    for dir in "${state_dirs[@]}"; do
-        path="${HOME_DIR}/${dir}"
-        if [[ "$(realpath -m -- "${path}")" != "${path}" ]]; then
-            die "state dir has symlinked components: ${path}"
-        fi
-        mkdir -p "${path}"
-        if [[ "$(realpath -e -- "${path}")" != "${path}" ]]; then
-            die "state dir has symlinked components: ${path}"
-        fi
-        if [[ ! -O "${path}" ]]; then
-            die "state dir not owned by invoker: ${path}"
-        fi
-    done
-    # --ro-bind-try cannot protect a missing entry. Seed JSON files with {}
-    # and extensionless paths as directories so those mounts always apply.
-    # Other file formats are left to the dotfiles; inventing empty YAML or
-    # Markdown content could change how an agent loads its configuration.
-    read -ra pinned <<<"${AGENT_RO_PATHS[${agent}]}"
-    for rel in "${pinned[@]}"; do
-        path="${HOME_DIR}/${rel}"
-        if [[ -e "${path}" || -L "${path}" ]]; then
-            real="$(realpath -e -- "${path}" 2>/dev/null)" ||
-                die "pinned path ${path} resolves outside the agent's state dirs: dangling symlink"
-        else
-            # Resolve missing paths too, before mkdir/redirect can follow an
-            # existing parent symlink into an unrelated host directory.
-            real="$(realpath -m -- "${path}")"
-        fi
-        if [[ "${real}" != "${path}" ]] && ! path_in_state_dirs "${real}"; then
-            die "pinned path ${path} resolves outside the agent's state dirs: ${real}"
-        fi
-        if [[ -e "${path}" ]]; then
-            continue
-        fi
-        case "${rel##*/}" in
-        *.json)
-            mkdir -p "${path%/*}"
-            printf '{}\n' >"${path}"
-            ;;
-        *.*) ;;
-        *)
-            mkdir -p "${path}"
-            ;;
-        esac
-    done
-    # Copy host Claude state once; later sandbox sessions keep their own copy.
-    if [[ "${agent}" == claude && ! -e "${HOME_DIR}/.claude/.claude.json" &&
-        -f "${HOME_DIR}/.claude.json" ]]; then
-        cp "${HOME_DIR}/.claude.json" "${HOME_DIR}/.claude/.claude.json"
-    fi
-}
+    home: Path
+    cwd: Path
+    env: Mapping[str, str] = field(repr=False)
+    uid: int
+    gid: int
+    user: str
+    verbose: bool = False
+    debug: bool = False
 
-# Test --disable-userns under the same outer namespace setup as the launch.
-# Some containers deny the user.max_user_namespaces write it needs; warn and
-# keep nesting available there instead of making the agent unusable.
-probe_userns_blockable() {
-    local out
-    if out="$(unshare --user --map-user="${UID_NUM}" --map-group="${GID_NUM}" \
-        --fork --pid -- bwrap --unshare-user --disable-userns \
-        --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib64 /lib64 \
-        --dev /dev -- /usr/bin/true 2>&1 >/dev/null)"; then
-        userns_blockable=1
-        log_verbose "--disable-userns usable; nesting will be blocked"
-        return 0
-    fi
-    warn "--disable-userns unavailable here (${out}); nested user namespaces stay possible"
-}
+    def report(self, message: str, *, level: str = "warning") -> None:
+        """Write a redacted diagnostic when its verbosity level is enabled.
 
-# run_agent creates the outer user/PID namespaces. bwrap adds IPC/UTS
-# isolation and, when supported and requested, a user namespace with nesting
-# disabled. Network and cgroup namespaces stay shared.
-add_namespace_args() {
-    bwrap_args+=(--die-with-parent --unshare-ipc --unshare-uts)
-    if ((userns_blockable && ${AGENT_DISABLE_USERNS[${agent}]})); then
-        bwrap_args+=(--unshare-user --disable-userns)
-    fi
-}
+        Args:
+            message: Diagnostic text before API-key redaction.
+            level: Warning, verbose or debug diagnostic level.
+        """
+        if level == "verbose" and not (self.verbose or self.debug):
+            return
+        if level == "debug" and not self.debug:
+            return
 
-# Start from an empty environment and restore only explicit settings.
-# Suppress xtrace while adding API_KEY_VARS; other forwarded values are traced.
-add_env_args() {
-    local var real xtrace_on=0
-    bwrap_args+=(
-        --clearenv
-        --setenv HOME "${HOME_DIR}"
-        --setenv PATH "${SANDBOX_PATH}"
-        --setenv PWD "${cwd_physical}"
-        --setenv USER "${USER_NAME}"
-        --setenv LOGNAME "${USER_NAME}"
-        --setenv SHELL /bin/bash
-        --setenv XDG_RUNTIME_DIR "/run/user/${UID_NUM}"
-    )
-    for var in "${FORWARD_VARS[@]}"; do
-        if [[ -n "${!var:-}" ]]; then
-            bwrap_args+=(--setenv "${var}" "${!var}")
-            log_verbose "forwarding ${var}"
-        fi
-    done
-    for var in "${FORWARD_PATH_VARS[@]}"; do
-        if [[ -z "${!var:-}" ]]; then
-            continue
-        fi
-        if ! real="$(realpath -e "${!var}" 2>/dev/null)"; then
-            warn "${var} does not exist: not forwarded"
-        elif path_is_exposed "${real}"; then
-            bwrap_args+=(--setenv "${var}" "${real}")
-            log_verbose "forwarding ${var}"
-        else
-            warn "${var} points outside the sandbox: not forwarded"
-        fi
-    done
-    if [[ -n "${ssh_sock}" ]]; then
-        bwrap_args+=(--setenv SSH_AUTH_SOCK "${ssh_sock}")
-    fi
-    # A host-selected port enables remote Plannotator setup. Without it,
-    # leave both variables out so the caller keeps its normal UI behavior.
-    if [[ -n "${PLANNOTATOR_PORT:-}" ]]; then
-        bwrap_args+=(
-            --setenv PLANNOTATOR_PORT "${PLANNOTATOR_PORT}"
-            --setenv PLANNOTATOR_REMOTE "${PLANNOTATOR_REMOTE:-1}"
+        prefix = "" if level == "verbose" else f"{level}: "
+        print(
+            f"agent-sandbox: {prefix}{redact_text(message=message, env=self.env)}",
+            file=sys.stderr,
         )
-        log_verbose "plannotator UI port: ${PLANNOTATOR_PORT}"
-    fi
-    if [[ "${agent}" == claude ]]; then
-        bwrap_args+=(--setenv CLAUDE_CONFIG_DIR "${HOME_DIR}/.claude")
-    fi
-    bwrap_args+=(--setenv AGENT_SANDBOX_ACTIVE 1)
-    if [[ "$-" == *x* ]]; then
-        xtrace_on=1
-        set +x
-    fi
-    for var in "${API_KEY_VARS[@]}"; do
-        if [[ -n "${!var:-}" ]]; then
-            bwrap_args+=(--setenv "${var}" "${!var}")
-            log_verbose "forwarding ${var}"
-        fi
-    done
-    if ((xtrace_on)); then
-        set -x
-    fi
-}
 
-# Rebuild the system view with read-only tools/config and fresh proc/dev.
-# Any DNS target under /run must be mounted after /run's tmpfs.
-add_system_args() {
-    local resolv
-    bwrap_args+=(
-        --ro-bind /usr /usr
-        --symlink usr/bin /bin
-        --symlink usr/sbin /sbin
-        --symlink usr/lib /lib
-        --symlink usr/lib64 /lib64
-        --ro-bind /etc /etc
-        --ro-bind /opt/mamba /opt/mamba
-        --proc /proc
-        --dev /dev
-        --tmpfs /tmp
-        --tmpfs /run
-        --perms 0700 --dir "/run/user/${UID_NUM}"
+
+@dataclass(frozen=True)
+class Workspace:
+    """Identify writable project and external Git metadata binds.
+
+    Args:
+        root: Workspace root.
+        common_dir: Git common directory requiring a separate writable bind.
+    """
+
+    root: Path
+    common_dir: Path | None = None
+
+
+@dataclass(frozen=True)
+class Signing:
+    """Identify the selected public key and its optional host file.
+
+    Args:
+        key_file: Canonical public-key file to expose.
+        pubkey: Public-key type and blob used to match agent identities.
+    """
+
+    key_file: Path | None = None
+    pubkey: str = ""
+
+
+def parse_args(argv: Sequence[str]) -> Options | None:
+    """Parse wrapper flags only before the agent name.
+
+    Args:
+        argv: Command-line arguments excluding the wrapper executable.
+
+    Returns:
+        Parsed options, or None when help was requested.
+
+    Raises:
+        SandboxError: If a flag is unknown or the agent is missing or unsupported.
+    """
+    verbose = debug = dry_run = False
+    index = 0
+    while index < len(argv):
+        word = argv[index]
+        if word in ("-h", "--help"):
+            return None
+        if word in ("-v", "--verbose"):
+            verbose = True
+        elif word == "--debug":
+            debug = True
+        elif word == "--dry-run":
+            dry_run = True
+        elif word == "--":
+            index += 1
+            break
+        elif word.startswith("-"):
+            raise SandboxError(message=f"unknown flag: {word}", usage=True)
+        else:
+            break
+        index += 1
+
+    if index == len(argv) or not argv[index]:
+        raise SandboxError(message="missing <agent>", usage=True)
+    agent = argv[index]
+    if agent not in POLICIES:
+        raise SandboxError(message=f"unknown agent: {agent}", usage=True)
+
+    return Options(
+        agent=agent,
+        agent_args=tuple(argv[index + 1 :]),
+        verbose=verbose,
+        debug=debug,
+        dry_run=dry_run,
     )
-    # The /etc bind preserves resolv.conf symlinks, but /run was replaced.
-    # Restore just the resolved DNS file when the link points there.
-    resolv="$(realpath -e /etc/resolv.conf 2>/dev/null || true)"
-    if [[ "${resolv}" == /run/* ]]; then
-        bwrap_args+=(--ro-bind-try "${resolv}" "${resolv}")
-    fi
-}
 
-# Mount ancestors above HOME first; mounting them later would hide the home
-# tmpfs. The final remount pass locks them after all child mounts exist.
-add_home_ancestor_args() {
-    local dir
-    for dir in "${parent_dirs[@]}"; do
-        if [[ "${HOME_DIR}/" == "${dir}"/* ]]; then
-            bwrap_args+=(--tmpfs "${dir}")
-        fi
-    done
-}
 
-# Mount order is policy: empty home, read-only allowlist, writable state,
-# then read-only pins inside that state. Intermediate directories such as
-# .local and .config remain writable tmpfs and disappear when the run ends.
-add_home_args() {
-    local -a pinned
-    local dir path
-    bwrap_args+=(--perms 0700 --tmpfs "${HOME_DIR}")
-    for dir in "${HOME_RO_PATHS[@]}"; do
-        path="${HOME_DIR}/${dir}"
-        bwrap_args+=(--ro-bind-try "${path}" "${path}")
-    done
-    bwrap_args+=(
-        --ro-bind "${HOME_DIR}/.gitconfig" "${HOME_DIR}/.gitconfig"
-        --ro-bind-try "${HOME_DIR}/.ssh/allowed_signers"
-        "${HOME_DIR}/.ssh/allowed_signers"
+def resolve_executable(*, runtime: Runtime, agent: str) -> str:
+    """Select and validate the agent executable or its override.
+
+    Args:
+        runtime: Invoker paths and environment.
+        agent: Supported agent name.
+
+    Returns:
+        Executable path retaining the selected spelling.
+
+    Raises:
+        SandboxError: If the executable is missing or not executable.
+    """
+    exe = runtime.env.get("AGENT_SANDBOX_BIN") or str(
+        runtime.home / ".local/bin" / agent
     )
-    for path in "${rc_files[@]}"; do
-        bwrap_args+=(--ro-bind-try "${path}" "${path}")
-    done
-    for dir in "${state_dirs[@]}"; do
-        path="${HOME_DIR}/${dir}"
-        bwrap_args+=(--bind "${path}" "${path}")
-    done
-    read -ra pinned <<<"${AGENT_RO_PATHS[${agent}]}"
-    for dir in "${pinned[@]}"; do
-        path="${HOME_DIR}/${dir}"
-        bwrap_args+=(--ro-bind-try "${path}" "${path}")
-    done
-}
+    if not os.access(path=exe, mode=os.X_OK):
+        raise SandboxError(f"agent executable missing or not executable: {exe}")
+    return exe
 
-# Preserve absolute paths for Git metadata, virtualenvs and lockfiles.
-# Create the remaining ancestor mounts before the writable binds. The final
-# remount pass locks each ancestor without making its child binds read-only.
-# Ordinary sibling worktrees stay hidden; a .bare container includes them.
-add_workspace_args() {
-    local -a binds=("${workspace}")
-    local bind dir
-    if [[ -n "${git_common_dir}" ]]; then
-        binds+=("${git_common_dir}")
-    fi
-    for dir in "${parent_dirs[@]}"; do
-        if [[ "${HOME_DIR}/" != "${dir}"/* ]]; then
-            bwrap_args+=(--tmpfs "${dir}")
-        fi
-    done
-    for bind in "${binds[@]}"; do
-        bwrap_args+=(--bind "${bind}" "${bind}")
-    done
-}
 
-# Add signing mounts after all tmpfs mounts so /run, /tmp or home overlays
-# cannot hide them. Use resolved source paths; only remounts follow this step.
-add_signing_args() {
-    if [[ -n "${signing_key_file}" ]]; then
-        bwrap_args+=(--ro-bind-try "${signing_key_file}" "${signing_key_file}")
-    fi
-    if [[ -n "${ssh_sock}" ]]; then
-        bwrap_args+=(--bind "${ssh_sock}" "${ssh_sock}")
-    fi
-}
+def check_home_canonical(home: str) -> Path:
+    """Validate the original lexical spelling of the home directory.
 
-# All mount points must exist before their parents become read-only.
-# Mount flags enforce this even when the directory owner could change modes.
-add_remount_args() {
-    local dir
-    for dir in "${parent_dirs[@]}"; do
-        bwrap_args+=(--remount-ro "${dir}")
-    done
-}
+    Args:
+        home: Unmodified HOME value, including any trailing slash.
 
-# Print shell-quoted arguments, masking only --setenv values in API_KEY_VARS.
-# Agent arguments and other environment values are not redacted.
-print_redacted_argv() {
-    while (($#)); do
-        if (($# >= 3)) && [[ "$1" == --setenv &&
-            " ${API_KEY_VARS[*]} " == *" $2 "* ]]; then
-            printf '%q %q *** ' "$1" "$2"
-            shift 3
-        else
-            printf '%q ' "$1"
-            shift
-        fi
-    done
-    printf '\n'
-}
+    Returns:
+        Canonical home path.
 
-# Create user/PID namespaces before bwrap: this container setup rejects a
-# fresh /proc when bwrap creates the PID namespace itself ("Mount too revealing").
-# Preserve the invoker's UID/GID instead of mapping to root. Nested bwrap may
-# still fail in containers, including Claude's own Bash sandbox.
-# Dry runs skip the namespace probe, so their argv omits --disable-userns.
-# Leave xtrace off from here: argv now contains the forwarded API keys.
-run_agent() {
-    set +x
-    local -a argv=(
-        unshare --user --map-user="${UID_NUM}" --map-group="${GID_NUM}"
-        --fork --pid -- bwrap "${bwrap_args[@]}" --chdir "${cwd_physical}"
-        -- "${exe}" "${agent_args[@]}"
+    Raises:
+        SandboxError: If the spelling contains symlinked or redundant components,
+            or the resolved home is the filesystem root.
+        OSError: If the path cannot be resolved.
+    """
+    path = Path(home).resolve()
+    if str(path) != home:
+        raise SandboxError(
+            "HOME is not canonical (symlinked components and trailing slashes "
+            f"are refused): {home}"
+        )
+    if path == Path("/"):
+        raise SandboxError("HOME is /: refusing to sandbox here")
+    return path
+
+
+def check_tiocsti(path: Path = Path("/proc/sys/dev/tty/legacy_tiocsti")) -> None:
+    """Require the kernel to disable legacy terminal input injection.
+
+    Args:
+        path: Kernel sysctl file containing the legacy TIOCSTI setting.
+
+    Raises:
+        SandboxError: If the sysctl is unavailable, empty or not zero.
+    """
+    try:
+        value = path.read_text().splitlines()[0].strip()
+    except (OSError, IndexError) as exc:
+        raise SandboxError(
+            f"{path} missing (kernel < 6.2): TIOCSTI escape unmitigated"
+        ) from exc
+    if value != "0":
+        raise SandboxError(
+            f"dev.tty.legacy_tiocsti={value}: TIOCSTI escape unmitigated"
+        )
+
+
+def run_command(
+    argv: Sequence[str], *, runtime: Runtime
+) -> subprocess.CompletedProcess[str]:
+    """Run a command with the explicit invoker context.
+
+    Args:
+        argv: Command and its argument vector.
+        runtime: Working directory and environment for the command.
+
+    Returns:
+        Exit status and captured text output.
+
+    Raises:
+        OSError: If the command cannot be started.
+        UnicodeError: If captured output cannot be decoded.
+    """
+    return subprocess.run(
+        args=argv, cwd=runtime.cwd, env=runtime.env, capture_output=True, text=True
     )
-    if ((dry_run)); then
-        print_redacted_argv "${argv[@]}"
-        return 0
-    fi
-    exec "${argv[@]}"
-}
 
-main() {
-    parse_args "$@"
-    validate_agent
-    maybe_exec_agent
-    check_home_canonical
-    check_tiocsti
-    resolve_workspace
-    validate_workspace
-    check_exe_visible
-    resolve_parent_chain
-    resolve_signing_key
-    resolve_ssh_sock
-    resolve_package_rc
-    if ((!dry_run)); then
-        ensure_state_dirs
-        if ((${AGENT_DISABLE_USERNS[${agent}]})); then
-            probe_userns_blockable
-        fi
-    fi
-    add_namespace_args
-    add_env_args
-    add_system_args
-    add_home_ancestor_args
-    add_home_args
-    add_workspace_args
-    add_signing_args
-    add_remount_args
-    run_agent
-}
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
-fi
+type CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def resolve_workspace(
+    runtime: Runtime, *, run: CommandRunner = run_command
+) -> Workspace:
+    """Resolve the project root and any external Git common directory.
+
+    Args:
+        runtime: Invoker working directory and environment.
+        run: Command runner used for Git queries.
+
+    Returns:
+        Writable workspace and optional external Git metadata bind.
+
+    Raises:
+        SandboxError: If Git metadata is unresolved, the cwd is outside the
+            selected workspace or a Git directory has no supported worktree.
+        OSError: If a command cannot start or a path cannot be resolved.
+    """
+    top = run(argv=("git", "rev-parse", "--show-toplevel"), runtime=runtime)
+    common_dir = None
+    if top.returncode == 0:
+        root = Path(top.stdout.rstrip("\n"))
+        common = run(
+            argv=("git", "rev-parse", "--path-format=absolute", "--git-common-dir"),
+            runtime=runtime,
+        )
+        if common.returncode != 0:
+            raise SandboxError("cannot resolve git common dir")
+
+        common_path = Path(common.stdout.rstrip("\n")).resolve()
+        if common_path.name == ".bare":
+            root = common_path.parent
+            runtime.report(
+                message=f".bare-style repo; workspace: {root}", level="verbose"
+            )
+        elif not common_path.is_relative_to(root):
+            common_dir = common_path
+            runtime.report(
+                message=f"git common dir outside workspace: {common_path}",
+                level="verbose",
+            )
+    else:
+        gitdir = run(
+            argv=("git", "rev-parse", "--path-format=absolute", "--git-dir"),
+            runtime=runtime,
+        )
+        if gitdir.returncode == 0:
+            git_path = Path(gitdir.stdout.rstrip("\n")).resolve()
+            if git_path.name != ".bare":
+                raise SandboxError(
+                    f"inside a git directory without a work tree: {runtime.cwd}"
+                )
+            root = git_path.parent
+            runtime.report(
+                message=f".bare-style repo without a work tree; workspace: {root}",
+                level="verbose",
+            )
+        else:
+            root = runtime.cwd
+
+    if not runtime.cwd.is_relative_to(root):
+        raise SandboxError(f"cwd {runtime.cwd} is outside the workspace {root}")
+    runtime.report(message=f"workspace: {root}", level="verbose")
+    return Workspace(root=root, common_dir=common_dir)
+
+
+def refuse_denied_path(*, path: Path, home: Path, label: str) -> None:
+    """Reject writable binds that would expose forbidden directory trees.
+
+    Args:
+        path: Canonical bind source.
+        home: Canonical invoker home directory.
+        label: Description used in refusal messages.
+
+    Raises:
+        SandboxError: If the source is root, HOME, an ancestor of HOME, a hidden
+            home entry or a denied system path.
+    """
+    if path == Path("/"):
+        raise SandboxError(f"{label} is /: refusing to sandbox here")
+    if path == home:
+        raise SandboxError(f"{label} is $HOME: refusing to rw-bind the home directory")
+    if home.is_relative_to(path):
+        raise SandboxError(f"{label} {path} is an ancestor of $HOME: refusing")
+    if path.is_relative_to(home) and path.relative_to(home).parts[0].startswith("."):
+        raise SandboxError(f"{label} {path} is a hidden entry under $HOME: refusing")
+
+    for prefix in DENY_PREFIXES:
+        if path.is_relative_to(prefix):
+            raise SandboxError(f"{label} {path} is at/under {prefix}: refusing")
+
+
+def validate_workspace(*, workspace: Workspace, home: Path) -> None:
+    """Apply the writable-bind deny rules to the workspace and Git metadata.
+
+    Args:
+        workspace: Resolved writable bind sources.
+        home: Canonical invoker home directory.
+
+    Raises:
+        SandboxError: If either bind source violates the deny rules.
+    """
+    refuse_denied_path(path=workspace.root, home=home, label="workspace root")
+    if workspace.common_dir is not None:
+        refuse_denied_path(path=workspace.common_dir, home=home, label="git common dir")
+
+
+def path_is_exposed(
+    *, path: Path, home: Path, workspace: Workspace, policy: AgentPolicy
+) -> bool:
+    """Check whether a canonical path lies within an exposed tree.
+
+    Args:
+        path: Canonical target to check.
+        home: Canonical invoker home directory.
+        workspace: Workspace and optional Git metadata bind.
+        policy: Selected agent's state policy.
+
+    Returns:
+        Whether the target is covered by an exposed directory prefix.
+    """
+    prefixes = (Path("/usr"), Path("/etc"), Path("/opt/mamba"), workspace.root)
+    if workspace.common_dir is not None:
+        prefixes += (workspace.common_dir,)
+    prefixes += tuple(home / rel for rel in HOME_RO_PATHS + policy.state_dirs)
+    return any(path.is_relative_to(prefix) for prefix in prefixes)
+
+
+def check_exe_visible(
+    *, exe: str, runtime: Runtime, workspace: Workspace, policy: AgentPolicy
+) -> None:
+    """Require the executable's resolved target to remain visible.
+
+    Args:
+        exe: Selected executable path.
+        runtime: Invoker home and environment.
+        workspace: Resolved workspace and optional Git metadata bind.
+        policy: Selected agent's state policy.
+
+    Raises:
+        SandboxError: If the target is unresolved or outside the exposed trees.
+    """
+    try:
+        real = Path(exe).resolve(strict=True)
+    except OSError as exc:
+        raise SandboxError(f"agent executable unresolvable: {exe}") from exc
+    if not path_is_exposed(
+        path=real, home=runtime.home, workspace=workspace, policy=policy
+    ):
+        raise SandboxError(
+            f"agent executable {exe} resolves to {real}, "
+            "which the sandbox does not expose"
+        )
+
+
+def resolve_parent_chain(*, workspace: Workspace, home: Path) -> tuple[Path, ...]:
+    """Collect distinct bind ancestors with parents before their children.
+
+    Args:
+        workspace: Workspace and optional Git metadata bind.
+        home: Home boundary excluded from the ancestor chain.
+
+    Returns:
+        Ordered ancestors to overlay and later remount read-only.
+    """
+    parents = []
+    binds = (workspace.root,)
+    if workspace.common_dir is not None:
+        binds += (workspace.common_dir,)
+
+    for bind in binds:
+        chain = []
+        for parent in bind.parents:
+            if parent in (home, Path("/")):
+                break
+            chain.append(parent)
+        for parent in reversed(chain):
+            if parent not in parents:
+                parents.append(parent)
+
+    return tuple(parents)
+
+
+def ensure_state_dirs(*, runtime: Runtime, agent: str) -> None:
+    """Validate and seed persistent state and read-only pins on the host.
+
+    Args:
+        runtime: Invoker home directory and user ID.
+        agent: Supported agent selecting the state and pin policy.
+
+    Raises:
+        SandboxError: If state roots are symlinked or not invoker-owned, or a
+            pinned path escapes the selected state trees.
+        OSError: If state or pin creation or Claude's one-time copy fails.
+    """
+    policy = POLICIES[agent]
+    for rel in policy.state_dirs:
+        path = runtime.home / rel
+        if path.resolve() != path:
+            raise SandboxError(f"state dir has symlinked components: {path}")
+        path.mkdir(parents=True, exist_ok=True)
+        if path.resolve(strict=True) != path:
+            raise SandboxError(f"state dir has symlinked components: {path}")
+        if path.stat().st_uid != runtime.uid:
+            raise SandboxError(f"state dir not owned by invoker: {path}")
+
+    # Missing pins must be seeded so --ro-bind-try can actually protect them
+    for rel in policy.ro_paths:
+        path = runtime.home / rel
+        try:
+            real = path.resolve(strict=path.exists() or path.is_symlink())
+        except OSError as exc:
+            raise SandboxError(
+                f"pinned path {path} resolves outside the agent's state dirs: "
+                "dangling symlink"
+            ) from exc
+        if real != path and not any(
+            real.is_relative_to(runtime.home / state) for state in policy.state_dirs
+        ):
+            raise SandboxError(
+                f"pinned path {path} resolves outside the agent's state dirs: {real}"
+            )
+        if path.exists():
+            continue
+
+        if path.name.endswith(".json"):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n")
+        elif "." not in path.name:
+            path.mkdir(parents=True, exist_ok=True)
+
+    # Host and sandbox Claude state diverge after this one-time copy
+    claude_state = runtime.home / ".claude/.claude.json"
+    if agent == "claude" and not claude_state.exists():
+        original = runtime.home / ".claude.json"
+        if original.is_file():
+            with original.open("rb") as source:
+                # Apply source permissions and the umask before writing account data
+                descriptor = os.open(
+                    path=claude_state,
+                    flags=os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    mode=stat.S_IMODE(os.fstat(source.fileno()).st_mode),
+                )
+                with os.fdopen(fd=descriptor, mode="wb") as destination:
+                    shutil.copyfileobj(fsrc=source, fdst=destination)
+
+
+def resolve_signing_key(
+    runtime: Runtime, *, run: CommandRunner = run_command
+) -> Signing:
+    """Resolve an SSH signing key from global Git configuration only.
+
+    Args:
+        runtime: Invoker home, working directory and environment.
+        run: Command runner used for global Git configuration queries.
+
+    Returns:
+        Public-key identity and optional canonical file. Returns an empty
+        selection when SSH signing is unconfigured or the key file is rejected;
+        file inspection failures also emit a warning.
+
+    Raises:
+        OSError: If Git cannot start or an accepted key path cannot be resolved.
+    """
+    format_result = run(
+        argv=("git", "config", "--global", "--get", "gpg.format"), runtime=runtime
+    )
+    key_result = run(
+        argv=("git", "config", "--global", "--get", "user.signingkey"), runtime=runtime
+    )
+    if format_result.returncode != 0 or key_result.returncode != 0:
+        return Signing()
+    key = key_result.stdout.rstrip("\n")
+    if format_result.stdout.rstrip("\n") != "ssh" or not key:
+        return Signing()
+
+    key = key.removeprefix("key::")
+    if key.startswith("~/"):
+        key = str(runtime.home / key[2:])
+    path = Path(key)
+    if not path.is_absolute():
+        path = runtime.cwd / path
+
+    key_file = None
+    if path.is_file():
+        try:
+            with path.open(errors="surrogateescape") as stream:
+                first = stream.readline()
+                nonblank = bool(first.strip()) + sum(
+                    bool(line.strip()) for line in stream
+                )
+        except OSError:
+            runtime.report(f"user.signingkey {key} cannot be inspected: not exposed")
+            return Signing()
+
+        fields = first.split()
+        if nonblank != 1 or not fields or fields[0] not in SSH_PUBKEY_TYPES:
+            runtime.report(
+                f"user.signingkey {key} is not a public key file: not exposed"
+            )
+            return Signing()
+        key_file = path.resolve()
+        runtime.report(message=f"signing key file: {key_file}", level="verbose")
+    else:
+        fields = key.split()
+
+    pubkey = f"{fields[0] if fields else ''} {fields[1] if len(fields) > 1 else ''}"
+    return Signing(key_file=key_file, pubkey=pubkey)
+
+
+def probe_identities(*, runtime: Runtime, sock: Path) -> str | None:
+    """Query SSH identities with a three-second deadline and one-second grace.
+
+    Args:
+        runtime: Invoker working directory and environment.
+        sock: Canonical SSH-agent socket.
+
+    Returns:
+        Identity listing on success, or None on timeout, launch, decoding or
+        command failure. The caller reports omission of the signing socket.
+    """
+    try:
+        with subprocess.Popen(
+            args=("ssh-add", "-L"),
+            env={**runtime.env, "SSH_AUTH_SOCK": str(sock)},
+            cwd=runtime.cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ) as proc:
+            try:
+                output, _ = proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                return None
+            return output if proc.returncode == 0 else None
+    except (OSError, UnicodeError):
+        return None
+
+
+def resolve_ssh_sock(
+    *,
+    runtime: Runtime,
+    signing: Signing,
+    probe: Callable[..., str | None] = probe_identities,
+) -> Path | None:
+    """Select an invoker-owned socket holding exactly the configured signing key.
+
+    Args:
+        runtime: Invoker environment and user ID.
+        signing: Configured SSH public-key identity.
+        probe: Bounded identity probe for the candidate socket.
+
+    Returns:
+        Canonical socket path, or None when unavailable or rejected. Rejections
+        emit warnings; an unset socket stays quiet when signing is disabled.
+    """
+    value = runtime.env.get("SSH_AUTH_SOCK")
+    if not value:
+        if not runtime.env.get("GIT_SIGNING_DISABLED"):
+            runtime.report("SSH_AUTH_SOCK unset: ssh-agent not forwarded")
+        return None
+
+    try:
+        sock = Path(value).resolve(strict=True)
+    except OSError:
+        runtime.report("SSH_AUTH_SOCK dangling: ssh-agent not forwarded")
+        return None
+    try:
+        info = sock.stat()
+    except OSError:
+        runtime.report("SSH_AUTH_SOCK not an invoker-owned socket: not forwarded")
+        return None
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != runtime.uid:
+        runtime.report("SSH_AUTH_SOCK not an invoker-owned socket: not forwarded")
+        return None
+    if not signing.pubkey:
+        runtime.report("no ssh signing key configured: ssh-agent not forwarded")
+        return None
+
+    listing = probe(runtime=runtime, sock=sock)
+    keys = listing.rstrip("\n").split("\n") if listing is not None else []
+    fields = keys[0].split() if keys else []
+    identity = f"{fields[0] if fields else ''} {fields[1] if len(fields) > 1 else ''}"
+    if len(keys) != 1 or identity != signing.pubkey:
+        runtime.report("ssh-agent must hold exactly the signing key: not forwarded")
+        return None
+
+    runtime.report(message=f"ssh-agent socket: {sock}", level="verbose")
+    return sock
+
+
+def resolve_package_rc(runtime: Runtime) -> tuple[Path, ...]:
+    """Screen package configuration for line-oriented credential indicators.
+
+    Args:
+        runtime: Invoker home directory and diagnostic context.
+
+    Returns:
+        Package configuration files eligible for read-only binding. Credential
+        matches and inspection failures emit warnings and omit the file.
+    """
+    files = []
+    for rel in PACKAGE_RC_FILES:
+        path = runtime.home / rel
+        if not path.is_file():
+            continue
+        try:
+            with path.open("rb") as stream:
+                # Read the whole file: a late read error must also omit the bind
+                credential = False
+                for line in stream:
+                    credential |= PACKAGE_RC_CREDENTIAL_RE.search(line) is not None
+        except OSError:
+            runtime.report(f"{path}: cannot inspect package config: not bound")
+            continue
+
+        if credential:
+            runtime.report(f"{path} contains credentials: not bound")
+        else:
+            files.append(path)
+
+    return tuple(files)
+
+
+def unshare_args(runtime: Runtime) -> tuple[str, ...]:
+    """Build the outer user and PID namespace command prefix.
+
+    Args:
+        runtime: Invoker user and group IDs.
+
+    Returns:
+        Argument prefix ending at the Bubblewrap executable.
+    """
+    return (
+        "unshare",
+        "--user",
+        f"--map-user={runtime.uid}",
+        f"--map-group={runtime.gid}",
+        "--fork",
+        "--pid",
+        "--",
+        "bwrap",
+    )
+
+
+def probe_userns_blockable(
+    runtime: Runtime, *, run: CommandRunner = run_command
+) -> bool:
+    """Check whether nested user namespaces can be disabled for this launch.
+
+    Args:
+        runtime: Invoker context used by the probe.
+        run: Command runner used for the namespace capability check.
+
+    Returns:
+        Whether the capability probe succeeded. Failures emit a warning and
+        leave nested namespaces available.
+    """
+    argv = (
+        *unshare_args(runtime),
+        "--unshare-user",
+        "--disable-userns",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
+        "--dev",
+        "/dev",
+        "--",
+        "/usr/bin/true",
+    )
+
+    try:
+        result = run(argv=argv, runtime=runtime)
+    except OSError as exc:
+        detail = os_error_message(exc)
+    else:
+        if result.returncode == 0:
+            runtime.report(
+                message="--disable-userns usable; nesting will be blocked",
+                level="verbose",
+            )
+            return True
+        detail = result.stderr.rstrip("\n")
+
+    runtime.report(
+        f"--disable-userns unavailable here ({detail}); "
+        "nested user namespaces stay possible"
+    )
+    return False
+
+
+def namespace_args(*, policy: AgentPolicy, userns_blockable: bool) -> tuple[str, ...]:
+    """Build Bubblewrap's namespace policy arguments.
+
+    Args:
+        policy: Selected agent's nested namespace policy.
+        userns_blockable: Whether the runtime supports disabling nested namespaces.
+
+    Returns:
+        Ordered namespace and parent-lifetime arguments.
+    """
+    args = ("--die-with-parent", "--unshare-ipc", "--unshare-uts")
+    if policy.disable_userns and userns_blockable:
+        args += ("--unshare-user", "--disable-userns")
+    return args
+
+
+def resolve_forwarded_env(
+    *, runtime: Runtime, workspace: Workspace, policy: AgentPolicy
+) -> tuple[tuple[str, str], ...]:
+    """Select allowed environment values and visible canonical file paths.
+
+    Args:
+        runtime: Invoker environment and diagnostic context.
+        workspace: Resolved workspace and optional Git metadata bind.
+        policy: Selected agent's exposed state policy.
+
+    Returns:
+        Environment name/value pairs to forward. Unresolved or hidden file
+        targets emit warnings and are omitted.
+    """
+    values = []
+    for var in FORWARD_VARS + API_KEY_VARS:
+        # An explicitly empty TERM must not receive the unset-value default
+        value = runtime.env.get(var, "dumb" if var == "TERM" else "")
+        if value:
+            values.append((var, value))
+            runtime.report(message=f"forwarding {var}", level="verbose")
+
+    for var in FORWARD_PATH_VARS:
+        value = runtime.env.get(var)
+        if not value:
+            continue
+        try:
+            real = Path(value).resolve(strict=True)
+        except OSError:
+            runtime.report(f"{var} does not exist: not forwarded")
+            continue
+        if path_is_exposed(
+            path=real, home=runtime.home, workspace=workspace, policy=policy
+        ):
+            values.append((var, str(real)))
+            runtime.report(message=f"forwarding {var}", level="verbose")
+        else:
+            runtime.report(f"{var} points outside the sandbox: not forwarded")
+
+    return tuple(values)
+
+
+def env_args(
+    *,
+    runtime: Runtime,
+    agent: str,
+    forwarded: tuple[tuple[str, str], ...],
+    ssh_sock: Path | None,
+) -> tuple[str, ...]:
+    """Build the cleared environment and explicit sandbox settings.
+
+    Args:
+        runtime: Invoker identity, paths and environment.
+        agent: Agent selecting any additional environment settings.
+        forwarded: Approved environment name/value pairs.
+        ssh_sock: Optional validated signing socket.
+
+    Returns:
+        Ordered environment arguments, including unredacted forwarded API keys.
+    """
+    sandbox_path = (
+        f"/opt/mamba/envs/dev/bin:{runtime.home}/.local/bin:"
+        "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+    )
+    values = [
+        ("HOME", str(runtime.home)),
+        ("PATH", sandbox_path),
+        ("PWD", str(runtime.cwd)),
+        ("USER", runtime.user),
+        ("LOGNAME", runtime.user),
+        ("SHELL", "/bin/bash"),
+        ("XDG_RUNTIME_DIR", f"/run/user/{runtime.uid}"),
+    ]
+    values.extend((var, value) for var, value in forwarded if var not in API_KEY_VARS)
+
+    if ssh_sock is not None:
+        values.append(("SSH_AUTH_SOCK", str(ssh_sock)))
+    if runtime.env.get("PLANNOTATOR_PORT"):
+        values.extend(
+            (
+                ("PLANNOTATOR_PORT", runtime.env["PLANNOTATOR_PORT"]),
+                ("PLANNOTATOR_REMOTE", runtime.env.get("PLANNOTATOR_REMOTE") or "1"),
+            )
+        )
+    if agent == "claude":
+        values.append(("CLAUDE_CONFIG_DIR", str(runtime.home / ".claude")))
+
+    values.append(("AGENT_SANDBOX_ACTIVE", "1"))
+    values.extend((var, value) for var, value in forwarded if var in API_KEY_VARS)
+    return (
+        "--clearenv",
+        *(word for var, value in values for word in ("--setenv", var, value)),
+    )
+
+
+def system_args(*, uid: int, resolv: Path | None) -> tuple[str, ...]:
+    """Build read-only system mounts and fresh runtime filesystems.
+
+    Args:
+        uid: Invoker user ID used for the runtime directory.
+        resolv: Resolved DNS configuration target, if available.
+
+    Returns:
+        Ordered system mount arguments, restoring DNS targets under /run.
+    """
+    args = (
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/sbin",
+        "/sbin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
+        "--ro-bind",
+        "/etc",
+        "/etc",
+        "--ro-bind",
+        "/opt/mamba",
+        "/opt/mamba",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        "/run",
+        "--perms",
+        "0700",
+        "--dir",
+        f"/run/user/{uid}",
+    )
+    if resolv is not None and resolv != Path("/run") and resolv.is_relative_to("/run"):
+        args += ("--ro-bind-try", str(resolv), str(resolv))
+    return args
+
+
+def home_args(
+    *, home: Path, policy: AgentPolicy, rc_files: tuple[Path, ...]
+) -> tuple[str, ...]:
+    """Build the empty home, allowlisted mounts, writable state and read-only pins.
+
+    Args:
+        home: Canonical invoker home directory.
+        policy: Selected agent's writable state and read-only pins.
+        rc_files: Package configuration files approved for read-only binding.
+
+    Returns:
+        Home mount arguments with pins after writable state mounts.
+    """
+    args = ["--perms", "0700", "--tmpfs", str(home)]
+    for rel in HOME_RO_PATHS:
+        args.extend(("--ro-bind-try", str(home / rel), str(home / rel)))
+    args.extend(
+        (
+            "--ro-bind",
+            str(home / ".gitconfig"),
+            str(home / ".gitconfig"),
+            "--ro-bind-try",
+            str(home / ".ssh/allowed_signers"),
+            str(home / ".ssh/allowed_signers"),
+        )
+    )
+    for path in rc_files:
+        args.extend(("--ro-bind-try", str(path), str(path)))
+
+    for rel in policy.state_dirs:
+        args.extend(("--bind", str(home / rel), str(home / rel)))
+
+    for rel in policy.ro_paths:
+        args.extend(("--ro-bind-try", str(home / rel), str(home / rel)))
+    return tuple(args)
+
+
+def build_argv(
+    *,
+    runtime: Runtime,
+    options: Options,
+    exe: str,
+    workspace: Workspace,
+    parents: tuple[Path, ...],
+    signing: Signing,
+    ssh_sock: Path | None,
+    rc_files: tuple[Path, ...],
+    forwarded: tuple[tuple[str, str], ...],
+    userns_blockable: bool,
+    resolv: Path | None,
+) -> tuple[str, ...]:
+    """Assemble the launch command in security-significant mount order.
+
+    Args:
+        runtime: Invoker identity, paths and environment.
+        options: Parsed wrapper options and verbatim agent arguments.
+        exe: Selected agent executable.
+        workspace: Resolved writable project and Git metadata binds.
+        parents: Ordered ancestor overlays to remount read-only.
+        signing: Selected public key and optional host file.
+        ssh_sock: Optional validated signing socket.
+        rc_files: Approved package configuration files.
+        forwarded: Approved environment name/value pairs.
+        userns_blockable: Whether nested user namespaces can be disabled.
+        resolv: Optional resolved DNS configuration target.
+
+    Returns:
+        Complete unredacted argument vector for process replacement.
+    """
+    policy = POLICIES[options.agent]
+    args = list(unshare_args(runtime))
+    args.extend(namespace_args(policy=policy, userns_blockable=userns_blockable))
+    args.extend(
+        env_args(
+            runtime=runtime, agent=options.agent, forwarded=forwarded, ssh_sock=ssh_sock
+        )
+    )
+    args.extend(system_args(uid=runtime.uid, resolv=resolv))
+
+    # Ancestors above HOME must precede its tmpfs or they would hide it
+    for parent in parents:
+        if runtime.home.is_relative_to(parent):
+            args.extend(("--tmpfs", str(parent)))
+    args.extend(home_args(home=runtime.home, policy=policy, rc_files=rc_files))
+    for parent in parents:
+        if not runtime.home.is_relative_to(parent):
+            args.extend(("--tmpfs", str(parent)))
+
+    args.extend(("--bind", str(workspace.root), str(workspace.root)))
+    if workspace.common_dir is not None:
+        args.extend(("--bind", str(workspace.common_dir), str(workspace.common_dir)))
+
+    # Signing mounts follow every overlay; ancestors are locked last
+    if signing.key_file is not None:
+        args.extend(("--ro-bind-try", str(signing.key_file), str(signing.key_file)))
+    if ssh_sock is not None:
+        args.extend(("--bind", str(ssh_sock), str(ssh_sock)))
+
+    for parent in parents:
+        args.extend(("--remount-ro", str(parent)))
+    args.extend(("--chdir", str(runtime.cwd), "--", exe, *options.agent_args))
+    return tuple(args)
+
+
+def redact_text(*, message: str, env: Mapping[str, str]) -> str:
+    """Mask nonempty API-key values in diagnostic text.
+
+    Args:
+        message: Text to redact.
+        env: Environment containing the API-key values.
+
+    Returns:
+        Text with matching API-key values replaced by asterisks.
+    """
+    for secret in sorted(
+        {env[var] for var in API_KEY_VARS if env.get(var)}, key=len, reverse=True
+    ):
+        message = message.replace(secret, "***")
+    return message
+
+
+def redacted_argv(argv: Sequence[str]) -> str:
+    """Shell-quote an argument vector while masking named API-key assignments.
+
+    Args:
+        argv: Argument vector that may contain --setenv API-key assignments.
+
+    Returns:
+        Shell-parseable text with those assignment values redacted. Other words
+        are preserved; redact their contents separately when needed.
+    """
+    words = list(argv)
+    index = 0
+    while index + 2 < len(words):
+        if words[index] == "--setenv" and words[index + 1] in API_KEY_VARS:
+            words[index + 2] = "***"
+            index += 3
+        else:
+            index += 1
+    return shlex.join(words)
+
+
+def os_error_message(error: OSError) -> str:
+    """Keep error filenames unescaped for diagnostic redaction.
+
+    Args:
+        error: Filesystem or process error to describe.
+
+    Returns:
+        Error description and any source/destination filenames without quoting.
+    """
+    message = error.strerror or str(error)
+    if error.filename is not None:
+        message += f": {os.fsdecode(error.filename)}"
+    if error.filename2 is not None:
+        message += f" -> {os.fsdecode(error.filename2)}"
+    return message
+
+
+def exec_process(argv: tuple[str, ...]) -> Never:
+    """Replace the wrapper while preserving shell exec failure statuses.
+
+    Args:
+        argv: Executable and its complete argument vector.
+
+    Raises:
+        SandboxError: If replacement fails, with status 127 for a missing
+            executable or 126 for other execution errors.
+    """
+    try:
+        os.execvp(file=argv[0], args=argv)
+    except OSError as exc:
+        raise SandboxError(
+            message=os_error_message(exc),
+            exit_code=127 if exc.errno == errno.ENOENT else 126,
+        ) from exc
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Resolve and launch the agent, or print help or a redacted dry-run command.
+
+    Args:
+        argv: Wrapper arguments, or None to read the process command line.
+
+    Returns:
+        Zero for help and successful dry runs, or the launch failure status.
+        Successful launches replace the process and do not return.
+    """
+    env = MappingProxyType(dict(os.environ))
+    try:
+        options = parse_args(sys.argv[1:] if argv is None else argv)
+        if options is None:
+            print(USAGE, end="")
+            return 0
+
+        # Python startup can coerce LC_CTYPE; forward the invoker's actual value
+        initial_env = Path("/proc/self/environ").read_bytes().split(b"\0")
+        original_locale = next(
+            (entry[9:] for entry in initial_env if entry.startswith(b"LC_CTYPE=")),
+            None,
+        )
+        if original_locale is None:
+            os.environ.pop(key="LC_CTYPE", default=None)
+        else:
+            os.environ["LC_CTYPE"] = os.fsdecode(original_locale)
+
+        env = MappingProxyType(dict(os.environ))
+        if "HOME" not in env:
+            raise SandboxError("HOME is unset")
+        try:
+            user = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError as exc:
+            raise SandboxError(f"no passwd entry for uid {os.getuid()}") from exc
+        runtime = Runtime(
+            home=Path(env["HOME"]),
+            cwd=Path.cwd(),
+            env=env,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            user=user,
+            verbose=options.verbose,
+            debug=options.debug,
+        )
+
+        exe = resolve_executable(runtime=runtime, agent=options.agent)
+        if env.get("AGENT_SANDBOX_DISABLE") or env.get("AGENT_SANDBOX_ACTIVE"):
+            exec_process((exe, *options.agent_args))
+
+        check_home_canonical(env["HOME"])
+        check_tiocsti()
+        runtime.report(
+            message=(
+                f"resolving agent={options.agent} executable={exe} cwd={runtime.cwd}"
+            ),
+            level="debug",
+        )
+        policy = POLICIES[options.agent]
+        workspace = resolve_workspace(runtime)
+        validate_workspace(workspace=workspace, home=runtime.home)
+        check_exe_visible(exe=exe, runtime=runtime, workspace=workspace, policy=policy)
+        parents = resolve_parent_chain(workspace=workspace, home=runtime.home)
+
+        signing = resolve_signing_key(runtime)
+        ssh_sock = resolve_ssh_sock(runtime=runtime, signing=signing)
+        rc_files = resolve_package_rc(runtime)
+
+        userns_blockable = False
+        if not options.dry_run:
+            ensure_state_dirs(runtime=runtime, agent=options.agent)
+            if policy.disable_userns:
+                userns_blockable = probe_userns_blockable(runtime)
+
+        forwarded = resolve_forwarded_env(
+            runtime=runtime, workspace=workspace, policy=policy
+        )
+        try:
+            resolv = Path("/etc/resolv.conf").resolve(strict=True)
+        except OSError:
+            resolv = None
+
+        command = build_argv(
+            runtime=runtime,
+            options=options,
+            exe=exe,
+            workspace=workspace,
+            parents=parents,
+            signing=signing,
+            ssh_sock=ssh_sock,
+            rc_files=rc_files,
+            forwarded=forwarded,
+            userns_blockable=userns_blockable,
+            resolv=resolv,
+        )
+        display = redacted_argv(
+            tuple(redact_text(message=word, env=env) for word in command)
+        )
+        runtime.report(message=f"launch argv: {display}", level="debug")
+
+        if options.dry_run:
+            print(display)
+            return 0
+        exec_process(command)
+    except SandboxError as exc:
+        if exc.usage:
+            print(USAGE, file=sys.stderr, end="")
+        print(
+            f"agent-sandbox: error: {redact_text(message=str(exc), env=env)}",
+            file=sys.stderr,
+        )
+        return exc.exit_code
+    except OSError as exc:
+        print(
+            "agent-sandbox: error: "
+            f"{redact_text(message=os_error_message(exc), env=env)}",
+            file=sys.stderr,
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
