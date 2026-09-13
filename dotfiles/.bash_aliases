@@ -8,6 +8,10 @@ alias sshk="kitten ssh"
 alias ta="tmux a"
 alias updatenvim="wget -O /tmp/nvim.appimage https://github.com/neovim/neovim/releases/download/stable/nvim.appimage && mv /tmp/nvim.appimage ~/bin/nvim && chmod u+x ~/bin/nvim"
 
+# LLM
+alias llmb="llm -o reasoning_effort low --hide-reasoning -t bash"
+alias llmc="llm -o reasoning_effort low --hide-reasoning -t concise"
+
 # LSD
 alias l="lsd -lFh"      # long, classify, human-readable
 alias la="lsd -lAFh"    # long, almost-all, classify, human-readable
