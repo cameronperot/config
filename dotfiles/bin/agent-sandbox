@@ -231,6 +231,8 @@ POLICIES = MappingProxyType(
                 ".pi/agent/skills",
                 ".pi/agent/prompts",
                 ".pi/agent/settings.json",
+                ".pi/agent/models.json",
+                ".pi/agent/worktree.json",
                 ".pi/agent/guard-rules.json",
                 ".pi/agent/AGENTS.md",
                 ".pi/agent/agents",
@@ -746,7 +748,9 @@ def ensure_state_dirs(*, runtime: Runtime, agent: str) -> None:
 
         if path.name.endswith(".json"):
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("{}\n")
+            path.write_text(
+                '{"providers": {}}\n' if rel == ".pi/agent/models.json" else "{}\n"
+            )
         elif "." not in path.name:
             path.mkdir(parents=True, exist_ok=True)
 

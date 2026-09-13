@@ -121,6 +121,8 @@ EXPECTED_AGENT_RO_PATHS = {
         ".pi/agent/skills",
         ".pi/agent/prompts",
         ".pi/agent/settings.json",
+        ".pi/agent/models.json",
+        ".pi/agent/worktree.json",
         ".pi/agent/guard-rules.json",
         ".pi/agent/AGENTS.md",
         ".pi/agent/agents",
@@ -1320,7 +1322,10 @@ def test_ensure_state_dirs_seeds_every_absent_pinned_json_file(
     home: Path, agent: str, relative_path: str
 ) -> None:
     sandbox.ensure_state_dirs(runtime=runtime(home), agent=agent)
-    assert (home / relative_path).read_text() == "{}\n"
+    expected = (
+        '{"providers": {}}\n' if relative_path == ".pi/agent/models.json" else "{}\n"
+    )
+    assert (home / relative_path).read_text() == expected
 
 
 @pytest.mark.parametrize(("agent", "relative_path"), EXPECTED_PINNED_DIRECTORY_CASES)
