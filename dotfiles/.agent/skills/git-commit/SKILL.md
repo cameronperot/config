@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Create atomic, well-messaged git commits. Follow the workflow in order; never commit blind.
 
-Trailing input after `/skill:git-commit` constrains the commit — the intended subject, scope, or subset of files (e.g. `only the config changes` → commit just the configuration files); with no input, partition and commit every change in the working tree per the workflow.
+Trailing input after `/skill:git-commit` constrains the subject, scope, or files. With no input, commit the changes identified in the conversation. If no conversation history is available, default to committing the staged and unstaged changes. When history exists but scope or ownership is unclear, ask before including unrelated work. A request for a commit message authorizes drafting only, not staging or committing.
 
 ## Workflow
 
