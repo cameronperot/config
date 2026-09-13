@@ -102,16 +102,17 @@ EXPECTED_HOME_RO_PATHS = (
     ".local/share/uv",
 )
 EXPECTED_AGENT_STATE_DIRS = {
-    "pi": (".agent", ".pi"),
-    "omp": (".agent", ".omp"),
+    "pi": (".agent", ".cache/pre-commit", ".pi"),
+    "omp": (".agent", ".cache/pre-commit", ".omp"),
     "opencode": (
         ".agent",
+        ".cache/pre-commit",
         ".opencode",
         ".local/share/opencode",
         ".local/state/opencode",
         ".local/share/opentui",
     ),
-    "claude": (".agent", ".claude", ".local/state/claude"),
+    "claude": (".agent", ".cache/pre-commit", ".claude", ".local/state/claude"),
 }
 EXPECTED_AGENT_RO_PATHS = {
     "pi": (
@@ -1315,6 +1316,63 @@ def test_parse_args_empty_agent_word_is_a_missing_agent(home: Path) -> None:
 
 
 # --- ensure_state_dirs seeding
+
+
+@pytest.mark.parametrize("agent", EXPECTED_AGENTS)
+def test_ensure_state_dirs_creates_and_preserves_pre_commit_cache(
+    home: Path, agent: str
+) -> None:
+    cache = home / ".cache/pre-commit"
+
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent=agent)
+
+    assert cache.is_dir()
+    marker = cache / "marker"
+    marker.write_text("cached environment")
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent=agent)
+    assert marker.read_text() == "cached environment"
+
+
+@pytest.mark.parametrize("agent", EXPECTED_AGENTS)
+def test_pre_commit_cache_is_exposed_without_exposing_other_caches(agent: str) -> None:
+    home = Path("/home/user")
+    workspace = sandbox.Workspace(root=Path("/projects/repo"))
+    policy = sandbox.POLICIES[agent]
+
+    assert sandbox.path_is_exposed(
+        path=home / ".cache/pre-commit/repo/bin/python",
+        home=home,
+        workspace=workspace,
+        policy=policy,
+    )
+    assert not sandbox.path_is_exposed(
+        path=home / ".cache/pip", home=home, workspace=workspace, policy=policy
+    )
+
+
+@pytest.mark.parametrize("agent", EXPECTED_AGENTS)
+def test_pre_commit_cache_requires_invoker_ownership(
+    home: Path, agent: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = home / ".cache/pre-commit"
+    cache.mkdir(parents=True)
+    original_stat = Path.stat
+
+    def foreign_cache_stat(path: Path, **kwargs) -> os.stat_result:
+        result = original_stat(path, **kwargs)
+        if path == cache:
+            fields = list(result)
+            fields[4] = os.getuid() + 1
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(Path, "stat", foreign_cache_stat)
+
+    with pytest.raises(
+        sandbox.SandboxError,
+        match=r"state dir not owned by invoker: .*\.cache/pre-commit",
+    ):
+        sandbox.ensure_state_dirs(runtime=runtime(home), agent=agent)
 
 
 @pytest.mark.parametrize(("agent", "relative_path"), EXPECTED_PINNED_JSON_CASES)

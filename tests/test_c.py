@@ -531,6 +531,7 @@ EXPECTED_HEAD = [
     *("-v", "/cfg/.agent/prompts:/home/user/.pi/agent/prompts"),
     *("-v", "/cfg/.agent/prompts:/home/user/.omp/agent/prompts"),
     *("-v", "/cfg/.plannotator:/home/user/.plannotator"),
+    *("-v", "dev-pre-commit:/home/user/.cache/pre-commit"),
 ]
 SSH_ENV = ["-e", "SSH_AUTH_SOCK=/tmp/ssh-agent.sock"]
 SOCKET_MOUNT = ["-v", "/run/user/7/llm-agent.sock:/tmp/ssh-agent.sock"]
@@ -544,6 +545,17 @@ SIGNING_OFF_ENV = [
     "-e",
     "GIT_SIGNING_DISABLED=1",
 ]
+
+
+@pytest.mark.parametrize("krun", (False, True), ids=("plain", "krun"))
+def test_run_argv_mounts_pre_commit_cache_once_before_image(krun: bool) -> None:
+    argv = run_argv(krun=krun, cpus=4, ram_mib=8192)
+
+    volume = "dev-pre-commit:/home/user/.cache/pre-commit"
+    assert argv.count(volume) == 1
+    index = argv.index(volume)
+    assert argv[index - 1] == "-v"
+    assert index < argv.index("dev:latest")
 
 
 def test_run_argv_plain_container() -> None:

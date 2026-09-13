@@ -222,6 +222,7 @@ POLICIES = MappingProxyType(
         "pi": AgentPolicy(
             state_dirs=(
                 ".agent",
+                ".cache/pre-commit",
                 ".pi",
             ),
             ro_paths=(
@@ -243,6 +244,7 @@ POLICIES = MappingProxyType(
         "omp": AgentPolicy(
             state_dirs=(
                 ".agent",
+                ".cache/pre-commit",
                 ".omp",
             ),
             ro_paths=(
@@ -260,6 +262,7 @@ POLICIES = MappingProxyType(
         "opencode": AgentPolicy(
             state_dirs=(
                 ".agent",
+                ".cache/pre-commit",
                 ".opencode",
                 ".local/share/opencode",
                 ".local/state/opencode",
@@ -276,6 +279,7 @@ POLICIES = MappingProxyType(
         "claude": AgentPolicy(
             state_dirs=(
                 ".agent",
+                ".cache/pre-commit",
                 ".claude",
                 ".local/state/claude",
             ),

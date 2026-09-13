@@ -384,6 +384,7 @@ def run_argv(
             "-v",
             f"{agent_config_dir / host_rel}:{CONTAINER_HOME / container_rel}",
         ]
+    argv += ["-v", f"dev-pre-commit:{CONTAINER_HOME / '.cache/pre-commit'}"]
     if not signing_disabled and (krun or ssh_sock is not None):
         argv += ["-e", f"SSH_AUTH_SOCK={CONTAINER_SSH_SOCK}"]
     if krun:
