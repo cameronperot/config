@@ -28,6 +28,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { getApprovalRequests } from "../shared/approval.ts";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -157,6 +158,7 @@ interface SingleResult {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
+	approvalRequests?: string[];
 	step?: number;
 }
 
@@ -180,10 +182,12 @@ function getFinalOutput(messages: Message[]): string {
 }
 
 function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted" ||
+		(result.approvalRequests?.length ?? 0) > 0;
 }
 
 function getResultOutput(result: SingleResult): string {
+	if (result.approvalRequests?.length) return result.approvalRequests.join("\n\n");
 	if (isFailedResult(result)) {
 		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
 	}
@@ -421,6 +425,7 @@ async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
+		currentResult.approvalRequests = getApprovalRequests(currentResult.messages);
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
@@ -664,7 +669,7 @@ export default function (pi: ExtensionAPI) {
 				const successCount = results.filter((r) => !isFailedResult(r)).length;
 				const summaries = results.map((r) => {
 					const output = truncateParallelOutput(getResultOutput(r));
-					const status = isFailedResult(r)
+					const status = r.approvalRequests?.length ? "needs approval" : isFailedResult(r)
 						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
 						: "completed";
 					return `### [${r.agent}] ${status}\n\n${output}`;
@@ -697,7 +702,7 @@ export default function (pi: ExtensionAPI) {
 				if (isError) {
 					const errorMsg = getResultOutput(result);
 					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+						content: [{ type: "text", text: `Agent ${result.approvalRequests?.length ? "needs approval" : result.stopReason || "failed"}: ${errorMsg}` }],
 						details: makeDetails("single")([result]),
 						isError: true,
 					};
