@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shlex
 import socket
 import struct
 import subprocess
@@ -875,6 +876,41 @@ def test_main_dry_run_prints_run_argv(
     )
     assert " -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock " in read.out
     assert "warning" not in read.err
+
+
+@pytest.mark.parametrize(
+    "config_env", [{}, {"AGENT_CONFIG_DIR": ""}], ids=["unset", "empty"]
+)
+def test_main_dry_run_without_agent_config_omits_config_mounts(
+    plain_repo: Path, config_env: dict[str, str]
+) -> None:
+    env = {key: value for key, value in os.environ.items() if key != "AGENT_CONFIG_DIR"}
+    env.update(config_env)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--dry-run",
+            "--no-git-signing",
+            "--no-plannotator-port",
+            "bash",
+        ],
+        cwd=plain_repo / "sub",
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    argv = shlex.split(result.stdout)
+    assert [value for flag, value in pairwise(argv) if flag == "-v"] == [
+        f"{plain_repo}:{plain_repo}",
+        "dev-pre-commit:/home/user/.cache/pre-commit",
+    ]
+    assert argv[:3] == ["podman", "run", "--rm"]
+    assert argv[-2:] == ["dev:latest", "bash"]
+    assert result.stderr == ""
 
 
 def test_main_dry_run_no_git_root_mounts_cwd_only(

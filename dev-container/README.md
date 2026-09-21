@@ -41,10 +41,12 @@ GIT_SIGNING_KEY="$(cat ~/.ssh/llm_agent_ed25519.pub)" ./dev-container/build.sh  
 A throwaway container starts in the current directory and receives:
 
 - the repository root mounted at its host path; for a `.bare` layout, the directory holding `.bare`; outside Git or with `--no-git-root`, only the current directory
-- `$AGENT_CONFIG_DIR/{.agent,.pi/agent,.omp/agent,.plannotator}` at the same paths under `/home/user` (`AGENT_CONFIG_DIR` must be set)
+- `$AGENT_CONFIG_DIR/{.agent,.pi/agent,.omp/agent,.plannotator}` at the same paths under `/home/user` when `AGENT_CONFIG_DIR` is non-empty; when unset or empty, no agent config directories are mounted and the image's bundled dotfiles are used
 - the isolated ssh-agent as `SSH_AUTH_SOCK`: socket bind-mount, or under `c -k` a TCP bridge to the host signer (see [Isolation](#isolation) and [Signing under `c -k`](#signing-under-c--k-pasta-bridge)); when the host socket is absent, `c` warns and starts the container without it, and signing fails at commit time unless `--no-git-signing`/`GIT_SIGNING_DISABLED` is used
 - a port for the Plannotator plan UI: a free loopback port is published one-to-one (`--plannotator-port PORT` to pin it, `--no-plannotator-port` to opt out), with `PLANNOTATOR_REMOTE=1` and `PLANNOTATOR_PORT` set inside
 - no API-key environment variables (use the harness' login functionality)
+
+Without agent config mounts, host agent credentials and customizations are not imported, and agent state created inside the throwaway container is lost when it exits.
 
 `compose.yml` mounts its own directory at `/work`, Jupyter's root. Keep machine-specific additions such as project mounts or the signing socket in a second compose file passed with another `-f`.
 

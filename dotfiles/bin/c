@@ -4,7 +4,8 @@
 By default a throwaway container is created with `podman run --rm`: the
 repository root is bind-mounted at its host path so git's absolute worktree
 links stay valid inside, the container starts in the current directory, and it
-gets the agent dotfiles from $AGENT_CONFIG_DIR plus the host's isolated
+gets the agent dotfiles from $AGENT_CONFIG_DIR when set (otherwise using the
+image's bundled dotfiles), plus the host's isolated
 ssh-agent (a socket bind mount, or under -k a pasta TCP bridge that the image
 entrypoint connects to SSH_AUTH_SOCK). If the signing socket does not exist,
 `c` warns and starts the container without it; ssh signing then fails at
@@ -329,7 +330,7 @@ def run_argv(
     *,
     cwd: Path,
     mounts: tuple[Path, ...],
-    agent_config_dir: Path,
+    agent_config_dir: Path | None,
     ssh_sock: Path | None,
     krun: bool,
     cpus: int | None,
@@ -345,7 +346,8 @@ def run_argv(
     Args:
         cwd: Working directory inside the container, identical to the host path.
         mounts: Host directories to bind at their own paths.
-        agent_config_dir: Host directory holding the agent dotfiles.
+        agent_config_dir: Host directory holding the agent dotfiles; None uses
+            the image's bundled dotfiles without config bind mounts.
         ssh_sock: Host ssh-agent socket, bind-mounted unless ``krun``; None
             mounts no socket and sets no ``SSH_AUTH_SOCK``.
         krun: Boot a libkrun microVM and bridge the ssh-agent over TCP instead.
@@ -379,11 +381,12 @@ def run_argv(
     argv += ["-w", str(cwd)]
     for mount in mounts:
         argv += ["-v", f"{mount}:{mount}"]
-    for host_rel, container_rel in AGENT_CONFIG_MOUNTS:
-        argv += [
-            "-v",
-            f"{agent_config_dir / host_rel}:{CONTAINER_HOME / container_rel}",
-        ]
+    if agent_config_dir is not None:
+        for host_rel, container_rel in AGENT_CONFIG_MOUNTS:
+            argv += [
+                "-v",
+                f"{agent_config_dir / host_rel}:{CONTAINER_HOME / container_rel}",
+            ]
     argv += ["-v", f"dev-pre-commit:{CONTAINER_HOME / '.cache/pre-commit'}"]
     if not signing_disabled and (krun or ssh_sock is not None):
         argv += ["-e", f"SSH_AUTH_SOCK={CONTAINER_SSH_SOCK}"]
@@ -620,15 +623,12 @@ def new_container(
             stderr and no ssh-agent socket is mounted.
 
     Raises:
-        Error: When a mount is refused, ``AGENT_CONFIG_DIR`` is unset, or no
-            free plannotator port can be found.
+        Error: When a mount is refused or no free plannotator port can be found.
     """
     mounts = (cwd,) if args.no_git_root else resolve_mounts(cwd)
     for mount in mounts:
         check_mount_allowed(mount)
     agent_config_dir = os.environ.get("AGENT_CONFIG_DIR")
-    if not agent_config_dir:
-        raise Error("AGENT_CONFIG_DIR must be set to create a new container")
     xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     signing_disabled = args.no_git_signing or bool(
         os.environ.get("GIT_SIGNING_DISABLED")
@@ -663,7 +663,7 @@ def new_container(
     cmd = run_argv(
         cwd=cwd,
         mounts=mounts,
-        agent_config_dir=Path(agent_config_dir),
+        agent_config_dir=Path(agent_config_dir) if agent_config_dir else None,
         ssh_sock=ssh_sock,
         krun=args.krun,
         cpus=cpus,
