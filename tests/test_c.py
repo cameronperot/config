@@ -362,27 +362,27 @@ def test_resolve_mounts_outside_git_is_cwd(tmp_path: Path) -> None:
     nogit = tmp_path.resolve() / "nogit"
     nogit.mkdir()
 
-    assert c.resolve_mounts(nogit) == (nogit,)
+    assert c.resolve_workspace(nogit).mounts == (nogit,)
 
 
 def test_resolve_mounts_plain_repo_is_toplevel(plain_repo: Path) -> None:
-    assert c.resolve_mounts(plain_repo / "sub") == (plain_repo,)
+    assert c.resolve_workspace(plain_repo / "sub").mounts == (plain_repo,)
 
 
 def test_resolve_mounts_linked_worktree_adds_common_dir(plain_repo: Path) -> None:
     worktree = plain_repo.parent / "plain-wt"
     git("-C", str(plain_repo), "worktree", "add", "-q", str(worktree), "-b", "wt")
 
-    assert c.resolve_mounts(worktree) == (worktree, plain_repo / ".git")
+    assert c.resolve_workspace(worktree).mounts == (worktree, plain_repo / ".git")
 
 
 def test_resolve_mounts_bare_layout_worktrees_map_to_parent(bare_layout: Path) -> None:
-    assert c.resolve_mounts(bare_layout / "main" / "sub") == (bare_layout,)
-    assert c.resolve_mounts(bare_layout / "feature") == (bare_layout,)
+    assert c.resolve_workspace(bare_layout / "main" / "sub").mounts == (bare_layout,)
+    assert c.resolve_workspace(bare_layout / "feature").mounts == (bare_layout,)
 
 
 def test_resolve_mounts_bare_layout_parent_is_itself(bare_layout: Path) -> None:
-    assert c.resolve_mounts(bare_layout) == (bare_layout,)
+    assert c.resolve_workspace(bare_layout).mounts == (bare_layout,)
 
 
 def test_resolve_mounts_bare_layout_outside_worktree_adds_toplevel(
@@ -390,7 +390,7 @@ def test_resolve_mounts_bare_layout_outside_worktree_adds_toplevel(
 ) -> None:
     outside = bare_layout.parent / "outside"
 
-    assert c.resolve_mounts(outside) == (bare_layout, outside)
+    assert c.resolve_workspace(outside).mounts == (bare_layout, outside)
 
 
 # --- check_mount_allowed
@@ -532,6 +532,13 @@ EXPECTED_HEAD = [
     *("-v", "/cfg/.agent/prompts:/home/user/.pi/agent/prompts"),
     *("-v", "/cfg/.agent/prompts:/home/user/.omp/agent/prompts"),
     *("-v", "/cfg/.plannotator:/home/user/.plannotator"),
+    *("-v", "/cfg/.opencode:/home/user/.opencode"),
+    *("-v", "/cfg/.config/opencode:/home/user/.config/opencode"),
+    *("-v", "/cfg/.local/share/opencode:/home/user/.local/share/opencode"),
+    *("-v", "/cfg/.local/state/opencode:/home/user/.local/state/opencode"),
+    *("-v", "/cfg/.local/share/opentui:/home/user/.local/share/opentui"),
+    *("-v", "/cfg/.claude:/home/user/.claude"),
+    *("-v", "/cfg/.local/state/claude:/home/user/.local/state/claude"),
     *("-v", "dev-pre-commit:/home/user/.cache/pre-commit"),
 ]
 SSH_ENV = ["-e", "SSH_AUTH_SOCK=/tmp/ssh-agent.sock"]
@@ -564,6 +571,7 @@ def test_run_argv_plain_container() -> None:
         *EXPECTED_HEAD,
         *SSH_ENV,
         *SOCKET_MOUNT,
+        "-i",
         "dev:latest",
         "bash",
     ]
@@ -572,7 +580,7 @@ def test_run_argv_plain_container() -> None:
 def test_run_argv_without_socket_omits_ssh_env_and_mount() -> None:
     argv = run_argv(ssh_sock=None)
 
-    assert argv == [*EXPECTED_HEAD, "dev:latest", "bash"]
+    assert argv == [*EXPECTED_HEAD, "-i", "dev:latest", "bash"]
 
 
 def test_run_argv_plain_container_limits_only_when_set() -> None:
@@ -586,6 +594,7 @@ def test_run_argv_plain_container_limits_only_when_set() -> None:
         "2",
         "--memory",
         "1024m",
+        "-i",
         "dev:latest",
         "bash",
     ]
@@ -594,6 +603,7 @@ def test_run_argv_plain_container_limits_only_when_set() -> None:
         *SOCKET_MOUNT,
         "--memory",
         "512m",
+        "-i",
         "dev:latest",
         "bash",
     ]
@@ -606,6 +616,7 @@ def test_run_argv_krun_uses_annotations_and_tcp_bridge() -> None:
         *SSH_ENV,
         *("--runtime=krun", "--network", "pasta:-T,7777"),
         *("--annotation", "krun.cpus=4", "--annotation", "krun.ram_mib=8192"),
+        "-i",
         "dev:latest",
         "bash",
     ]
@@ -643,6 +654,7 @@ def test_run_argv_publishes_plannotator_port_on_both_networks() -> None:
         *SSH_ENV,
         *SOCKET_MOUNT,
         *publish,
+        "-i",
         "dev:latest",
         "bash",
     ]
@@ -653,6 +665,7 @@ def test_run_argv_publishes_plannotator_port_on_both_networks() -> None:
         *("--runtime=krun", "--network", "pasta:-T,7777"),
         *("--annotation", "krun.cpus=4", "--annotation", "krun.ram_mib=8192"),
         *publish,
+        "-i",
         "dev:latest",
         "bash",
     ]
@@ -664,11 +677,13 @@ def test_run_argv_signing_disabled_appends_git_config() -> None:
 
     assert with_socket[len(EXPECTED_HEAD) :] == [
         *SIGNING_OFF_ENV,
+        "-i",
         "dev:latest",
         "bash",
     ]
     assert without_socket[len(EXPECTED_HEAD) :] == [
         *SIGNING_OFF_ENV,
+        "-i",
         "dev:latest",
         "bash",
     ]
@@ -681,6 +696,7 @@ def test_run_argv_signing_disabled_under_krun() -> None:
         *("--runtime=krun", "--network", "pasta"),
         *("--annotation", "krun.cpus=4", "--annotation", "krun.ram_mib=8192"),
         *SIGNING_OFF_ENV,
+        "-i",
         "dev:latest",
         "bash",
     ]
@@ -745,7 +761,7 @@ def test_exec_argv() -> None:
         "dev_container",
         "bash",
     ]
-    assert batch == ["podman", "exec", "-w", "/work", "dev_container", "ls"]
+    assert batch == ["podman", "exec", "-w", "/work", "-i", "dev_container", "ls"]
 
 
 # --- parser and usage_errors
@@ -848,6 +864,7 @@ def batch_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_main_dry_run_prints_run_argv(
+    agent_config: Path,
     plain_repo: Path,
     tmp_sock_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -855,7 +872,7 @@ def test_main_dry_run_prints_run_argv(
     batch_stdin: None,
 ) -> None:
     monkeypatch.chdir(plain_repo / "sub")
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_sock_dir))
     monkeypatch.setattr(c, "pick_free_port", lambda: 19555)
 
@@ -865,14 +882,14 @@ def test_main_dry_run_prints_run_argv(
     assert read.out.startswith(
         "podman run --rm --userns keep-id --security-opt label=disable "
     )
-    assert (
-        f" -w {plain_repo / 'sub'} -v {plain_repo}:{plain_repo} -v /cfg/.agent:"
-        in read.out
-    )
+    words = shlex.split(read.out)
+    assert words[words.index("-w") + 1] == str(plain_repo / "sub")
+    assert f"{plain_repo}:{plain_repo}" in words
+    assert f"{agent_config}/.agent:/home/user/.agent" in words
     assert read.out.endswith(
         f" -v {tmp_sock_dir}/llm-agent.sock:/tmp/ssh-agent.sock --cpus 2 "
         "-p 127.0.0.1:19555:19555 -e PLANNOTATOR_REMOTE=1 -e PLANNOTATOR_PORT=19555 "
-        "dev:latest bash -c 'echo hi'\n"
+        "-i dev:latest bash -c 'echo hi'\n"
     )
     assert " -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock " in read.out
     assert "warning" not in read.err
@@ -914,6 +931,7 @@ def test_main_dry_run_without_agent_config_omits_config_mounts(
 
 
 def test_main_dry_run_no_git_root_mounts_cwd_only(
+    agent_config: Path,
     plain_repo: Path,
     tmp_sock_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -921,7 +939,7 @@ def test_main_dry_run_no_git_root_mounts_cwd_only(
     batch_stdin: None,
 ) -> None:
     monkeypatch.chdir(plain_repo / "sub")
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_sock_dir))
     monkeypatch.setattr(c, "pick_free_port", lambda: 19555)
 
@@ -934,6 +952,7 @@ def test_main_dry_run_no_git_root_mounts_cwd_only(
 
 
 def test_main_dry_run_missing_socket_warns(
+    agent_config: Path,
     plain_repo: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -943,7 +962,7 @@ def test_main_dry_run_missing_socket_warns(
     empty = tmp_path.resolve() / "run"
     empty.mkdir()
     monkeypatch.chdir(plain_repo / "sub")
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(empty))
     monkeypatch.setattr(c, "pick_free_port", lambda: 19555)
 
@@ -959,6 +978,7 @@ def test_main_dry_run_missing_socket_warns(
 
 
 def test_main_dry_run_krun_signer_reachable_no_warning(
+    agent_config: Path,
     plain_repo: Path,
     signer_server: Callable[[bytes | None], int],
     monkeypatch: pytest.MonkeyPatch,
@@ -969,7 +989,7 @@ def test_main_dry_run_krun_signer_reachable_no_warning(
     monkeypatch.setattr(c, "KRUN_SSH_PORT", port)
     monkeypatch.setattr(c, "SSH_PROBE_HOST", LOCAL_HOST)
     monkeypatch.chdir(plain_repo / "sub")
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
 
     c.main(["--dry-run", "-k", "bash"])
 
@@ -982,6 +1002,7 @@ def test_main_dry_run_krun_signer_reachable_no_warning(
 
 
 def test_main_dry_run_krun_missing_signer_warns(
+    agent_config: Path,
     plain_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -991,7 +1012,7 @@ def test_main_dry_run_krun_missing_signer_warns(
     monkeypatch.setattr(c, "KRUN_SSH_PORT", port)
     monkeypatch.setattr(c, "SSH_PROBE_HOST", LOCAL_HOST)
     monkeypatch.chdir(plain_repo / "sub")
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
 
     c.main(["--dry-run", "-k", "bash"])
 
@@ -1002,12 +1023,13 @@ def test_main_dry_run_krun_missing_signer_warns(
     )
     assert "llm-agent.sock" not in read.out
     assert (
-        f"c: warning: {LOCAL_HOST}:{port}: no ssh-agent reachable; "
-        "running without ssh-agent\n" in read.err
+        f"c: warning: {LOCAL_HOST}:{port}: no signer responded; "
+        "bridge remains configured\n" in read.err
     )
 
 
 def test_main_dry_run_no_git_signing_flag_without_socket(
+    agent_config: Path,
     plain_repo: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1017,7 +1039,7 @@ def test_main_dry_run_no_git_signing_flag_without_socket(
     empty = tmp_path.resolve() / "run"
     empty.mkdir()
     monkeypatch.chdir(plain_repo / "sub")
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(empty))
     monkeypatch.setattr(c, "pick_free_port", lambda: 19555)
 
@@ -1034,6 +1056,7 @@ def test_main_dry_run_no_git_signing_flag_without_socket(
 
 
 def test_main_dry_run_git_signing_disabled_env_without_socket(
+    agent_config: Path,
     plain_repo: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1043,7 +1066,7 @@ def test_main_dry_run_git_signing_disabled_env_without_socket(
     empty = tmp_path.resolve() / "run"
     empty.mkdir()
     monkeypatch.chdir(plain_repo / "sub")
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(empty))
     monkeypatch.setenv("GIT_SIGNING_DISABLED", "1")
     monkeypatch.setattr(c, "pick_free_port", lambda: 19555)
@@ -1061,6 +1084,7 @@ def test_main_dry_run_git_signing_disabled_env_without_socket(
 
 
 def test_main_dry_run_no_git_signing_skips_present_socket(
+    agent_config: Path,
     plain_repo: Path,
     tmp_sock_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1068,7 +1092,7 @@ def test_main_dry_run_no_git_signing_skips_present_socket(
     batch_stdin: None,
 ) -> None:
     monkeypatch.chdir(plain_repo / "sub")
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_sock_dir))
     monkeypatch.setattr(c, "pick_free_port", lambda: 19555)
 
@@ -1082,6 +1106,7 @@ def test_main_dry_run_no_git_signing_skips_present_socket(
 
 
 def test_main_dry_run_krun_no_git_signing_skips_probe(
+    agent_config: Path,
     plain_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1091,7 +1116,7 @@ def test_main_dry_run_krun_no_git_signing_skips_probe(
     monkeypatch.setattr(c, "KRUN_SSH_PORT", port)
     monkeypatch.setattr(c, "SSH_PROBE_HOST", LOCAL_HOST)
     monkeypatch.chdir(plain_repo / "sub")
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
 
     c.main(["--dry-run", "-k", "--no-git-signing", "bash"])
 
@@ -1107,10 +1132,10 @@ def test_main_dry_run_krun_no_git_signing_skips_probe(
 
 
 def test_new_container_banner_advertises_plan_ui(
-    plain_repo: Path, monkeypatch: pytest.MonkeyPatch
+    agent_config: Path, plain_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(plain_repo / "sub")
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
     monkeypatch.setattr(c, "pick_free_port", lambda: 19555)
 
     args = c.build_parser().parse_args(["bash"])
@@ -1120,13 +1145,14 @@ def test_new_container_banner_advertises_plan_ui(
 
 
 def test_main_plannotator_port_flags(
+    agent_config: Path,
     plain_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     batch_stdin: None,
 ) -> None:
     monkeypatch.chdir(plain_repo)
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
 
     c.main(["--dry-run", "--plannotator-port", "19999", "bash"])
     override = capsys.readouterr().out
@@ -1140,13 +1166,14 @@ def test_main_plannotator_port_flags(
 
 
 def test_main_strips_one_command_separator(
+    agent_config: Path,
     plain_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     batch_stdin: None,
 ) -> None:
     monkeypatch.chdir(plain_repo)
-    monkeypatch.setenv("AGENT_CONFIG_DIR", "/cfg")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
 
     c.main(["--dry-run", "--", "--", "--version"])
 
@@ -1174,25 +1201,27 @@ def test_main_container_implies_running(
     c.main(["-c", "dev_container", "--dry-run", "zsh", "-c", "ls -la"])
     c.main(["-r", "--dry-run", "bash"])
 
+    selected_id = inspect_entry("dev_container", plain_repo)["Id"]
     assert capsys.readouterr().out == (
-        "podman exec -w /work/sub dev_container zsh -c 'ls -la'\n"
-        "podman exec -w /work/sub dev_container bash\n"
+        f"podman exec -w /work/sub -i {selected_id} zsh -c 'ls -la'\n"
+        f"podman exec -w /work/sub -i {selected_id} bash\n"
     )
 
 
 def test_main_reports_missing_podman(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
 
     with pytest.raises(SystemExit) as exc:
         c.main(["-r", "--dry-run", "bash"])
 
-    assert exc.value.code == "c: error: podman: command not found"
+    assert exc.value.code == 127
+    assert capsys.readouterr().err == "c: error: podman: No such file or directory\n"
 
 
 def test_main_reports_engine_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
     bin_dir = tmp_path / "bin"
     install_fake_podman(bin_dir, None)
@@ -1201,7 +1230,8 @@ def test_main_reports_engine_failure(
     with pytest.raises(SystemExit) as exc:
         c.main(["-r", "--dry-run", "bash"])
 
-    assert exc.value.code == "c: error: podman failed: Error: cannot connect"
+    assert exc.value.code == 1
+    assert capsys.readouterr().err == "c: error: podman failed: Error: cannot connect\n"
 
 
 def test_main_usage_error_exits_with_two(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1213,3 +1243,629 @@ def test_main_usage_error_exits_with_two(capsys: pytest.CaptureFixture[str]) -> 
         "-k/--krun cannot be used with -r/--running; no command specified"
         in capsys.readouterr().err
     )
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [(v, True) for v in ("1", "true", "TRUE", "yes", "YES", "on", "ON")]
+    + [(v, False) for v in ("", "0", "false", "FALSE", "no", "NO", "off", "OFF")],
+)
+def test_boolean_and_dry_run_contract_signing_values(
+    monkeypatch, value: str, expected: bool
+) -> None:
+    monkeypatch.setenv("GIT_SIGNING_DISABLED", value)
+    assert c.env_bool("GIT_SIGNING_DISABLED") is expected
+
+
+def test_boolean_and_dry_run_contract_invalid_before_launch(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("GIT_SIGNING_DISABLED", "invalid")
+    with pytest.raises(SystemExit) as error:
+        c.main(["--dry-run", "--no-git-signing", "bash"])
+    assert error.value.code == 2
+    assert "GIT_SIGNING_DISABLED: expected a boolean" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("running", [False, True])
+@pytest.mark.parametrize(
+    "stdin_tty, stdout_tty",
+    [(True, True), (False, True), (True, False), (False, False)],
+)
+def test_stdio_contract_defaults(
+    plain_repo, monkeypatch, capsys, running, stdin_tty, stdout_tty
+):
+    monkeypatch.chdir(plain_repo)
+    monkeypatch.delenv("AGENT_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: stdin_tty)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: stdout_tty)
+    monkeypatch.setattr(
+        c,
+        "running_containers",
+        lambda: (c.Container("id", "dev", (c.Mount(plain_repo, plain_repo),)),),
+    )
+    c.main(
+        [
+            "--dry-run",
+            *(["-r"] if running else ["--no-git-signing", "--no-plannotator-port"]),
+            "cat",
+        ]
+    )
+    words = shlex.split(capsys.readouterr().out)
+    assert "-i" in words
+    assert ("-t" in words) is (stdin_tty and stdout_tty)
+
+
+@pytest.mark.parametrize("running", [False, True])
+@pytest.mark.parametrize("interactive", [False, True])
+@pytest.mark.parametrize("tty", [False, True])
+def test_stdio_contract_overrides(
+    plain_repo, monkeypatch, capsys, running, interactive, tty
+):
+    monkeypatch.chdir(plain_repo)
+    monkeypatch.delenv("AGENT_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(
+        c,
+        "running_containers",
+        lambda: (c.Container("id", "dev", (c.Mount(plain_repo, plain_repo),)),),
+    )
+    c.main(
+        [
+            "--dry-run",
+            "--interactive" if interactive else "--no-interactive",
+            "--tty" if tty else "--no-tty",
+            *(["-r"] if running else ["--no-git-signing", "--no-plannotator-port"]),
+            "cat",
+            "--tty",
+        ]
+    )
+    words = shlex.split(capsys.readouterr().out)
+    assert ("-i" in words) is interactive
+    assert ("-t" in words) is tty
+    assert words[-2:] == ["cat", "--tty"]
+
+
+@pytest.mark.parametrize(
+    "flags", [("--interactive", "--no-interactive"), ("--tty", "--no-tty")]
+)
+def test_stdio_contract_conflicts(flags):
+    with pytest.raises(SystemExit) as error:
+        parse(*flags, "cat")
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["-a=-e", "-a=PRIVATE_VALUE=synthetic-secret"],
+        ["-a=--env=PRIVATE_VALUE=synthetic-secret"],
+        ["-a=--env", "-a=PRIVATE_VALUE=synthetic-secret"],
+    ],
+)
+def test_secret_transport_contract_literal_environment(
+    plain_repo, monkeypatch, capsys, extra
+):
+    monkeypatch.chdir(plain_repo)
+    monkeypatch.delenv("AGENT_CONFIG_DIR", raising=False)
+    args = ["--no-git-signing", "--no-plannotator-port", *extra, "bash"]
+    c.main(["--dry-run", *args])
+    assert "synthetic-secret" not in capsys.readouterr().out
+    captured = []
+    monkeypatch.setattr(os, "execvp", lambda file, args: captured.extend(args))
+    c.main(args)
+    assert "synthetic-secret" in repr(captured)
+
+
+def test_secret_transport_contract_known_values(plain_repo, monkeypatch, capsys):
+    monkeypatch.chdir(plain_repo)
+    monkeypatch.delenv("AGENT_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key'quoted")
+    c.main(
+        [
+            "--dry-run",
+            "--no-git-signing",
+            "--no-plannotator-port",
+            "echo",
+            "synthetic-key'quoted",
+            "https://user:password@localhost/path",
+        ]
+    )
+    display = capsys.readouterr().out
+    assert "synthetic-key" not in display
+    assert "user:password" not in display
+
+
+REQUIRED_CONFIG_DIRS = (
+    ".agent",
+    ".pi/agent",
+    ".omp/agent",
+    ".agent/skills",
+    ".agent/prompts",
+)
+PERSISTENT_STATE_DIRS = (
+    ".plannotator",
+    ".opencode",
+    ".config/opencode",
+    ".local/share/opencode",
+    ".local/state/opencode",
+    ".local/share/opentui",
+    ".claude",
+    ".local/state/claude",
+)
+
+
+@pytest.fixture
+def agent_config(tmp_path):
+    root = tmp_path / "agent config"
+    for rel in REQUIRED_CONFIG_DIRS:
+        (root / rel).mkdir(parents=True, exist_ok=True)
+    return root
+
+
+@pytest.mark.parametrize("rel", PERSISTENT_STATE_DIRS)
+def test_persistence_contract_prepares_private_state(agent_config, rel):
+    c.prepare_agent_config(agent_config, dry_run=False)
+    path = agent_config / rel
+    assert path.is_dir()
+    assert path.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_uid == os.getuid()
+    assert not (agent_config / ".opencode/bin").exists()
+    argv = run_argv(agent_config_dir=agent_config)
+    assert f"{path}:/home/user/{rel}" in argv
+    assert not any("/.local/lib" in word for word in argv)
+
+
+@pytest.mark.parametrize("rel", REQUIRED_CONFIG_DIRS)
+def test_persistence_contract_missing_required_has_no_side_effects(agent_config, rel):
+    import shutil
+
+    shutil.rmtree(agent_config / rel)
+    with pytest.raises(c.Error, match="required configuration directory"):
+        c.prepare_agent_config(agent_config, dry_run=False)
+    assert not (agent_config / ".plannotator").exists()
+
+
+def test_persistence_contract_dry_run_reports_without_creation(agent_config, capsys):
+    before = sorted(agent_config.rglob("*"))
+    c.prepare_agent_config(agent_config, dry_run=True)
+    assert sorted(agent_config.rglob("*")) == before
+    report = capsys.readouterr().err
+    assert all(str(agent_config / rel) in report for rel in PERSISTENT_STATE_DIRS)
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        ".pi/agent/auth.json",
+        ".omp/agent/auth.json",
+        ".claude/.credentials.json",
+        ".local/share/opencode/auth.json",
+    ],
+)
+def test_persistence_contract_preserves_selected_credentials(
+    agent_config, tmp_path, monkeypatch, rel
+):
+    personal = tmp_path / "personal"
+    personal.mkdir()
+    (personal / ".claude.json").write_text("must not import")
+    monkeypatch.setenv("HOME", str(personal))
+    path = agent_config / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("synthetic selected credential")
+    c.prepare_agent_config(agent_config, dry_run=False)
+    assert path.read_text() == "synthetic selected credential"
+    assert not (agent_config / ".claude/.claude.json").exists()
+    assert not (agent_config / ".claude.json").exists()
+
+
+def test_persistence_contract_rejects_symlinked_state_before_preparing(
+    agent_config, tmp_path
+):
+    target = tmp_path / "external"
+    target.mkdir()
+    (agent_config / ".claude").symlink_to(target)
+    with pytest.raises(c.Error, match="symlinked"):
+        c.prepare_agent_config(agent_config, dry_run=False)
+    assert not (agent_config / ".plannotator").exists()
+
+
+def test_persistence_contract_rejects_wrong_owner(agent_config, monkeypatch):
+    state = agent_config / ".claude"
+    state.mkdir()
+    original = Path.stat
+
+    def foreign(path, **kwargs):
+        info = original(path, **kwargs)
+        if path == state:
+            fields = list(info)
+            fields[4] = os.getuid() + 1
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(Path, "stat", foreign)
+    with pytest.raises(c.Error, match="not owned by invoker"):
+        c.prepare_agent_config(agent_config, dry_run=False)
+    assert not (agent_config / ".plannotator").exists()
+
+
+def test_persistence_contract_child_order_and_cache(agent_config):
+    words = run_argv(agent_config_dir=agent_config)
+    assert words.index(f"{agent_config}/.pi/agent:/home/user/.pi/agent") < words.index(
+        f"{agent_config}/.agent/skills:/home/user/.pi/agent/skills"
+    )
+    assert words.index(
+        f"{agent_config}/.omp/agent:/home/user/.omp/agent"
+    ) < words.index(f"{agent_config}/.agent/prompts:/home/user/.omp/agent/prompts")
+    assert "dev-pre-commit:/home/user/.cache/pre-commit" in words
+    assert f"{agent_config}/.pi:/home/user/.pi" not in words
+    assert f"{agent_config}/.omp:/home/user/.omp" not in words
+
+
+def test_workspace_contract_external_bare_roots(bare_layout):
+    outside = bare_layout.parent / "outside"
+    workspace = c.resolve_workspace(outside)
+    assert workspace.roots == (bare_layout, outside)
+    assert workspace.common_dir is None
+
+
+def test_workspace_contract_linked_metadata(plain_repo):
+    linked = plain_repo.parent / "linked"
+    git("-C", str(plain_repo), "worktree", "add", "-b", "linked", str(linked))
+    workspace = c.resolve_workspace(linked)
+    assert workspace.roots == (linked,)
+    assert workspace.common_dir == plain_repo / ".git"
+
+
+@pytest.mark.parametrize("selection", ["ab", "abcd"])
+def test_container_selection_contract_exact_before_prefix(selection):
+    exact = container("ab", mount("/srv"), id="abcd")
+    prefix = container("dev_container", mount("/srv/project"), id="abcdef")
+    selected, _ = c.select_container(
+        cwd=Path("/srv/project"), containers=(prefix, exact), name=selection
+    )
+    assert selected is exact
+
+
+def test_container_selection_contract_ambiguous_prefix():
+    first = container("one", mount("/srv"), id="abcd1234")
+    second = container("two", mount("/srv"), id="abcd5678")
+    with pytest.raises(c.Error, match=r"ambiguous.*one.*abcd1234.*two.*abcd5678"):
+        c.select_container(
+            cwd=Path("/srv/project"), containers=(first, second), name="abcd"
+        )
+
+
+def test_container_selection_contract_unique_prefix():
+    first = container("one", mount("/srv"), id="abcd1234")
+    second = container("two", mount("/srv"), id="abcd5678")
+    selected, _ = c.select_container(
+        cwd=Path("/srv/project"), containers=(first, second), name="abcd1"
+    )
+    assert selected is first
+
+
+def test_container_selection_contract_exec_uses_id(plain_repo, monkeypatch):
+    selected = container(
+        "friendly", c.Mount(plain_repo, Path("/work")), id="immutable-id"
+    )
+    monkeypatch.setattr(c, "running_containers", lambda: (selected,))
+    words, banner = c.exec_running(parse("-r", "cat"), cwd=plain_repo, tty=False)
+    assert words[-2:] == ["immutable-id", "cat"]
+    assert banner == "friendly:/work"
+
+
+@pytest.mark.parametrize(
+    "flag, value",
+    [
+        ("--cpus", "0"),
+        ("--cpus", "-1"),
+        ("--cpus", "1.5"),
+        ("--ram-mib", "0"),
+        ("--ram-mib", "-2"),
+        ("--plannotator-port", "0"),
+        ("--plannotator-port", "65536"),
+    ],
+)
+def test_launch_validation_contract_ranges_no_side_effects(
+    agent_config, monkeypatch, capsys, flag, value
+):
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
+    with pytest.raises(SystemExit) as error:
+        c.main(["--dry-run", flag, value, "bash"])
+    assert error.value.code == 2
+    assert "error:" in capsys.readouterr().err
+    assert not (agent_config / ".plannotator").exists()
+
+
+@pytest.mark.parametrize("rel", [".pi/agent", ".claude", ".local"])
+def test_launch_validation_contract_wrong_type_before_preparation(
+    agent_config, monkeypatch, rel
+):
+    import shutil
+
+    path = agent_config / rel
+    if path.exists():
+        shutil.rmtree(path)
+    path.write_text("not a directory")
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid sources must be rejected before socket probing")
+
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    with pytest.raises(c.Error, match="directory"):
+        c.new_container(parse("-k", "bash"), cwd=agent_config.parent, tty=False)
+    assert not (agent_config / ".plannotator").exists()
+
+
+def test_launch_validation_contract_relative_configuration(
+    agent_config, monkeypatch, capsys
+):
+    monkeypatch.chdir(agent_config.parent)
+    monkeypatch.setenv("AGENT_CONFIG_DIR", f"unused/../{agent_config.name}")
+    c.main(
+        [
+            "--dry-run",
+            "--no-git-root",
+            "--no-git-signing",
+            "--no-plannotator-port",
+            "bash",
+        ]
+    )
+    words = shlex.split(capsys.readouterr().out)
+    assert f"{agent_config}/.agent:/home/user/.agent" in words
+    assert not (agent_config / ".plannotator").exists()
+
+
+@pytest.mark.parametrize("target, suffix", [(".", ""), ("..", "/agent config")])
+def test_launch_validation_contract_canonicalizes_store_alias(
+    agent_config, monkeypatch, target, suffix
+):
+    alias = agent_config.parent / "alias"
+    alias.symlink_to(agent_config / target)
+    monkeypatch.setenv("AGENT_CONFIG_DIR", f"{alias}{suffix}")
+
+    words, _ = c.new_container(
+        parse("--no-git-root", "--no-git-signing", "--no-plannotator-port", "bash"),
+        cwd=agent_config.parent,
+        tty=False,
+    )
+
+    assert f"{agent_config}/.agent:/home/user/.agent" in words
+    assert (agent_config / ".plannotator").is_dir()
+
+
+def test_launch_validation_contract_store_alias_preserves_state_symlink_rejection(
+    agent_config, monkeypatch
+):
+    alias = agent_config.parent / "alias"
+    alias.symlink_to(agent_config)
+    (agent_config / ".claude").symlink_to(agent_config.parent)
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(alias))
+
+    with pytest.raises(c.Error, match=r"symlinked components: .*\.claude"):
+        c.new_container(
+            parse("--no-git-root", "--no-git-signing", "bash"),
+            cwd=agent_config.parent,
+            tty=False,
+        )
+
+    assert not (agent_config / ".plannotator").exists()
+
+
+def test_launch_validation_contract_store_alias_cannot_mount_home(
+    agent_config, monkeypatch
+):
+    alias = agent_config.parent / "alias"
+    alias.symlink_to(agent_config)
+    monkeypatch.setenv("HOME", str(agent_config))
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(alias))
+
+    with pytest.raises(c.Error, match="refusing to mount"):
+        c.new_container(
+            parse("--no-git-root", "--no-git-signing", "bash"),
+            cwd=agent_config / "project",
+            tty=False,
+        )
+
+    assert not (agent_config / ".plannotator").exists()
+
+
+def test_launch_validation_contract_denied_root_before_state(agent_config, monkeypatch):
+    monkeypatch.setenv("HOME", str(agent_config.parent))
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(agent_config))
+    with pytest.raises(c.Error, match="refusing to mount"):
+        c.new_container(
+            parse("--no-git-root", "bash"), cwd=agent_config.parent, tty=False
+        )
+    assert not (agent_config / ".plannotator").exists()
+
+
+@pytest.mark.parametrize("running, executable", [(False, "git"), (True, "podman")])
+def test_launch_validation_contract_missing_binaries(tmp_path, running, executable):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--dry-run",
+            *(["-r"] if running else []),
+            "bash",
+        ],
+        env={"HOME": str(tmp_path), "PATH": str(tmp_path / "empty")},
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 127
+    assert executable in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize("error_number, status", [(2, 127), (13, 126)])
+def test_launch_validation_contract_exec_failure(
+    plain_repo, monkeypatch, capsys, error_number, status
+):
+    monkeypatch.chdir(plain_repo)
+    monkeypatch.delenv("AGENT_CONFIG_DIR", raising=False)
+
+    def fail(*args, **kwargs):
+        raise OSError(error_number, "fixture exec failure")
+
+    monkeypatch.setattr(os, "execvp", fail)
+    with pytest.raises(SystemExit) as error:
+        c.main(["--no-git-root", "--no-git-signing", "--no-plannotator-port", "bash"])
+    assert error.value.code == status
+    assert "Traceback" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "delay, expected",
+    [(0.002, True), (0.08, False)],
+    ids=["fragmented", "total-deadline"],
+)
+def test_tcp_signer_contract_fragmented_deadline(delay, expected):
+    import time
+
+    with socket.socket() as listener:
+        listener.bind((LOCAL_HOST, 0))
+        listener.listen(1)
+        listener.settimeout(2)
+        stopped = threading.Event()
+
+        def serve():
+            with listener.accept()[0] as connection:
+                connection.settimeout(2)
+                connection.recv(5)
+                for byte in agent_identity_reply(1):
+                    if stopped.wait(delay):
+                        return
+                    try:
+                        connection.sendall(bytes([byte]))
+                    except OSError:
+                        return
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        try:
+            start = time.monotonic()
+            result = c.probe_tcp_signer(
+                LOCAL_HOST, listener.getsockname()[1], timeout=0.25
+            )
+            elapsed = time.monotonic() - start
+        finally:
+            stopped.set()
+            thread.join(timeout=3)
+    assert result is expected
+    assert elapsed < 0.65
+    assert not thread.is_alive()
+
+
+def test_tcp_signer_contract_warning_preserves_bridge(plain_repo, monkeypatch, capsys):
+    monkeypatch.chdir(plain_repo)
+    monkeypatch.delenv("AGENT_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(c, "KRUN_SSH_PORT", closed_tcp_port())
+    c.main(["--dry-run", "-k", "--no-plannotator-port", "bash"])
+    captured = capsys.readouterr()
+    assert "no signer responded; bridge remains configured" in captured.err
+    assert f"pasta:-T,{c.KRUN_SSH_PORT}" in captured.out
+
+
+@pytest.mark.parametrize("running", [False, True])
+@pytest.mark.parametrize("interactive", [False, True])
+def test_workflow_fix_podman_stub_stdin_and_arguments(
+    plain_repo, tmp_path, running, interactive
+):
+    """Verify the wrapper's handoff to a stub, without claiming Podman execution."""
+    executable = tmp_path / "podman"
+    entry = inspect_entry("friendly", plain_repo)
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"entry = {entry!r}\n"
+        "if sys.argv[1] == 'ps': print(entry['Id'])\n"
+        "elif sys.argv[1] == 'inspect': print(json.dumps([entry]))\n"
+        "else: print(json.dumps([sys.argv[1:], "
+        "sys.stdin.read() if '-i' in sys.argv else '']))\n"
+    )
+    executable.chmod(0o755)
+    command = ["agent", "--dry-run", "--tty", "a b"]
+    options = ["-r"] if running else ["--no-git-signing", "--no-plannotator-port"]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            *options,
+            "--tty",
+            "--interactive" if interactive else "--no-interactive",
+            *command,
+        ],
+        cwd=plain_repo,
+        env={"HOME": str(tmp_path), "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        input="piped stdin",
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    words, stdin = json.loads(result.stdout)
+    assert words[-4:] == command
+    assert ("-i" in words) is interactive
+    assert "-t" in words
+    assert stdin == ("piped stdin" if interactive else "")
+    assert words[-5] == (entry["Id"] if running else "dev:latest")
+
+
+@pytest.mark.parametrize("target, status", [("absent", 127), ("not-executable", 126)])
+def test_workflow_fix_engine_exec_errors(tmp_path, target, status):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    if target == "not-executable":
+        (bindir / "podman").write_text("cannot execute")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--no-git-root",
+            "--no-git-signing",
+            "--no-plannotator-port",
+            "bash",
+        ],
+        cwd=workspace,
+        env={"HOME": str(tmp_path / "home"), "PATH": str(bindir)},
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == status
+    assert "Traceback" not in result.stderr
+    assert "c: error:" in result.stderr
+
+
+def test_secret_transport_contract_socks_proxy_redaction():
+    assert (
+        c.redact_text("socks5://user:password@proxy:1080", [])
+        == "socks5://***@proxy:1080"
+    )
+
+
+def test_secret_transport_contract_path_diagnostics(agent_config, monkeypatch, capsys):
+    secret = "synthetic-path-secret"
+    root = agent_config.with_name(secret)
+    agent_config.rename(root)
+    monkeypatch.setenv("AGENT_CONFIG_DIR", str(root))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(root / "run"))
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    c.main(
+        [
+            "--dry-run",
+            "--no-plannotator-port",
+            "-a=--env=PRIVATE_VALUE=synthetic-path-secret",
+            "bash",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    assert "would create private state" in captured.err
+    assert "signing agent socket not found" in captured.err

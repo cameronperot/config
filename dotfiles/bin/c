@@ -11,13 +11,17 @@ entrypoint connects to SSH_AUTH_SOCK). If the signing socket does not exist,
 `c` warns and starts the container without it; ssh signing then fails at
 commit time. Under -k, before booting, `c` probes the host's bridge port with
 an ssh-agent identity request and warns when no signer answers. With
---no-git-signing (or a non-empty GIT_SIGNING_DISABLED), both checks are
+--no-git-signing (or a true GIT_SIGNING_DISABLED), both checks are
 skipped, no agent socket is mounted or bridged, and commit.gpgsign=false is injected via
 GIT_CONFIG_* so commits succeed unsigned; GIT_SIGNING_DISABLED=1 is passed
-into the container so agent-sandbox does not warn about the unset socket.
+into the container so agent-sandbox preserves unsigned commits after clearing
+its environment and omits even a supplied signing socket. The TCP probe uses
+one total one-second deadline; a failed probe leaves the bridge configured.
 
 With -r (or -c) the command runs instead in the already-running container whose
 bind mount contains the current directory, translated to its container path.
+Exact names/IDs precede unique ID prefixes; ambiguous prefixes are errors.
+Execution uses the immutable ID while diagnostics use the friendly name.
 
 Mounted at its host path: the directory holding `.bare` for a `.bare` layout
 (plus the toplevel when it lies elsewhere), the toplevel and the common git dir
@@ -29,17 +33,35 @@ The Plannotator plan UI port is exposed by default: a free loopback port is
 picked on the host and published one-to-one into the container, with
 PLANNOTATOR_REMOTE=1 and PLANNOTATOR_PORT set so the URL Plannotator prints
 inside is already clickable on the host. `--plannotator-port PORT` pins the
-port, `--no-plannotator-port` opts out.
+port (1..65535), `--no-plannotator-port` opts out. CPU/RAM limits must be positive.
+
+Stdin is attached by default; a TTY is automatic only when stdin and stdout
+are terminals. --interactive/--no-interactive and --tty/--no-tty are independent.
+A configured dedicated AGENT_CONFIG_DIR must supply .agent, .pi/agent,
+.omp/agent and shared skills/prompts. Missing Plannotator/OpenCode/Claude stores
+are created privately only on real launches; credentials already there persist.
+Without it, bundled configuration and ephemeral agent state are used; the named
+pre-commit cache persists in both modes. Personal HOME credentials are not copied.
+
+GIT_SIGNING_DISABLED accepts 1/true/yes/on or 0/false/no/off case-insensitively;
+unset/empty is false, other values are usage errors. Dry-run never executes the
+command or prepares state. Diagnostics mask known API keys, proxy URL user info,
+and literal -a environment assignments; unknown command secrets cannot be detected.
+Missing executables return 127; other exec failures return 126 without tracebacks.
 """
 
 import argparse
+import errno
 import json
 import os
+import re
 import shlex
 import socket
 import struct
 import subprocess
 import sys
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,7 +79,7 @@ KRUN_RAM_MIB = 8192
 # (path under AGENT_CONFIG_DIR, path under CONTAINER_HOME), parents before children.
 # The host's .pi/agent and .omp/agent shadow the image's symlinks to
 # .agent/{skills,prompts}, so those two are mounted again underneath each agent.
-AGENT_CONFIG_MOUNTS = (
+REQUIRED_CONFIG_MOUNTS = (
     (".agent", ".agent"),
     (".pi/agent", ".pi/agent"),
     (".omp/agent", ".omp/agent"),
@@ -65,12 +87,39 @@ AGENT_CONFIG_MOUNTS = (
     (".agent/skills", ".omp/agent/skills"),
     (".agent/prompts", ".pi/agent/prompts"),
     (".agent/prompts", ".omp/agent/prompts"),
-    (".plannotator", ".plannotator"),
+)
+AGENT_STATE_DIRS = (
+    ".plannotator",
+    ".opencode",
+    ".config/opencode",
+    ".local/share/opencode",
+    ".local/state/opencode",
+    ".local/share/opentui",
+    ".claude",
+    ".local/state/claude",
+)
+AGENT_CONFIG_MOUNTS = REQUIRED_CONFIG_MOUNTS + tuple(
+    (rel, rel) for rel in AGENT_STATE_DIRS
 )
 
 
 class Error(Exception):
     """Fatal condition reported as `c: error: ...`."""
+
+    def __init__(self, message: str, *, exit_code: int = 1) -> None:
+        """Keep a shell-compatible status with the diagnostic."""
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def env_bool(name: str) -> bool:
+    """Parse an optional boolean control, rejecting unknown spellings."""
+    value = os.environ.get(name, "").lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise Error(f"{name}: expected a boolean value")
 
 
 @dataclass(frozen=True)
@@ -112,6 +161,19 @@ class Container:
     mounts: tuple[Mount, ...]
 
 
+@dataclass(frozen=True)
+class Workspace:
+    """Ordered project roots and any separately mounted Git metadata."""
+
+    roots: tuple[Path, ...]
+    common_dir: Path | None = None
+
+    @property
+    def mounts(self) -> tuple[Path, ...]:
+        """Return all writable mounts in project-then-metadata order."""
+        return self.roots + ((self.common_dir,) if self.common_dir is not None else ())
+
+
 def run(*argv: str) -> str:
     """Run an engine command and return its stdout.
 
@@ -127,8 +189,11 @@ def run(*argv: str) -> str:
     """
     try:
         result = subprocess.run(argv, capture_output=True, text=True, check=True)
-    except FileNotFoundError:
-        raise Error(f"{argv[0]}: command not found") from None
+    except OSError as exc:
+        raise Error(
+            f"{argv[0]}: {exc.strerror}",
+            exit_code=127 if exc.errno == errno.ENOENT else 126,
+        ) from None
     except subprocess.CalledProcessError as e:
         raise Error(f"{argv[0]} failed: {e.stderr.strip()}") from None
     return result.stdout
@@ -157,31 +222,31 @@ def git_rev_parse(cwd: Path, *args: str) -> Path:
     return Path(result.stdout.strip()).resolve()
 
 
-def resolve_mounts(cwd: Path) -> tuple[Path, ...]:
-    """Directories to bind at their host paths so git works inside the container.
+def resolve_workspace(cwd: Path) -> Workspace:
+    """Resolve ordered project roots and separately identified Git metadata.
 
     Args:
         cwd: The resolved current directory.
 
     Returns:
-        Outside a work tree (a non-git dir, or the ``.bare`` parent itself) just
-            ``cwd``. In a ``.bare`` layout the directory containing ``.bare``, plus
-            the toplevel when it lies elsewhere. In a linked worktree of a plain
-            repo the toplevel and the common git dir. Otherwise the toplevel.
+        A workspace whose roots are ``cwd`` outside a worktree, the containing
+        directory (plus an external toplevel) in a ``.bare`` layout, or the
+        toplevel otherwise. Ordinary linked worktrees also identify their
+        external common Git directory separately.
     """
     try:
         toplevel = git_rev_parse(cwd, "--show-toplevel")
     except subprocess.CalledProcessError:
-        return (cwd,)
+        return Workspace((cwd,))
     common = git_rev_parse(cwd, "--path-format=absolute", "--git-common-dir")
     if common.is_relative_to(toplevel):
-        return (toplevel,)
+        return Workspace((toplevel,))
     if common.name == ".bare":
         parent = common.parent
         if toplevel.is_relative_to(parent):
-            return (parent,)
-        return (parent, toplevel)
-    return (toplevel, common)
+            return Workspace((parent,))
+        return Workspace((parent, toplevel))
+    return Workspace((toplevel,), common)
 
 
 def pick_free_port() -> int:
@@ -217,19 +282,29 @@ def probe_tcp_signer(host: str, port: int, timeout: float = 1.0) -> bool:
     Args:
         host: Host to probe.
         port: TCP port to probe.
-        timeout: Seconds allowed for the connect, the send, and each read.
+        timeout: Total seconds allowed across connect, send and all reads.
 
     Returns:
         True only when the endpoint answers ``SSH_AGENTC_REQUEST_IDENTITIES``
             (type 12) reporting at least one key; connection errors, timeouts,
             malformed replies, and empty key lists return False.
     """
+    deadline = time.monotonic() + timeout
+
+    def remaining() -> float:
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("signer probe deadline exceeded")
+        return seconds
+
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
+        with socket.create_connection((host, port), timeout=remaining()) as sock:
             # SSH_AGENTC_REQUEST_IDENTITIES: length 1, type 11
+            sock.settimeout(remaining())
             sock.sendall(b"\x00\x00\x00\x01\x0b")
             reply = b""
             while len(reply) < 4:
+                sock.settimeout(remaining())
                 chunk = sock.recv(4 - len(reply))
                 if not chunk:
                     return False
@@ -237,6 +312,7 @@ def probe_tcp_signer(host: str, port: int, timeout: float = 1.0) -> bool:
             (length,) = struct.unpack(">I", reply)
             payload = b""
             while len(payload) < length:
+                sock.settimeout(remaining())
                 chunk = sock.recv(length - len(payload))
                 if not chunk:
                     return False
@@ -298,7 +374,7 @@ def select_container(
     Args:
         cwd: The resolved current directory.
         containers: The running containers.
-        name: Restrict the choice to the container with this name or id prefix.
+        name: Exact container name/ID, falling back to a unique ID prefix.
 
     Returns:
         The ``(container, mount)`` pair whose mount contains ``cwd``, preferring
@@ -311,9 +387,11 @@ def select_container(
     if not containers:
         raise Error("no running containers")
     if name is not None:
-        containers = tuple(
-            c for c in containers if c.name == name or c.id.startswith(name)
-        )
+        exact = tuple(c for c in containers if c.name == name or c.id == name)
+        containers = exact or tuple(c for c in containers if c.id.startswith(name))
+        if not exact and len(containers) > 1:
+            candidates = ", ".join(f"{c.name} ({c.id})" for c in containers)
+            raise Error(f"ambiguous container ID prefix '{name}': {candidates}")
         if not containers:
             raise Error(f"no running container named '{name}'")
     candidates = [(c, m) for c in containers for m in c.mounts if m.contains(cwd)]
@@ -339,6 +417,7 @@ def run_argv(
     signing_disabled: bool,
     extra_args: list[str],
     tty: bool,
+    interactive: bool = True,
     command: list[str],
 ) -> list[str]:
     """Assemble the ``podman run`` argv for a throwaway dev container.
@@ -360,10 +439,11 @@ def run_argv(
             ``PLANNOTATOR_PORT`` set; omitted when None.
         signing_disabled: When true, omit agent access and inject
             ``commit.gpgsign=false`` via ``GIT_CONFIG_*`` for unsigned commits, and set
-            ``GIT_SIGNING_DISABLED=1`` in the container so ``agent-sandbox``
-            does not warn about the unset ssh-agent socket.
+            ``GIT_SIGNING_DISABLED=1`` so ``agent-sandbox`` preserves unsigned
+            commits after clearing its environment and omits signing sockets.
         extra_args: Additional ``podman run`` arguments, placed before the image.
-        tty: Whether to attach an interactive terminal (``-i -t``).
+        tty: Whether to allocate a terminal (``-t``).
+        interactive: Whether to attach stdin (``-i``).
         command: Command to run; empty for the image's default.
 
     Returns:
@@ -431,27 +511,53 @@ def run_argv(
             f"PLANNOTATOR_PORT={plannotator_port}",
         ]
     argv += extra_args
+    if interactive:
+        argv += ["-i"]
     if tty:
-        argv += ["-i", "-t"]
+        argv += ["-t"]
     return [*argv, IMAGE, *command]
 
 
-def exec_argv(*, name: str, workdir: Path, tty: bool, command: list[str]) -> list[str]:
+def exec_argv(
+    *, name: str, workdir: Path, tty: bool, interactive: bool = True, command: list[str]
+) -> list[str]:
     """Assemble the ``podman exec`` argv for a running container.
 
     Args:
-        name: Container name.
+        name: Selected immutable container ID.
         workdir: Working directory inside the container.
-        tty: Whether to attach an interactive terminal (``-i -t``).
+        tty: Whether to allocate a terminal (``-t``).
+        interactive: Whether to attach stdin (``-i``).
         command: Command to run.
 
     Returns:
         The argv, starting with the engine.
     """
     argv = [ENGINE, "exec", "-w", str(workdir)]
+    if interactive:
+        argv += ["-i"]
     if tty:
-        argv += ["-i", "-t"]
+        argv += ["-t"]
     return [*argv, name, *command]
+
+
+def positive_int(value: str) -> int:
+    """Parse a positive integer resource limit."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a positive integer") from None
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
+
+
+def port_number(value: str) -> int:
+    """Parse a TCP port in the inclusive range 1..65535."""
+    parsed = positive_int(value)
+    if parsed > 65535:
+        raise argparse.ArgumentTypeError("port must be from 1 through 65535")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -466,7 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
         usage=(
             "%(prog)s [--dry-run] [-k] [--cpus N] [--ram-mib MIB] "
             "[--plannotator-port PORT | --no-plannotator-port] [--no-git-signing] "
-            "[--no-git-root] "
+            "[--no-git-root] [--interactive | --no-interactive] [--tty | --no-tty] "
             "[-a=ARG ...] [--] [CMD ...]\n"
             "       %(prog)s [--dry-run] -r [-c NAME] [--] CMD ..."
         ),
@@ -474,11 +580,46 @@ def build_parser() -> argparse.ArgumentParser:
             f"Run CMD in a {IMAGE} container: a throwaway one by default, or with -r "
             "the running one whose bind mount contains the current directory."
         ),
+        epilog=(
+            "GIT_SIGNING_DISABLED: 1/true/yes/on or 0/false/no/off (case-insensitive); "
+            "unset/empty is false, other values are errors. AGENT_CONFIG_DIR selects "
+            "a dedicated store: existing shared/Pi/OMP config is required; missing "
+            "Plannotator/OpenCode/Claude state is created privately on real launches. "
+            "Unset/empty uses bundled config and ephemeral agent state. The named "
+            "pre-commit cache persists in either mode. Dry-run creates no state. "
+            "Diagnostics redact known API keys, proxy credentials and -a env values; "
+            "unknown secrets embedded in command arguments cannot be detected."
+        ),
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print the podman argv instead of running it",
+    )
+    stdin_group = parser.add_mutually_exclusive_group()
+    stdin_group.add_argument(
+        "--interactive",
+        dest="interactive",
+        action="store_true",
+        default=True,
+        help="attach stdin (default)",
+    )
+    stdin_group.add_argument(
+        "--no-interactive",
+        dest="interactive",
+        action="store_false",
+        help="do not attach stdin",
+    )
+    tty_group = parser.add_mutually_exclusive_group()
+    tty_group.add_argument(
+        "--tty",
+        dest="tty",
+        action="store_true",
+        default=None,
+        help="allocate a TTY (default: stdin and stdout are terminals)",
+    )
+    tty_group.add_argument(
+        "--no-tty", dest="tty", action="store_false", help="do not allocate a TTY"
     )
     new = parser.add_argument_group("new container (default)")
     new.add_argument(
@@ -489,28 +630,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     new.add_argument(
         "--cpus",
-        type=int,
+        type=positive_int,
         metavar="N",
         help=(
-            "CPU limit: `podman run --cpus N`, or vCPUs under -k "
+            "positive integer CPU limit: `podman run --cpus N`, or vCPUs under -k "
             f"(unset: no limit; -k default {KRUN_CPUS})"
         ),
     )
     new.add_argument(
         "--ram-mib",
-        type=int,
+        type=positive_int,
         metavar="MIB",
         help=(
-            "memory limit in MiB: `podman run --memory MIBm`, or RAM under -k "
+            "positive integer MiB limit: `podman run --memory MIBm`, or RAM under -k "
             f"(unset: no limit; -k default {KRUN_RAM_MIB})"
         ),
     )
     new.add_argument(
         "--plannotator-port",
-        type=int,
+        type=port_number,
         metavar="PORT",
         help=(
-            "host port for the Plannotator plan UI, published to the same port "
+            "host port (1..65535) for the Plannotator UI, published to the same port "
             "in the container (default: a free port is picked)"
         ),
     )
@@ -562,7 +703,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-c",
         "--container",
         metavar="NAME",
-        help="pick the container by name or id prefix (implies -r)",
+        help="exact name/ID or unique ID prefix (ambiguous prefixes fail; implies -r)",
     )
     parser.add_argument(
         "command",
@@ -607,6 +748,53 @@ def usage_errors(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(problems)
 
 
+def prepare_agent_config(
+    root: Path, *, dry_run: bool, extra_args: Sequence[str] = ()
+) -> None:
+    """Validate dedicated configuration before preparing private persistent state."""
+    check_mount_allowed(root)
+    for rel, _ in REQUIRED_CONFIG_MOUNTS:
+        if not (root / rel).is_dir():
+            raise Error(
+                "required configuration directory is missing or not a directory: "
+                f"{root / rel}"
+            )
+    for rel in dict.fromkeys(("", *(source for source, _ in AGENT_CONFIG_MOUNTS))):
+        path = root / rel
+        if path.resolve() != path:
+            raise Error(f"configuration/state dir has symlinked components: {path}")
+        for component in (path, *path.parents):
+            if component.exists():
+                if not component.is_dir():
+                    raise Error(
+                        f"configuration/state source is not a directory: {component}"
+                    )
+                if component.stat().st_uid != os.getuid():
+                    raise Error(
+                        f"configuration/state dir not owned by invoker: {component}"
+                    )
+            if component == root:
+                break
+    for rel in AGENT_STATE_DIRS:
+        path = root / rel
+        if not path.exists():
+            if dry_run:
+                print(
+                    redact_text(
+                        f"c: would create private state directory: {path}", extra_args
+                    ),
+                    file=sys.stderr,
+                )
+            else:
+                missing = [path]
+                parent = path.parent
+                while not parent.exists():
+                    missing.append(parent)
+                    parent = parent.parent
+                for directory in reversed(missing):
+                    directory.mkdir(mode=0o700)
+
+
 def new_container(
     args: argparse.Namespace, *, cwd: Path, tty: bool
 ) -> tuple[list[str], str]:
@@ -615,7 +803,7 @@ def new_container(
     Args:
         args: Parsed arguments.
         cwd: The resolved current directory.
-        tty: Whether stdin is a terminal.
+        tty: Whether to allocate a terminal.
 
     Returns:
         The argv and the banner printed before exec. Without an existing
@@ -625,28 +813,37 @@ def new_container(
     Raises:
         Error: When a mount is refused or no free plannotator port can be found.
     """
-    mounts = (cwd,) if args.no_git_root else resolve_mounts(cwd)
+    mounts = (cwd,) if args.no_git_root else resolve_workspace(cwd).mounts
     for mount in mounts:
         check_mount_allowed(mount)
-    agent_config_dir = os.environ.get("AGENT_CONFIG_DIR")
+    config_value = os.environ.get("AGENT_CONFIG_DIR")
+    agent_config_dir = Path(config_value).resolve() if config_value else None
+    if agent_config_dir is not None:
+        prepare_agent_config(
+            agent_config_dir, dry_run=args.dry_run, extra_args=args.arg
+        )
     xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    signing_disabled = args.no_git_signing or bool(
-        os.environ.get("GIT_SIGNING_DISABLED")
-    )
+    signing_disabled = args.no_git_signing or env_bool("GIT_SIGNING_DISABLED")
     ssh_sock = Path(xdg_runtime_dir) / "llm-agent.sock"
     if args.krun:
         if not signing_disabled and not probe_tcp_signer(SSH_PROBE_HOST, KRUN_SSH_PORT):
             print(
-                f"c: warning: {SSH_PROBE_HOST}:{KRUN_SSH_PORT}: "
-                "no ssh-agent reachable; running without ssh-agent",
+                redact_text(
+                    f"c: warning: {SSH_PROBE_HOST}:{KRUN_SSH_PORT}: "
+                    "no signer responded; bridge remains configured",
+                    args.arg,
+                ),
                 file=sys.stderr,
             )
     elif signing_disabled:
         ssh_sock = None
     elif not ssh_sock.is_socket():
         print(
-            f"c: warning: {ssh_sock}: signing agent socket not found; "
-            "running without ssh-agent",
+            redact_text(
+                f"c: warning: {ssh_sock}: signing agent socket not found; "
+                "running without ssh-agent",
+                args.arg,
+            ),
             file=sys.stderr,
         )
         ssh_sock = None
@@ -663,7 +860,7 @@ def new_container(
     cmd = run_argv(
         cwd=cwd,
         mounts=mounts,
-        agent_config_dir=Path(agent_config_dir) if agent_config_dir else None,
+        agent_config_dir=agent_config_dir,
         ssh_sock=ssh_sock,
         krun=args.krun,
         cpus=cpus,
@@ -672,6 +869,7 @@ def new_container(
         signing_disabled=signing_disabled,
         extra_args=args.arg,
         tty=tty,
+        interactive=args.interactive,
         command=args.command,
     )
     mounted = ", ".join(str(m) for m in mounts)
@@ -688,7 +886,7 @@ def exec_running(
     Args:
         args: Parsed arguments.
         cwd: The resolved current directory.
-        tty: Whether stdin is a terminal.
+        tty: Whether to allocate a terminal.
 
     Returns:
         The argv and the banner printed before exec.
@@ -700,8 +898,41 @@ def exec_running(
         cwd=cwd, containers=running_containers(), name=args.container
     )
     workdir = mount.translate(cwd)
-    cmd = exec_argv(name=container.name, workdir=workdir, tty=tty, command=args.command)
+    cmd = exec_argv(
+        name=container.id,
+        workdir=workdir,
+        tty=tty,
+        interactive=args.interactive,
+        command=args.command,
+    )
     return cmd, f"{container.name}:{workdir}"
+
+
+def redact_text(message: str, extra_args: Sequence[str]) -> str:
+    """Mask known API keys, proxy credentials and explicit extra env values."""
+    secrets = {
+        os.environ.get(name, "")
+        for name in (
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENCODE_API_KEY",
+            "GEMINI_API_KEY",
+        )
+    }
+    for index, word in enumerate(extra_args):
+        assignment = None
+        if word.startswith("--env="):
+            assignment = word[len("--env=") :]
+        elif word.startswith("-e") and word != "-e":
+            assignment = word[2:]
+        elif index and extra_args[index - 1] in ("-e", "--env"):
+            assignment = word
+        if assignment is not None and "=" in assignment:
+            secrets.add(assignment.split("=", 1)[1])
+    for secret in sorted(secrets - {""}, key=len, reverse=True):
+        message = message.replace(secret, "***")
+    return re.sub(r"([a-z][a-z0-9+.-]*://)[^/\s@]+@", r"\1***@", message, flags=re.I)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -720,20 +951,37 @@ def main(argv: list[str] | None = None) -> None:
     if problems:
         parser.error("; ".join(problems))
 
+    try:
+        env_bool("GIT_SIGNING_DISABLED")
+    except Error as exc:
+        parser.error(str(exc))
     cwd = Path.cwd().resolve()
-    tty = sys.stdin.isatty()
+    tty = (
+        args.tty if args.tty is not None else sys.stdin.isatty() and sys.stdout.isatty()
+    )
     try:
         if args.running:
             cmd, banner = exec_running(args, cwd=cwd, tty=tty)
         else:
             cmd, banner = new_container(args, cwd=cwd, tty=tty)
-    except Error as e:
-        sys.exit(f"{parser.prog}: error: {e}")
-    if args.dry_run:
-        print(shlex.join(cmd))
-        return
-    print(f"▶ {banner}", file=sys.stderr)
-    os.execvp(cmd[0], cmd)
+        if args.dry_run:
+            print(shlex.join(redact_text(word, args.arg) for word in cmd))
+            return
+        print(f"▶ {redact_text(banner, args.arg)}", file=sys.stderr)
+        os.execvp(cmd[0], cmd)
+    except Error as exc:
+        print(
+            f"{parser.prog}: error: {redact_text(str(exc), args.arg)}", file=sys.stderr
+        )
+        sys.exit(exc.exit_code)
+    except OSError as exc:
+        message = exc.strerror or str(exc)
+        if exc.filename is not None:
+            message += f": {os.fsdecode(exc.filename)}"
+        print(
+            f"{parser.prog}: error: {redact_text(message, args.arg)}", file=sys.stderr
+        )
+        sys.exit(127 if exc.errno == errno.ENOENT else 126)
 
 
 if __name__ == "__main__":
