@@ -39,7 +39,7 @@ Prefix bindings use `Ctrl+Q` followed by the listed key.
 | :--- | :--- |
 | `c` | Create a window |
 | `h` / `v` | Split into side-by-side / stacked panes |
-| `H/J/K/L` | Resize left / down / up / right by five cells; tmux-fingers can override `J` (see below) |
+| `H/J/K/L` | Resize left / down / up / right by five cells |
 | `n` / `p` | Select the next or previous session |
 | `s` | Open the session tree |
 | `P` | Open a shell popup |
@@ -74,9 +74,8 @@ Press `Alt+v` to enter copy mode, navigate with vi keys, press `v` to begin a se
 | Plugin | Keys after `Ctrl+Q` | Usage |
 | :--- | :--- | :--- |
 | [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect) | `Ctrl+S` / `Ctrl+R` | Save / restore sessions, layouts, directories, and supported programs |
-| [tmux-fingers](https://github.com/Morantron/tmux-fingers) | `F` | Show letter hints for paths, hashes, and other text; type a hint to copy, or hold Shift while selecting to copy and paste |
 | [extrakto](https://github.com/laktak/extrakto) | `Tab` | Fuzzy-search pane output; `Tab` inserts the selection, `Enter` copies it, and `Ctrl+F` changes the filter |
 
-Resurrect saves and restores only when requested; it does not preserve arbitrary process state. Extrakto requires `fzf` and Python 3. Tmux-fingers may open an installation wizard to obtain its executable. Its upstream default also binds prefix + `J` to jump mode, overriding this configuration's resize-down binding when loaded; use prefix + `:`, then `resize-pane -D 5` to resize down explicitly.
+Resurrect saves and restores only when requested; it does not preserve arbitrary process state. Extrakto requires `fzf` and Python 3.
 
 SSH sessions use a stable agent link so panes keep working after reconnects. See [SSH](ssh.md) for the socket rules.
