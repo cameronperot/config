@@ -114,6 +114,7 @@ RUN groupadd -g "${NEW_GID}" "${NEW_USER}" \
 RUN mkdir -p \
     "${MAMBA_ROOT_PREFIX}" \
     /work \
+    "${HOME_DIR}/.local/state" \
     "${HOME_DIR}/.ssh" \
     && chmod 700 "${HOME_DIR}/.ssh" \
     && chown -R "${NEW_USER}:${NEW_USER}" "${MAMBA_ROOT_PREFIX}" /work "${HOME_DIR}"
@@ -129,7 +130,9 @@ RUN micromamba env create -f /tmp/environment-setup/environment.yml \
 
 # Install coding agents
 RUN curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path \
-    && ln -s "${HOME_DIR}/.opencode/bin/opencode" "${HOME_DIR}/.local/bin/opencode"
+    && mkdir -p "${HOME_DIR}/.local/lib/opencode" \
+    && mv "${HOME_DIR}/.opencode/bin/opencode" "${HOME_DIR}/.local/lib/opencode/opencode" \
+    && ln -s "${HOME_DIR}/.local/lib/opencode/opencode" "${HOME_DIR}/.local/bin/opencode"
 RUN npm install -g --ignore-scripts --min-release-age=0 --no-fund --no-audit \
     --prefix "${HOME_DIR}/.local" @earendil-works/pi-coding-agent
 RUN curl -fsSL https://omp.sh/install | sh

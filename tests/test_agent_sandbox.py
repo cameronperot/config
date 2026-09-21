@@ -102,17 +102,24 @@ EXPECTED_HOME_RO_PATHS = (
     ".local/share/uv",
 )
 EXPECTED_AGENT_STATE_DIRS = {
-    "pi": (".agent", ".cache/pre-commit", ".pi"),
-    "omp": (".agent", ".cache/pre-commit", ".omp"),
+    "pi": (".agent", ".cache/pre-commit", ".plannotator", ".pi"),
+    "omp": (".agent", ".cache/pre-commit", ".plannotator", ".omp"),
     "opencode": (
         ".agent",
         ".cache/pre-commit",
+        ".plannotator",
         ".opencode",
         ".local/share/opencode",
         ".local/state/opencode",
         ".local/share/opentui",
     ),
-    "claude": (".agent", ".cache/pre-commit", ".claude", ".local/state/claude"),
+    "claude": (
+        ".agent",
+        ".cache/pre-commit",
+        ".plannotator",
+        ".claude",
+        ".local/state/claude",
+    ),
 }
 EXPECTED_AGENT_RO_PATHS = {
     "pi": (
@@ -121,7 +128,6 @@ EXPECTED_AGENT_RO_PATHS = {
         ".agent/rules",
         ".pi/agent/skills",
         ".pi/agent/prompts",
-        ".pi/agent/settings.json",
         ".pi/agent/models.json",
         ".pi/agent/worktree.json",
         ".pi/agent/guard-rules.json",
@@ -135,7 +141,6 @@ EXPECTED_AGENT_RO_PATHS = {
         ".agent/rules",
         ".omp/agent/skills",
         ".omp/agent/prompts",
-        ".omp/agent/config.yml",
         ".omp/agent/AGENTS.md",
         ".omp/agent/extensions",
     ),
@@ -143,13 +148,11 @@ EXPECTED_AGENT_RO_PATHS = {
         ".agent/skills",
         ".agent/prompts",
         ".agent/rules",
-        ".config/opencode",
     ),
     "claude": (
         ".agent/skills",
         ".agent/prompts",
         ".agent/rules",
-        ".claude/settings.json",
         ".claude/skills",
         ".claude/rules",
         ".claude/agents",
@@ -221,7 +224,6 @@ EXPECTED_AGENT_RO_CASES = tuple(
 EXPECTED_STATE_PIN_CASES = tuple(
     (agent, relative_path, relative_path.split("/", maxsplit=1)[0])
     for agent, relative_path in EXPECTED_AGENT_RO_CASES
-    if relative_path != ".config/opencode"
 )
 EXPECTED_PINNED_JSON_CASES = tuple(
     (agent, relative_path)
@@ -431,7 +433,7 @@ def test_cli_override_requires_executable(home: Path, exists: bool) -> None:
 
 
 @pytest.mark.parametrize("variable", ("AGENT_SANDBOX_DISABLE", "AGENT_SANDBOX_ACTIVE"))
-@pytest.mark.parametrize("value", ("1", "0"))
+@pytest.mark.parametrize("value", ("1", "true"))
 def test_cli_direct_exec_preserves_arguments_and_exit_status(
     home: Path, variable: str, value: str
 ) -> None:
@@ -439,7 +441,6 @@ def test_cli_direct_exec_preserves_arguments_and_exit_status(
     proc = subprocess.run(
         [
             str(SCRIPT),
-            "--dry-run",
             "--",
             "pi",
             "-c",
@@ -454,7 +455,7 @@ def test_cli_direct_exec_preserves_arguments_and_exit_status(
 
     assert proc.returncode == 23
     assert proc.stdout.split("\0") == [*args, ""]
-    assert proc.stderr == ""
+    assert proc.stderr == f"agent-sandbox: warning: sandbox bypassed: {variable}\n"
     assert list(home.iterdir()) == []
 
 
@@ -637,7 +638,7 @@ def test_refuse_denied_path_rejects_every_system_prefix(
 def resolved(home: Path, cwd: Path) -> tuple[str, str]:
     """Resolve the project and optional Git common directory using real Git."""
     result = sandbox.resolve_workspace(runtime(home=home, cwd=cwd))
-    return str(result.root), str(
+    return str(result.roots[0]), str(
         result.common_dir
     ) if result.common_dir is not None else ""
 
@@ -773,13 +774,13 @@ def test_resolve_workspace_inside_bare_dir_maps_to_container(
     assert resolved(home, hooks) == (str(bare_layout), "")
 
 
-def test_resolve_workspace_dies_when_cwd_is_outside_the_workspace(
+def test_resolve_workspace_includes_external_bare_worktree(
     home: Path, bare_layout: Path
 ) -> None:
-    with pytest.raises(sandbox.SandboxError, match="outside the workspace"):
-        sandbox.resolve_workspace(
-            runtime(home=home, cwd=bare_layout.parent / "outside")
-        )
+    outside = bare_layout.parent / "outside"
+    workspace = sandbox.resolve_workspace(runtime(home=home, cwd=outside))
+    assert workspace.roots == (bare_layout, outside)
+    assert workspace.common_dir is None
 
 
 # --- add_workspace_args parent chain
@@ -893,20 +894,20 @@ def test_allowlist_places_every_state_pin_after_its_writable_bind(
     state = str(home / state_path)
     path = str(home / relative_path)
     assert position(argv, "--bind", state, state) < position(
-        argv, "--ro-bind-try", path, path
+        argv, "--ro-bind", path, path
     )
 
 
 @needs_tiocsti
-def test_opencode_config_is_read_only_not_writable(scratch: Path) -> None:
+def test_opencode_config_is_not_mounted(scratch: Path) -> None:
     home = scratch / "home"
     repo = make_repo(home / "lsq" / "proj")
     config = str(home / ".config" / "opencode")
+    Path(config).mkdir(parents=True)
 
     argv = argv_of(run_dry(home, repo, agent="opencode"))
 
-    assert seq_index(argv, "--ro-bind-try", config, config) is not None
-    assert seq_index(argv, "--bind", config, config) is None
+    assert config not in argv
 
 
 # --- resolve_npmrc
@@ -1225,7 +1226,7 @@ def test_forward_path_vars_forward_canonical_symlink_target(
 
     result = sandbox.resolve_forwarded_env(
         runtime=runtime(home=home, env_extra={variable: str(link)}),
-        workspace=sandbox.Workspace(root=workspace),
+        workspace=sandbox.Workspace(roots=(workspace,)),
         policy=sandbox.POLICIES["pi"],
     )
 
@@ -1249,7 +1250,7 @@ def test_forward_path_vars_drop_symlink_to_unavailable_target(
 
     result = sandbox.resolve_forwarded_env(
         runtime=runtime(home=home, env_extra={"SSL_CERT_FILE": str(link)}),
-        workspace=sandbox.Workspace(root=home / "workspace"),
+        workspace=sandbox.Workspace(roots=(home / "workspace",)),
         policy=sandbox.POLICIES["pi"],
     )
 
@@ -1336,7 +1337,7 @@ def test_ensure_state_dirs_creates_and_preserves_pre_commit_cache(
 @pytest.mark.parametrize("agent", EXPECTED_AGENTS)
 def test_pre_commit_cache_is_exposed_without_exposing_other_caches(agent: str) -> None:
     home = Path("/home/user")
-    workspace = sandbox.Workspace(root=Path("/projects/repo"))
+    workspace = sandbox.Workspace(roots=(Path("/projects/repo"),))
     policy = sandbox.POLICIES[agent]
 
     assert sandbox.path_is_exposed(
@@ -1407,11 +1408,11 @@ def test_ensure_state_dirs_keeps_every_existing_pinned_json_file(
 
 
 @pytest.mark.parametrize(("agent", "relative_path"), EXPECTED_PINNED_OTHER_FILE_CASES)
-def test_ensure_state_dirs_does_not_seed_any_non_json_file(
+def test_ensure_state_dirs_seeds_pinned_instruction_files(
     home: Path, agent: str, relative_path: str
 ) -> None:
     sandbox.ensure_state_dirs(runtime=runtime(home), agent=agent)
-    assert not (home / relative_path).exists()
+    assert (home / relative_path).read_text() == ""
 
 
 # --- resolve_package_rc bunfig
@@ -1612,7 +1613,7 @@ def test_ensure_state_dirs_dies_when_a_pinned_path_escapes_the_state_dirs(
     (home / ".ssh").mkdir()
     (home / ".ssh" / "id").write_text("secret\n")
     (home / ".pi" / "agent").mkdir(parents=True)
-    (home / ".pi" / "agent" / "settings.json").symlink_to(home / ".ssh" / "id")
+    (home / ".pi" / "agent" / "models.json").symlink_to(home / ".ssh" / "id")
 
     with pytest.raises(
         sandbox.SandboxError, match="resolves outside the agent's state dirs"
@@ -1622,7 +1623,7 @@ def test_ensure_state_dirs_dies_when_a_pinned_path_escapes_the_state_dirs(
 
 def test_ensure_state_dirs_dies_on_a_dangling_pinned_link(home: Path) -> None:
     (home / ".pi" / "agent").mkdir(parents=True)
-    (home / ".pi" / "agent" / "settings.json").symlink_to(home / "nowhere")
+    (home / ".pi" / "agent" / "models.json").symlink_to(home / "nowhere")
 
     with pytest.raises(
         sandbox.SandboxError, match="resolves outside the agent's state dirs"
@@ -1776,7 +1777,7 @@ def test_ensure_state_dirs_rejects_every_symlinked_state_directory(
 
 @pytest.mark.parametrize(
     ("agent", "parent"),
-    [("pi", ".pi/agent"), ("omp", ".omp/agent"), ("opencode", ".config")],
+    [("pi", ".pi/agent"), ("omp", ".omp/agent")],
 )
 def test_ensure_state_dirs_rejects_pinned_parents_before_seeding(
     home: Path, agent: str, parent: str
@@ -1800,7 +1801,7 @@ def test_parent_chain_handles_root_children_and_deduplicates_ancestors(
     result = sandbox.resolve_parent_chain(
         home=home,
         workspace=sandbox.Workspace(
-            root=Path("/projects/team/work"), common_dir=Path("/projects/repo/.git")
+            roots=(Path("/projects/team/work"),), common_dir=Path("/projects/repo/.git")
         ),
     )
 
@@ -2234,3 +2235,622 @@ def test_integration_sandbox_environment_and_filesystem(scratch: Path) -> None:
     assert (repo / "workspace-marker").read_text() == "workspace"
     assert (home / "private-marker").read_text() == "hidden\n"
     assert not (home / "ephemeral-marker").exists()
+
+
+@pytest.mark.parametrize("marker", ["1", "true", "YES", "On"])
+@pytest.mark.parametrize("container_env", [False, True])
+def test_signing_disabled_survives_sandbox_environment_unsigned(
+    home: Path, marker: str, container_env: bool
+) -> None:
+    write_gitconfig(home, "key::ssh-ed25519 fixture")
+    with (home / ".gitconfig").open("a") as stream:
+        stream.write("[commit]\n\tgpgsign = true\n")
+    inherited = {
+        "GIT_SIGNING_DISABLED": marker,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "alias.unrelated",
+        "GIT_CONFIG_VALUE_0": "unwanted",
+    }
+    if container_env:
+        inherited.update(
+            GIT_CONFIG_COUNT="2",
+            GIT_CONFIG_KEY_1="commit.gpgsign",
+            GIT_CONFIG_VALUE_1="false",
+        )
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.bind(str(home / "signer.sock"))
+        context = runtime(
+            home, env_extra={**inherited, "SSH_AUTH_SOCK": str(home / "signer.sock")}
+        )
+
+        def forbidden(**kwargs):
+            pytest.fail("disabled signing must not discover or probe keys")
+
+        selected = sandbox.resolve_signing_key(context, run=forbidden)
+        assert selected == sandbox.Signing()
+        assert (
+            sandbox.resolve_ssh_sock(runtime=context, signing=selected, probe=forbidden)
+            is None
+        )
+        words = sandbox.env_args(
+            runtime=context, agent="pi", forwarded=(), ssh_sock=None
+        )
+    values = {
+        words[i + 1]: words[i + 2] for i, word in enumerate(words) if word == "--setenv"
+    }
+    assert values["GIT_SIGNING_DISABLED"] == "1"
+    assert "SSH_AUTH_SOCK" not in values
+    result = subprocess.run(
+        ["git", "config", "--get", "commit.gpgsign"],
+        env=values,
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode, result.stdout.strip()) == (0, "false")
+    result = subprocess.run(
+        ["git", "config", "--get", "alias.unrelated"],
+        env=values,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+
+
+@pytest.mark.parametrize("marker", ["0", "false", "NO", "Off", ""])
+def test_signing_disabled_survives_sandbox_environment_false(
+    home: Path, marker: str
+) -> None:
+    with socket.socket(socket.AF_UNIX) as sock:
+        path = home / "signer.sock"
+        sock.bind(str(path))
+        context = runtime(
+            home, env_extra={"GIT_SIGNING_DISABLED": marker, "SSH_AUTH_SOCK": str(path)}
+        )
+        selected = sandbox.resolve_ssh_sock(
+            runtime=context,
+            signing=sandbox.Signing(pubkey="ssh-ed25519 fixture"),
+            probe=lambda **kwargs: "ssh-ed25519 fixture\n",
+        )
+        assert selected == path
+        words = sandbox.env_args(
+            runtime=context, agent="pi", forwarded=(), ssh_sock=selected
+        )
+        assert ("--setenv", "SSH_AUTH_SOCK", str(path)) in tuple(
+            zip(words, words[1:], words[2:], strict=False)
+        )
+        assert "GIT_SIGNING_DISABLED" not in words
+
+
+@pytest.mark.parametrize(
+    "name", ["AGENT_SANDBOX_DISABLE", "AGENT_SANDBOX_ACTIVE", "GIT_SIGNING_DISABLED"]
+)
+@pytest.mark.parametrize(
+    "value, expected",
+    [(v, True) for v in ("1", "true", "TRUE", "yes", "YES", "on", "ON")]
+    + [(v, False) for v in ("", "0", "false", "FALSE", "no", "NO", "off", "OFF")],
+)
+def test_boolean_and_dry_run_contract_values(
+    name: str, value: str, expected: bool
+) -> None:
+    assert sandbox.env_bool({name: value}, name) is expected
+    assert sandbox.env_bool({}, name) is False
+
+
+@pytest.mark.parametrize(
+    "name", ["AGENT_SANDBOX_DISABLE", "AGENT_SANDBOX_ACTIVE", "GIT_SIGNING_DISABLED"]
+)
+def test_boolean_and_dry_run_contract_invalid(home: Path, name: str) -> None:
+    proc = subprocess.run(
+        [str(SCRIPT), "--dry-run", "pi"],
+        env={**base_env(home), name: "invalid", "AGENT_SANDBOX_BIN": "/bin/sh"},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 2
+    assert f"{name}: expected a boolean" in proc.stderr
+
+
+@pytest.mark.parametrize("name", ["AGENT_SANDBOX_DISABLE", "AGENT_SANDBOX_ACTIVE"])
+def test_boolean_and_dry_run_contract_bypass_no_side_effects(
+    home: Path, name: str
+) -> None:
+    marker = home / "marker"
+    args = ["-c", f"touch {shlex.quote(str(marker))}", "--dry-run", "a b"]
+    proc = subprocess.run(
+        [str(SCRIPT), "--dry-run", "pi", *args],
+        env={**base_env(home), name: "yes", "AGENT_SANDBOX_BIN": "/bin/sh"},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists()
+    assert not (home / ".pi").exists()
+    assert shlex.split(proc.stdout) == ["/bin/sh", *args]
+    assert name in proc.stderr
+
+
+@pytest.mark.parametrize("name", ["AGENT_SANDBOX_DISABLE", "AGENT_SANDBOX_ACTIVE"])
+@needs_tiocsti
+def test_boolean_and_dry_run_contract_false_keeps_sandbox(
+    scratch: Path, name: str
+) -> None:
+    home = scratch / "home"
+    repo = make_repo(home / "project")
+    argv = argv_of(run_dry(home, repo, env_extra={name: "false"}))
+    assert argv[0] == "unshare"
+    assert not (home / ".pi").exists()
+
+
+@pytest.mark.parametrize("agent", ["pi", "omp"])
+def test_missing_configuration_pin_contract_instructions(home, agent):
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent=agent)
+    assert (home / f".{agent}/agent/AGENTS.md").read_bytes() == b""
+
+
+@pytest.mark.parametrize(
+    ("agent", "rel"),
+    [
+        ("pi", ".pi/agent/settings.json"),
+        ("omp", ".omp/agent/config.yml"),
+        ("claude", ".claude/settings.json"),
+        ("opencode", ".config/opencode"),
+    ],
+)
+def test_unpinned_configuration_is_not_seeded_or_bound(home, agent, rel):
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent=agent)
+    words = sandbox.home_args(home=home, policy=sandbox.POLICIES[agent], rc_files=())
+
+    assert not (home / rel).exists()
+    assert str(home / rel) not in words
+
+
+@pytest.mark.parametrize("alternate", ["config.yaml", "settings.json"])
+def test_unpinned_omp_configuration_preserves_alternates(home, alternate):
+    config = home / ".omp/agent"
+    config.mkdir(parents=True)
+    (config / alternate).write_text("existing configuration")
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent="omp")
+    assert not (config / "config.yml").exists()
+    assert (config / alternate).read_text() == "existing configuration"
+
+
+@pytest.mark.parametrize("agent", ["pi", "omp"])
+def test_missing_configuration_pin_contract_preserves_existing(home, agent):
+    path = home / f".{agent}/agent/AGENTS.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("existing content")
+    before = path.stat()
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent=agent)
+    assert path.read_text() == "existing content"
+    assert path.stat().st_ino == before.st_ino
+
+
+def test_missing_configuration_pin_contract_required_binds(home):
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent="omp")
+    words = list(
+        sandbox.home_args(home=home, policy=sandbox.POLICIES["omp"], rc_files=())
+    )
+    config = home / ".omp/agent/AGENTS.md"
+    config.unlink()
+    assert seq_index(words, "--ro-bind", str(config), str(config)) is not None
+
+
+def test_missing_configuration_pin_contract_shared_symlink(home):
+    shared = home / ".agent"
+    shared.mkdir()
+    (shared / "instructions.md").write_text("shared instructions")
+    agent = home / ".omp/agent"
+    agent.mkdir(parents=True)
+    (agent / "AGENTS.md").symlink_to(shared / "instructions.md")
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent="omp")
+    assert (agent / "AGENTS.md").read_text() == "shared instructions"
+    assert (agent / "AGENTS.md").is_symlink()
+
+
+def test_missing_configuration_pin_contract_escape_rejected(home, tmp_path):
+    target = tmp_path / "instructions.md"
+    target.write_text("outside")
+    agent = home / ".omp/agent"
+    agent.mkdir(parents=True)
+    (agent / "AGENTS.md").symlink_to(target)
+    with pytest.raises(sandbox.SandboxError, match="outside the agent's state"):
+        sandbox.ensure_state_dirs(runtime=runtime(home), agent="omp")
+    assert target.read_text() == "outside"
+
+
+@needs_tiocsti
+def test_missing_configuration_pin_contract_dry_run(scratch):
+    home = scratch / "home"
+    repo = make_repo(home / "project")
+    assert run_dry(home, repo, agent="omp").returncode == 0
+    assert not (home / ".omp").exists()
+
+
+def test_opencode_installation_protection_existing_host_binary(home):
+    install = home / ".opencode/bin"
+    install.mkdir(parents=True)
+    binary = install / "opencode"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent="opencode")
+    words = list(
+        sandbox.home_args(home=home, policy=sandbox.POLICIES["opencode"], rc_files=())
+    )
+    assert position(
+        words, "--bind", str(install.parent), str(install.parent)
+    ) < position(words, "--ro-bind", str(install), str(install))
+    assert subprocess.run([str(binary)], check=False).returncode == 0
+
+
+def test_opencode_installation_protection_absent_not_seeded(home):
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent="opencode")
+    assert not (home / ".opencode/bin").exists()
+    words = sandbox.home_args(
+        home=home, policy=sandbox.POLICIES["opencode"], rc_files=()
+    )
+    assert str(home / ".opencode/bin") not in words
+
+
+@pytest.mark.parametrize("target", [".ssh", ".opencode/tools", "missing"])
+def test_opencode_installation_protection_rejects_symlink(home, target):
+    installation = home / ".opencode/bin"
+    installation.parent.mkdir()
+    (home / ".ssh").mkdir()
+    (home / ".opencode/tools").mkdir()
+    installation.symlink_to(home / target, target_is_directory=True)
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent="opencode")
+
+    # An agent-writable installation link must never expose host directories.
+    with pytest.raises(sandbox.SandboxError, match="installation is a symlink"):
+        sandbox.home_args(home=home, policy=sandbox.POLICIES["opencode"], rc_files=())
+
+
+def test_opencode_installation_protection_image_layout(home):
+    containerfile = (REPO_ROOT / "dev-container/Containerfile").read_text()
+    assert (
+        'mv "${HOME_DIR}/.opencode/bin/opencode" '
+        '"${HOME_DIR}/.local/lib/opencode/opencode"' in containerfile
+    )
+    binary = home / ".local/lib/opencode/opencode"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nprintf fixture-opencode\n")
+    binary.chmod(0o755)
+    link = home / ".local/bin/opencode"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(binary)
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent="opencode")
+    sandbox.check_exe_visible(
+        exe=str(link),
+        runtime=runtime(home),
+        workspace=sandbox.Workspace((Path("/projects/repo"),)),
+        policy=sandbox.POLICIES["opencode"],
+    )
+    assert subprocess.check_output([str(link)]) == b"fixture-opencode"
+    words = list(
+        sandbox.home_args(home=home, policy=sandbox.POLICIES["opencode"], rc_files=())
+    )
+    assert (
+        seq_index(
+            words, "--ro-bind-try", str(home / ".local/lib"), str(home / ".local/lib")
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "secret", ["key-'\"$();\\\nvalue", "x" * 200000], ids=["quoted", "large"]
+)
+def test_secret_transport_contract_payload_and_failed_exec(home, monkeypatch, secret):
+    prefix = sandbox.unshare_args(runtime(home))
+    options = ("--clearenv", "--setenv", "OPENAI_API_KEY", secret)
+    command = ("--", "/bin/true")
+    seen = []
+
+    def capture(file, args):
+        assert args[: len(prefix)] == prefix
+        assert args[-2:] == command
+        assert secret not in repr(args)
+        fd = int(args[len(prefix) + 1])
+        assert args[len(prefix)] == "--args"
+        assert os.get_inheritable(fd)
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            assert (
+                stream.read()
+                == b"\0".join(os.fsencode(word) for word in options) + b"\0"
+            )
+        seen.append(fd)
+        raise OSError(errno.ENOENT, "fixture missing unshare")
+
+    monkeypatch.setattr(os, "execvp", capture)
+    with pytest.raises(sandbox.SandboxError, match="fixture missing unshare") as error:
+        sandbox.exec_sandbox(
+            (*prefix, *options, *command), command_index=len(prefix) + len(options)
+        )
+    assert error.value.exit_code == 127
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(seen[0])
+
+
+@pytest.mark.parametrize("variable", ["http_proxy", "HTTPS_PROXY"])
+@needs_tiocsti
+def test_secret_transport_contract_proxy_redaction(scratch, variable):
+    home = scratch / "home"
+    repo = make_repo(home / "project")
+    secret = "user:pass%27word"
+    proc = run_dry(
+        home, repo, env_extra={variable: f"http://{secret}@localhost:1234/path"}
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert secret not in proc.stdout + proc.stderr
+    assert "http://***@localhost:1234/path" in proc.stdout
+
+
+def test_secret_transport_contract_descriptor_inherits_across_exec(home):
+    consumer = home / "consume.py"
+    consumer.write_text(
+        "import os, sys\n"
+        "fd = int(sys.argv[sys.argv.index('--args') + 1])\n"
+        "with os.fdopen(fd, 'rb') as stream:\n"
+        "    payload = stream.read()\n"
+        "assert os.environ['FIXTURE_SECRET'].encode() in payload\n"
+        "assert os.environ['FIXTURE_SECRET'] not in repr(sys.argv)\n"
+        "assert not os.path.exists('/proc/self/fd/' + str(fd))\n"
+        "print('inherited and closed')\n"
+        "sys.exit(23)\n"
+    )
+    code = (
+        "import os, runpy, sys; "
+        "module = runpy.run_path(sys.argv[1]); "
+        "prefix = (sys.executable, sys.argv[2], 'bwrap'); "
+        "options = ('--setenv', 'OPENAI_API_KEY', os.environ['FIXTURE_SECRET']); "
+        "module['exec_sandbox']((*prefix, *options, '--', '/bin/true'), "
+        "command_index=6)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(SCRIPT), str(consumer)],
+        env={**base_env(home), "FIXTURE_SECRET": "synthetic-'$();secret"},
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 23, result.stderr
+    assert result.stdout == "inherited and closed\n"
+
+
+@pytest.mark.parametrize("agent", EXPECTED_AGENTS)
+def test_persistence_contract_plannotator_writable(home, agent):
+    sandbox.ensure_state_dirs(runtime=runtime(home), agent=agent)
+    state = home / ".plannotator"
+    assert state.is_dir()
+    words = list(
+        sandbox.home_args(home=home, policy=sandbox.POLICIES[agent], rc_files=())
+    )
+    assert seq_index(words, "--bind", str(state), str(state)) is not None
+    assert sandbox.path_is_exposed(
+        path=state / "session.json",
+        home=home,
+        workspace=sandbox.Workspace((Path("/projects/repo"),)),
+        policy=sandbox.POLICIES[agent],
+    )
+
+
+@pytest.mark.parametrize(
+    "layout", ["plain", "linked", "bare-internal", "bare-external", "nongit"]
+)
+def test_workspace_contract_layouts(scratch, layout, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(scratch))
+    home = scratch / "home"
+    home.mkdir()
+    repo = scratch / "repo"
+    repo.mkdir()
+    cwd = repo
+    expected_roots = (repo,)
+    metadata = None
+    if layout != "nongit":
+        commit_repo(repo)
+    if layout == "linked":
+        cwd = scratch / "linked"
+        git("-C", str(repo), "worktree", "add", "-b", "linked", str(cwd))
+        expected_roots, metadata = (cwd,), repo / ".git"
+    if layout.startswith("bare-"):
+        container = scratch / "bare-layout"
+        container.mkdir()
+        git("clone", "--bare", str(repo), str(container / ".bare"))
+        cwd = container / "main" if layout == "bare-internal" else scratch / "outside"
+        git("--git-dir", str(container / ".bare"), "worktree", "add", str(cwd), "main")
+        expected_roots = (container,) if layout == "bare-internal" else (container, cwd)
+    workspace = sandbox.resolve_workspace(
+        runtime(home, cwd, {"GIT_CEILING_DIRECTORIES": str(scratch)})
+    )
+    assert workspace.roots == expected_roots
+    assert workspace.common_dir == metadata
+    sandbox.validate_workspace(workspace=workspace, home=home)
+    assert test_c.c.resolve_workspace(cwd).mounts == (
+        *expected_roots,
+        *((metadata,) if metadata else ()),
+    )
+    parents = sandbox.resolve_parent_chain(workspace=workspace, home=home)
+    for root in expected_roots:
+        assert sandbox.path_is_exposed(
+            path=root / "file",
+            home=home,
+            workspace=workspace,
+            policy=sandbox.POLICIES["pi"],
+        )
+        assert root not in parents
+    words = sandbox.build_argv(
+        runtime=runtime(home, cwd),
+        options=sandbox.Options(agent="pi"),
+        exe="/bin/sh",
+        workspace=workspace,
+        parents=parents,
+        signing=sandbox.Signing(),
+        ssh_sock=None,
+        rc_files=(),
+        forwarded=(),
+        userns_blockable=False,
+        resolv=None,
+    )
+    for root in expected_roots:
+        assert seq_index(list(words), "--bind", str(root), str(root)) is not None
+    assert not sandbox.path_is_exposed(
+        path=scratch / "unrelated/file",
+        home=home,
+        workspace=workspace,
+        policy=sandbox.POLICIES["pi"],
+    )
+
+
+@pytest.mark.parametrize(
+    "denied",
+    [Path("/etc/project"), Path("/home/tester/.private"), Path("/home/tester")],
+)
+def test_workspace_contract_validates_each_root(denied):
+    with pytest.raises(sandbox.SandboxError, match="workspace root"):
+        sandbox.validate_workspace(
+            workspace=sandbox.Workspace(roots=(Path("/projects/repo"), denied)),
+            home=Path("/home/tester"),
+        )
+
+
+def test_workflow_fix_unsigned_commit_with_resolved_environment(home, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (home / ".gitconfig").write_text(
+        "[commit]\n gpgsign = true\n[user]\n name = Fixture\n"
+        " email = fixture@example.com\n[gpg]\n format = ssh\n"
+    )
+    words = sandbox.env_args(
+        runtime=runtime(home, repo, {"GIT_SIGNING_DISABLED": "YES"}),
+        agent="pi",
+        forwarded=(),
+        ssh_sock=None,
+    )
+    env = {
+        words[i + 1]: words[i + 2] for i, word in enumerate(words) if word == "--setenv"
+    }
+    subprocess.run(
+        ["git", "init", "-q", str(repo)],
+        env=env,
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+    result = subprocess.run(
+        ["git", "-C", str(repo), "commit", "--allow-empty", "-m", "unsigned fixture"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    commit = subprocess.check_output(
+        ["git", "-C", str(repo), "cat-file", "commit", "HEAD"], env=env, timeout=5
+    )
+    assert b"gpgsig " not in commit
+    assert b"unsigned fixture" in commit
+
+
+def test_workflow_fix_secret_descriptor_stub_chain(home):
+    """Exercise Python exec and shell forwarding; these stubs enforce no isolation."""
+    outer = home / "unshare-stub"
+    outer.write_text(
+        '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n'
+    )
+    outer.chmod(0o755)
+    consumer = home / "bwrap"
+    consumer.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "assert sys.argv[1] == '--args'\n"
+        "fd = int(sys.argv[2])\n"
+        "assert os.environ['FIXTURE_SECRET'] not in repr(sys.argv)\n"
+        "with os.fdopen(fd, 'rb') as stream:\n"
+        "    words = stream.read().split(b'\\0')[:-1]\n"
+        "assert words == [b'--setenv', b'OPENAI_API_KEY', "
+        "os.environ['FIXTURE_SECRET'].encode()]\n"
+        "assert not os.path.exists('/proc/self/fd/' + str(fd))\n"
+        "os.execvp(sys.argv[4], sys.argv[4:])\n"
+    )
+    consumer.chmod(0o755)
+    code = (
+        "import os, runpy, sys; m = runpy.run_path(sys.argv[1]); "
+        "prefix = (sys.argv[2], '--user', '--fork', '--pid', '--', 'bwrap'); "
+        "options = ('--setenv', 'OPENAI_API_KEY', os.environ['FIXTURE_SECRET']); "
+        "command = ('--', '/bin/sh', '-c', 'cat; exit 23'); "
+        "m['exec_sandbox']((*prefix, *options, *command), command_index=9)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(SCRIPT), str(outer)],
+        env={
+            **base_env(home),
+            "PATH": f"{home}:{os.environ['PATH']}",
+            "FIXTURE_SECRET": "fixture'\"$();\nsecret",
+        },
+        input="stdin survived\n",
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 23, result.stderr
+    assert result.stdout == "stdin survived\n"
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("target, status", [("absent", 127), ("not-executable", 126)])
+def test_workflow_fix_descriptor_exec_errors(home, target, status):
+    path = home / target
+    if target == "not-executable":
+        path.write_text("cannot execute")
+    code = (
+        "import runpy, sys; m = runpy.run_path(sys.argv[1]); "
+        "argv = (sys.argv[2], 'bwrap', '--clearenv', '--', '/bin/true')\n"
+        "try: m['exec_sandbox'](argv, command_index=3)\n"
+        "except m['SandboxError'] as error: sys.exit(error.exit_code)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(SCRIPT), str(path)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == status
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_workflow_fix_bypass_argument_boundary_and_stdin(home, dry_run):
+    executable = home / "agent"
+    executable.write_text(
+        f"#!{sys.executable}\nimport json, sys\n"
+        "print(json.dumps([sys.argv[1:], sys.stdin.read()]))\n"
+    )
+    executable.chmod(0o755)
+    args = ["--dry-run", "", "a b", "$(literal)"]
+    result = subprocess.run(
+        [str(SCRIPT), *(["--dry-run"] if dry_run else []), "pi", *args],
+        env={
+            **base_env(home),
+            "AGENT_SANDBOX_DISABLE": "on",
+            "AGENT_SANDBOX_BIN": str(executable),
+        },
+        input="piped input",
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    if dry_run:
+        assert shlex.split(result.stdout) == [str(executable), *args]
+    else:
+        import json
+
+        assert json.loads(result.stdout) == [args, "piped input"]
+    assert not (home / ".pi").exists()
+
+
+def test_secret_transport_contract_socks_proxy_redaction():
+    assert (
+        sandbox.redact_text(message="socks5://user:password@proxy:1080", env={})
+        == "socks5://***@proxy:1080"
+    )

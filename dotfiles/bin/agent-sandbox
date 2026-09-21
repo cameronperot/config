@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Launch coding agents with unshare and Bubblewrap filesystem isolation."""
+"""Launch coding agents with unshare and Bubblewrap filesystem isolation.
+
+Configuration pins are required read-only binds over writable agent/Plannotator
+state. External .bare worktrees retain both project roots. Bubblewrap options
+travel through an inherited memfd, closed by Bubblewrap before the agent runs.
+Dry-run (including a boolean-controlled bypass) prints redacted arguments only.
+"""
 
 import errno
 import os
@@ -121,8 +127,8 @@ Script flags (must precede <agent>; "--" ends them; everything after
   -h, --help     show this help
   -v, --verbose  report resolution decisions on stderr
   --debug        verbose output plus resolution summary and launch argv;
-                 API key values are redacted (not a line-by-line trace)
-  --dry-run      print the sandbox argv (API key values redacted) without
+                 API keys and proxy credentials are redacted
+  --dry-run      print the selected argv (secrets redacted) without
                  touching the host or launching anything
 
 Examples:
@@ -136,8 +142,13 @@ Environment:
   AGENT_SANDBOX_DISABLE=1   exec the agent binary unsandboxed (escape hatch)
   AGENT_SANDBOX_BIN=<path>  override the agent executable from the table
   AGENT_SANDBOX_ACTIVE      set automatically inside the sandbox; when
-                            already set, the agent is exec'd directly
+                            true, the agent is exec'd directly
                             (nesting guard)
+  GIT_SIGNING_DISABLED=1   omit signing keys/sockets and preserve unsigned commits
+
+  These three booleans accept 1/true/yes/on and 0/false/no/off, ignoring case.
+  Unset/empty is false; other values are usage errors (status 2).
+  Bypass reasons go to stderr; wrapper --dry-run never executes the agent.
 
 Notes:
   Network access remains shared. Credential screening scans plain text,
@@ -153,13 +164,18 @@ Notes:
   claude: the sandbox sets CLAUDE_CONFIG_DIR=$HOME/.claude so all
   state lives in one rw dir; sandboxed and host runs diverge unless the
   same variable is also exported on the host.
-  ~/.agent is shared across all agents by design.
-  The agent's config files (settings, instructions, rules, skills,
-  prompts, guard rules, subagents, extensions) are pinned read-only on
-  top of its state dirs, and opencode's whole ~/.config/opencode is
-  read-only; absent JSON files and directories are seeded empty on the
-  host so the pin always applies. Edit them, and install opencode
-  plugins, on the host.
+  ~/.agent, ~/.plannotator and ~/.cache/pre-commit are writable shared state.
+  Selected instructions, rules, skills, prompts, model/guard/worktree
+  configuration, subagents and extensions are pinned read-only over state.
+  Missing pinned JSON files/directories are seeded; missing AGENTS.md is empty.
+  Pi/Claude settings.json and OMP config.yml remain writable and are not seeded.
+  Host ~/.config/opencode is not mounted; that sandbox location is ephemeral.
+  Configuration binds are required after preparation. Existing .opencode/bin
+  is pinned read-only but never seeded. The image binary lives in .local/lib.
+  Edit pinned files on the host.
+  Through c, configured AGENT_CONFIG_DIR state persists across container
+  replacement; without it, agent state is ephemeral. The named pre-commit
+  cache persists in either mode.
   pi-create-skill and pi-create-prompt write into pinned paths, so they
   work only on the host.
   ~/.local and ~/.config are writable ephemeral directories inside the
@@ -175,7 +191,12 @@ Notes:
   Sibling worktrees are not visible and worktrees cannot be created
   from inside the sandbox by design; manage them from the host.
   Exception: for a .bare layout the whole .bare container directory is
-  the workspace, so sibling worktrees resolve inside.
+  writable, plus any external worktree. Every root passes the same deny rules.
+  Real launches pass Bubblewrap options through --args FD; Bubblewrap closes
+  the inherited descriptor before running the agent. Unsupported launches fail
+  without falling back to secret-bearing options on the process command line.
+  Diagnostics mask known API keys and proxy URL user information. Arbitrary
+  unknown secrets embedded in command arguments cannot be detected.
 """
 
 
@@ -202,6 +223,16 @@ class SandboxError(Exception):
         self.exit_code = exit_code
 
 
+def env_bool(env: Mapping[str, str], name: str) -> bool:
+    """Parse an optional boolean control, rejecting unknown spellings."""
+    value = env.get(name, "").lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise SandboxError(f"{name}: expected a boolean value", usage=True, exit_code=2)
+
+
 @dataclass(frozen=True)
 class AgentPolicy:
     """Define persistent state, read-only pins and nested namespace policy.
@@ -223,6 +254,7 @@ POLICIES = MappingProxyType(
             state_dirs=(
                 ".agent",
                 ".cache/pre-commit",
+                ".plannotator",
                 ".pi",
             ),
             ro_paths=(
@@ -231,7 +263,6 @@ POLICIES = MappingProxyType(
                 ".agent/rules",
                 ".pi/agent/skills",
                 ".pi/agent/prompts",
-                ".pi/agent/settings.json",
                 ".pi/agent/models.json",
                 ".pi/agent/worktree.json",
                 ".pi/agent/guard-rules.json",
@@ -245,6 +276,7 @@ POLICIES = MappingProxyType(
             state_dirs=(
                 ".agent",
                 ".cache/pre-commit",
+                ".plannotator",
                 ".omp",
             ),
             ro_paths=(
@@ -253,7 +285,6 @@ POLICIES = MappingProxyType(
                 ".agent/rules",
                 ".omp/agent/skills",
                 ".omp/agent/prompts",
-                ".omp/agent/config.yml",
                 ".omp/agent/AGENTS.md",
                 ".omp/agent/extensions",
             ),
@@ -263,6 +294,7 @@ POLICIES = MappingProxyType(
             state_dirs=(
                 ".agent",
                 ".cache/pre-commit",
+                ".plannotator",
                 ".opencode",
                 ".local/share/opencode",
                 ".local/state/opencode",
@@ -272,7 +304,6 @@ POLICIES = MappingProxyType(
                 ".agent/skills",
                 ".agent/prompts",
                 ".agent/rules",
-                ".config/opencode",
             ),
             disable_userns=True,
         ),
@@ -280,6 +311,7 @@ POLICIES = MappingProxyType(
             state_dirs=(
                 ".agent",
                 ".cache/pre-commit",
+                ".plannotator",
                 ".claude",
                 ".local/state/claude",
             ),
@@ -287,7 +319,6 @@ POLICIES = MappingProxyType(
                 ".agent/skills",
                 ".agent/prompts",
                 ".agent/rules",
-                ".claude/settings.json",
                 ".claude/skills",
                 ".claude/rules",
                 ".claude/agents",
@@ -366,11 +397,11 @@ class Workspace:
     """Identify writable project and external Git metadata binds.
 
     Args:
-        root: Workspace root.
+        roots: Ordered writable workspace roots.
         common_dir: Git common directory requiring a separate writable bind.
     """
 
-    root: Path
+    roots: tuple[Path, ...]
     common_dir: Path | None = None
 
 
@@ -545,6 +576,7 @@ def resolve_workspace(
     """
     top = run(argv=("git", "rev-parse", "--show-toplevel"), runtime=runtime)
     common_dir = None
+    external_root = None
     if top.returncode == 0:
         root = Path(top.stdout.rstrip("\n"))
         common = run(
@@ -556,6 +588,8 @@ def resolve_workspace(
 
         common_path = Path(common.stdout.rstrip("\n")).resolve()
         if common_path.name == ".bare":
+            if not root.is_relative_to(common_path.parent):
+                external_root = root
             root = common_path.parent
             runtime.report(
                 message=f".bare-style repo; workspace: {root}", level="verbose"
@@ -585,10 +619,11 @@ def resolve_workspace(
         else:
             root = runtime.cwd
 
-    if not runtime.cwd.is_relative_to(root):
-        raise SandboxError(f"cwd {runtime.cwd} is outside the workspace {root}")
-    runtime.report(message=f"workspace: {root}", level="verbose")
-    return Workspace(root=root, common_dir=common_dir)
+    roots = (root,) if external_root is None else (root, external_root)
+    if not any(runtime.cwd.is_relative_to(path) for path in roots):
+        raise SandboxError(f"cwd {runtime.cwd} is outside the workspace {roots}")
+    runtime.report(message=f"workspace: {', '.join(map(str, roots))}", level="verbose")
+    return Workspace(roots=roots, common_dir=common_dir)
 
 
 def refuse_denied_path(*, path: Path, home: Path, label: str) -> None:
@@ -627,7 +662,8 @@ def validate_workspace(*, workspace: Workspace, home: Path) -> None:
     Raises:
         SandboxError: If either bind source violates the deny rules.
     """
-    refuse_denied_path(path=workspace.root, home=home, label="workspace root")
+    for root in workspace.roots:
+        refuse_denied_path(path=root, home=home, label="workspace root")
     if workspace.common_dir is not None:
         refuse_denied_path(path=workspace.common_dir, home=home, label="git common dir")
 
@@ -646,7 +682,7 @@ def path_is_exposed(
     Returns:
         Whether the target is covered by an exposed directory prefix.
     """
-    prefixes = (Path("/usr"), Path("/etc"), Path("/opt/mamba"), workspace.root)
+    prefixes = (Path("/usr"), Path("/etc"), Path("/opt/mamba"), *workspace.roots)
     if workspace.common_dir is not None:
         prefixes += (workspace.common_dir,)
     prefixes += tuple(home / rel for rel in HOME_RO_PATHS + policy.state_dirs)
@@ -691,14 +727,14 @@ def resolve_parent_chain(*, workspace: Workspace, home: Path) -> tuple[Path, ...
         Ordered ancestors to overlay and later remount read-only.
     """
     parents = []
-    binds = (workspace.root,)
+    binds = workspace.roots
     if workspace.common_dir is not None:
         binds += (workspace.common_dir,)
 
     for bind in binds:
         chain = []
         for parent in bind.parents:
-            if parent in (home, Path("/")):
+            if parent in (home, Path("/"), *binds):
                 break
             chain.append(parent)
         for parent in reversed(chain):
@@ -731,7 +767,7 @@ def ensure_state_dirs(*, runtime: Runtime, agent: str) -> None:
         if path.stat().st_uid != runtime.uid:
             raise SandboxError(f"state dir not owned by invoker: {path}")
 
-    # Missing pins must be seeded so --ro-bind-try can actually protect them
+    # Prepare every configuration pin before its required read-only bind
     for rel in policy.ro_paths:
         path = runtime.home / rel
         try:
@@ -750,7 +786,19 @@ def ensure_state_dirs(*, runtime: Runtime, agent: str) -> None:
         if path.exists():
             continue
 
-        if path.name.endswith(".json"):
+        if path.name == "AGENTS.md" or rel == ".omp/agent/config.yml":
+            if rel == ".omp/agent/config.yml" and any(
+                (path.parent / name).exists() or (path.parent / name).is_symlink()
+                for name in ("config.yaml", "settings.json")
+            ):
+                raise SandboxError(
+                    "normalize OMP configuration to config.yml on the host "
+                    "before sandbox launch"
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("x") as stream:
+                stream.write("{}\n" if rel == ".omp/agent/config.yml" else "")
+        elif path.name.endswith(".json"):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
                 '{"providers": {}}\n' if rel == ".pi/agent/models.json" else "{}\n"
@@ -791,6 +839,8 @@ def resolve_signing_key(
     Raises:
         OSError: If Git cannot start or an accepted key path cannot be resolved.
     """
+    if env_bool(runtime.env, "GIT_SIGNING_DISABLED"):
+        return Signing()
     format_result = run(
         argv=("git", "config", "--global", "--get", "gpg.format"), runtime=runtime
     )
@@ -889,10 +939,11 @@ def resolve_ssh_sock(
         Canonical socket path, or None when unavailable or rejected. Rejections
         emit warnings; an unset socket stays quiet when signing is disabled.
     """
+    if env_bool(runtime.env, "GIT_SIGNING_DISABLED"):
+        return None
     value = runtime.env.get("SSH_AUTH_SOCK")
     if not value:
-        if not runtime.env.get("GIT_SIGNING_DISABLED"):
-            runtime.report("SSH_AUTH_SOCK unset: ssh-agent not forwarded")
+        runtime.report("SSH_AUTH_SOCK unset: ssh-agent not forwarded")
         return None
 
     try:
@@ -1121,7 +1172,16 @@ def env_args(
     ]
     values.extend((var, value) for var, value in forwarded if var not in API_KEY_VARS)
 
-    if ssh_sock is not None:
+    if env_bool(runtime.env, "GIT_SIGNING_DISABLED"):
+        values.extend(
+            (
+                ("GIT_SIGNING_DISABLED", "1"),
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "commit.gpgsign"),
+                ("GIT_CONFIG_VALUE_0", "false"),
+            )
+        )
+    elif ssh_sock is not None:
         values.append(("SSH_AUTH_SOCK", str(ssh_sock)))
     if runtime.env.get("PLANNOTATOR_PORT"):
         values.extend(
@@ -1203,6 +1263,9 @@ def home_args(
 
     Returns:
         Home mount arguments with pins after writable state mounts.
+
+    Raises:
+        SandboxError: If the optional OpenCode installation is a symlink.
     """
     args = ["--perms", "0700", "--tmpfs", str(home)]
     for rel in HOME_RO_PATHS:
@@ -1224,7 +1287,13 @@ def home_args(
         args.extend(("--bind", str(home / rel), str(home / rel)))
 
     for rel in policy.ro_paths:
-        args.extend(("--ro-bind-try", str(home / rel), str(home / rel)))
+        args.extend(("--ro-bind", str(home / rel), str(home / rel)))
+    installation = home / ".opencode/bin"
+    if ".opencode" in policy.state_dirs:
+        if installation.is_symlink():
+            raise SandboxError(f"OpenCode installation is a symlink: {installation}")
+        if installation.exists():
+            args.extend(("--ro-bind", str(installation), str(installation)))
     return tuple(args)
 
 
@@ -1279,7 +1348,8 @@ def build_argv(
         if not runtime.home.is_relative_to(parent):
             args.extend(("--tmpfs", str(parent)))
 
-    args.extend(("--bind", str(workspace.root), str(workspace.root)))
+    for root in workspace.roots:
+        args.extend(("--bind", str(root), str(root)))
     if workspace.common_dir is not None:
         args.extend(("--bind", str(workspace.common_dir), str(workspace.common_dir)))
 
@@ -1296,20 +1366,20 @@ def build_argv(
 
 
 def redact_text(*, message: str, env: Mapping[str, str]) -> str:
-    """Mask nonempty API-key values in diagnostic text.
+    """Mask nonempty API-key values and URL user information in diagnostics.
 
     Args:
         message: Text to redact.
         env: Environment containing the API-key values.
 
     Returns:
-        Text with matching API-key values replaced by asterisks.
+        Text with matching API-key values and URL credentials masked.
     """
     for secret in sorted(
         {env[var] for var in API_KEY_VARS if env.get(var)}, key=len, reverse=True
     ):
         message = message.replace(secret, "***")
-    return message
+    return re.sub(r"([a-z][a-z0-9+.-]*://)[^/\s@]+@", r"\1***@", message, flags=re.I)
 
 
 def redacted_argv(argv: Sequence[str]) -> str:
@@ -1369,6 +1439,25 @@ def exec_process(argv: tuple[str, ...]) -> Never:
         ) from exc
 
 
+def exec_sandbox(argv: tuple[str, ...], *, command_index: int) -> Never:
+    """Pass Bubblewrap options through an inherited memfd, closed by its parser.
+
+    The command stays outside --args because Bubblewrap only accepts options
+    in that file. A failed exec closes the descriptor here.
+    """
+    prefix_end = argv.index("bwrap") + 1
+    with os.fdopen(os.memfd_create("agent-sandbox-args"), "w+b") as stream:
+        stream.write(
+            b"\0".join(os.fsencode(word) for word in argv[prefix_end:command_index])
+            + b"\0"
+        )
+        stream.seek(0)
+        os.set_inheritable(stream.fileno(), True)
+        exec_process(
+            (*argv[:prefix_end], "--args", str(stream.fileno()), *argv[command_index:])
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Resolve and launch the agent, or print help or a redacted dry-run command.
 
@@ -1415,9 +1504,31 @@ def main(argv: list[str] | None = None) -> int:
             debug=options.debug,
         )
 
+        controls = {
+            name: env_bool(env, name)
+            for name in (
+                "AGENT_SANDBOX_DISABLE",
+                "AGENT_SANDBOX_ACTIVE",
+                "GIT_SIGNING_DISABLED",
+            )
+        }
         exe = resolve_executable(runtime=runtime, agent=options.agent)
-        if env.get("AGENT_SANDBOX_DISABLE") or env.get("AGENT_SANDBOX_ACTIVE"):
-            exec_process((exe, *options.agent_args))
+        bypass = [
+            name
+            for name in ("AGENT_SANDBOX_DISABLE", "AGENT_SANDBOX_ACTIVE")
+            if controls[name]
+        ]
+        if bypass:
+            runtime.report(f"sandbox bypassed: {', '.join(bypass)}")
+            direct = (exe, *options.agent_args)
+            if options.dry_run:
+                print(
+                    shlex.join(
+                        tuple(redact_text(message=word, env=env) for word in direct)
+                    )
+                )
+                return 0
+            exec_process(direct)
 
         check_home_canonical(env["HOME"])
         check_tiocsti()
@@ -1472,7 +1583,7 @@ def main(argv: list[str] | None = None) -> int:
         if options.dry_run:
             print(display)
             return 0
-        exec_process(command)
+        exec_sandbox(command, command_index=len(command) - len(options.agent_args) - 2)
     except SandboxError as exc:
         if exc.usage:
             print(USAGE, file=sys.stderr, end="")
