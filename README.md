@@ -47,7 +47,15 @@ Options:
 | [tmux](docs/tmux.md) | Prefix, key bindings, plugins, and session behavior |
 | [SSH](docs/ssh.md) | Personal and Git-signing agents, forwarding, and tmux |
 | [Neovim](docs/nvim.md) | Installation, editor defaults, plugins, and key bindings |
+| [VS Code](docs/vscode.md) | Neovim integration, Python, notebooks, and host-specific paths |
+| [ranger](docs/ranger.md) | Fuzzy selection, previews, and file-opening rules |
+| [kitty](docs/kitty.md) | Terminal appearance, windows, tabs, clipboard, and hints |
+| [Desktop](docs/desktop.md) | Sway/i3 bindings, status bars, locking, and host-specific setup |
+| [Compose](docs/compose.md) | Greek letters, accents, subscripts, and mathematical symbols |
+| [Git and worktrees](docs/git.md) | Identity, signing, delta, and the git-bareify layout |
 | [Dotfiles](docs/dotfiles.md) | Sync commands, manifest rules, and safety checks |
+| [Agent sandbox](docs/agent-sandbox.md) | Filesystem access, persistent state, signing, and isolation limits |
+| [Pi configuration](dotfiles/.pi/agent/README.md) | Models, modes, guards, subagents, and extensions |
 | [Dev container](dev-container/README.md) | Container build, isolation, and Git signing |
 | [Dev VM](dev-vm/README.md) | KVM, QEMU, and libvirt setup |
 
