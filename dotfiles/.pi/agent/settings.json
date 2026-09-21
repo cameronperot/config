@@ -1,7 +1,7 @@
 {
-  "defaultProvider": "openrouter",
-  "defaultModel": "z-ai/glm-5.3-flash",
-  "defaultThinkingLevel": "high",
+  "defaultProvider": "opencode-go",
+  "defaultModel": "glm-5.3-flash",
+  "defaultThinkingLevel": "max",
   "enabledModels": [
     "**/deepseek-v4-*",
     "**/kimi-k3",
@@ -34,6 +34,6 @@
   "branchSummary": {
     "skipPrompt": true
   },
-  "lastChangelogVersion": "0.85.1",
+  "lastChangelogVersion": "0.86.1",
   "hideThinkingBlock": false
 }

@@ -30,7 +30,7 @@ The syntax is `agent-sandbox [script-flags] [--] <agent> [agent-args...]`. Wrapp
 | `--debug` | Enable verbose output plus two diagnostic lines: a resolution summary and the redacted launch argument vector; not a line-by-line trace |
 | `--dry-run` | Print a shell-quoted launch command without creating state or launching the sandbox |
 
-Diagnostics and dry-run output redact values from the five API-key variables listed below. This is not general-purpose secret redaction: credentials in other variables or agent arguments can appear in output. A dry run still validates paths and terminal protection, queries Git, screens package configuration, and may query the SSH agent. It skips the namespace capability probe, so its output does not include the conditional `--disable-userns` flags used by a supported real launch.
+Diagnostics and dry-run output redact values from the five API-key variables listed below and URL user information in proxies. Arbitrary unknown secrets embedded in command arguments cannot be recognized automatically. Real launches serialize Bubblewrap options, including forwarded secrets, into an inherited, seekable memory descriptor and use `bwrap --args FD`; Bubblewrap closes that descriptor after reading it, before the agent runs. An unsupported descriptor launch fails without falling back to secret-bearing options on the process command line. Dry-run prints the descriptive, redacted options instead. A dry run still validates paths and terminal protection, queries Git, screens package configuration, and may query the SSH agent. It skips the namespace capability probe, so its output does not include the conditional `--disable-userns` flags used by a supported real launch.
 
 ## Workspace and filesystem access
 
@@ -38,14 +38,14 @@ Diagnostics and dry-run output redact values from the five API-key variables lis
 | :--- | :--- |
 | Git toplevel, or current directory outside Git | Read-write host bind; edits persist |
 | External Git common directory for a linked worktree | Separate read-write host bind; Git metadata changes persist |
-| Directory containing a Git common directory named `.bare` | Entire directory becomes the writable workspace, including sibling worktrees |
+| Directory containing a Git common directory named `.bare` | Entire directory becomes writable, including sibling worktrees; an external worktree is an additional writable root |
 | Ancestors of the writable binds, excluding `$HOME` and `/` | Empty overlays remounted read-only; unrelated host contents are hidden |
 | `/usr`, `/etc`, `/opt/mamba` | Read-only host binds |
 | `/bin`, `/sbin`, `/lib`, `/lib64` | Links into `/usr` |
 | `$HOME`, `/tmp`, `/run` | Fresh, writable tmpfs; contents are ephemeral except for explicit host binds |
 | `/proc`, `/dev` | Fresh process and device mounts |
 
-The agent starts in the original working directory. The wrapper rejects writable roots at `/`, `$HOME`, ancestors of `$HOME`, or beneath a top-level hidden entry in `$HOME`. It also rejects roots at or beneath `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, `/opt`, `/var`, `/boot`, `/root`, `/srv`, `/tmp`, `/run`, `/proc`, `/sys`, and `/dev`. The same restrictions apply to an external Git common directory. A Git directory without a worktree is rejected unless its resolved name is `.bare`.
+The agent starts in the original working directory. The wrapper rejects writable roots at `/`, `$HOME`, ancestors of `$HOME`, or beneath a top-level hidden entry in `$HOME`. It also rejects roots at or beneath `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, `/opt`, `/var`, `/boot`, `/root`, `/srv`, `/tmp`, `/run`, `/proc`, `/sys`, and `/dev`. The same restrictions apply to every workspace root and an external Git common directory. A Git directory without a worktree is rejected unless its resolved name is `.bare`.
 
 Ordinary linked worktrees expose shared Git metadata but hide sibling worktree contents. Manage worktrees from the host; the `.bare` layout is the exception because the entire containing directory is writable and visible.
 
@@ -61,20 +61,22 @@ The following home paths are exposed read-only when present:
 
 ## Persistent state and protected configuration
 
-All paths in this table are relative to `$HOME`. Each agent also receives writable `.agent` state, with `.agent/skills`, `.agent/prompts`, and `.agent/rules` pinned read-only. That shared state is visible across agents.
+All paths in this table are relative to `$HOME`. Each agent also receives writable `.agent`, `.plannotator`, and `.cache/pre-commit` state, with `.agent/skills`, `.agent/prompts`, and `.agent/rules` pinned read-only. That shared state is visible across agents.
 
 | Agent | Additional writable state | Additional read-only pins |
 | :--- | :--- | :--- |
-| `pi` | `.pi` | Under `.pi/agent/`: `skills`, `prompts`, `settings.json`, `models.json`, `worktree.json`, `guard-rules.json`, `AGENTS.md`, `agents`, `extensions` |
-| `omp` | `.omp` | Under `.omp/agent/`: `skills`, `prompts`, `config.yml`, `AGENTS.md`, `extensions` |
-| `opencode` | `.opencode`, `.local/share/opencode`, `.local/state/opencode`, `.local/share/opentui` | Entire `.config/opencode` directory |
-| `claude` | `.claude`, `.local/state/claude` | Under `.claude/`: `settings.json`, `skills`, `rules`, `agents`, `commands` |
+| `pi` | `.pi` | Under `.pi/agent/`: `skills`, `prompts`, `models.json`, `worktree.json`, `guard-rules.json`, `AGENTS.md`, `agents`, `extensions` |
+| `omp` | `.omp` | Under `.omp/agent/`: `skills`, `prompts`, `AGENTS.md`, `extensions` |
+| `opencode` | `.opencode`, `.local/share/opencode`, `.local/state/opencode`, `.local/share/opentui` | An existing `.opencode/bin` installation |
+| `claude` | `.claude`, `.local/state/claude` | Under `.claude/`: `skills`, `rules`, `agents`, `commands` |
 
-Before a real launch, the wrapper creates missing state directories on the host and verifies that they are owned by the invoking user and have no symlinked components. Pinned symlinks must resolve within the selected agent's state directories. Missing pinned JSON files are seeded with `{}` (`{"providers": {}}` for Pi's `models.json`), and missing pinned directory paths are created; absent `AGENTS.md` and `config.yml` files are not seeded. Existing pins are mounted read-only over the writable state.
+Before a real launch, the wrapper creates missing state directories on the host and verifies that they are owned by the invoking user and have no symlinked components. Pinned symlinks must resolve within the selected agent's state directories. Missing pinned JSON files are seeded with `{}` (`{"providers": {}}` for Pi's `models.json`), and missing pinned directory paths are created. Missing pinned `AGENTS.md` files are created empty. Instruction-file seeds use exclusive creation and preserve existing content. Prepared configuration pins use required read-only binds, so disappearance fails launch. The optional `.opencode/bin` installation pin is only added when present and is never seeded. A symlink at `.opencode/bin` is rejected, including dangling links and links into the state tree, before generating mount arguments on real launches and dry-runs.
 
-Pi's `trust.json` remains writable so `/trust` can save decisions. Sessions, credentials and other unpinned state also remain accessible inside the sandbox. Model/provider configuration and global worktree setup commands must be edited from the host.
+When invoked through `c`, these paths survive container replacement only when included in the dedicated `AGENT_CONFIG_DIR` store described in the [container persistence table](../dev-container/README.md#persistent-agent-state). Without that store, agent state is ephemeral; the named pre-commit cache still persists. The image keeps OpenCode’s executable in `.local/lib/opencode/opencode`, outside the writable `.opencode` store.
 
-Edit protected configuration and install OpenCode plugins from the host. `pi-create-skill` and `pi-create-prompt` target pinned paths and therefore need to run on the host. Other writes beneath the sandbox's `.local` and `.config` disappear on exit unless covered by a persistent bind.
+Pi's `settings.json` and `trust.json`, OMP's `config.yml`, and Claude's `settings.json` remain writable within their state directories and are not seeded by the wrapper. OMP's alternate configuration files do not require normalization. Host `.config/opencode` is neither seeded nor mounted into the sandbox; that location is ephemeral inside the sandbox. Sessions, credentials and other unpinned state also remain accessible inside the sandbox. Model/provider configuration and global worktree setup commands must be edited from the host.
+
+Edit pinned configuration from the host. `pi-create-skill` and `pi-create-prompt` target pinned paths and therefore need to run on the host. Other writes beneath the sandbox's `.local` and `.config` disappear on exit unless covered by a persistent bind.
 
 For Claude, the wrapper sets `CLAUDE_CONFIG_DIR=$HOME/.claude`. If `$HOME/.claude/.claude.json` is absent and `$HOME/.claude.json` exists, it copies the latter once before launching, using the source permissions restricted by the process umask. Host and sandbox Claude state then diverge unless the host also uses the same `CLAUDE_CONFIG_DIR`.
 
@@ -95,14 +97,16 @@ The sandbox clears the inherited environment and supplies `HOME`, `PWD`, `USER`,
 | :--- | :--- |
 | `AGENT_SANDBOX_BIN=<path>` | Select a different executable; the agent name still determines the state policy |
 | `AGENT_SANDBOX_DISABLE=1` | Execute the agent directly without sandbox setup |
-| `AGENT_SANDBOX_ACTIVE` | Set to `1` inside the sandbox; an existing nonempty value causes direct execution to prevent nesting |
-| `GIT_SIGNING_DISABLED=1` | Suppress the warning for an unset `SSH_AUTH_SOCK`; does not disable forwarding of a supplied socket |
+| `AGENT_SANDBOX_ACTIVE` | Set to `1` inside the sandbox; a true value causes direct execution to prevent nesting |
+| `GIT_SIGNING_DISABLED=1` | Disable signing-key/socket discovery and forwarding, including a supplied `SSH_AUTH_SOCK`; preserve `GIT_SIGNING_DISABLED=1` and reconstruct only `commit.gpgsign=false` after clearing the environment |
 
-Both bypass variables are tested for nonempty values, so even `AGENT_SANDBOX_DISABLE=0` bypasses isolation. Bypass handling precedes dry-run handling: with either bypass variable set, `--dry-run` still executes the agent directly.
+`AGENT_SANDBOX_DISABLE`, `AGENT_SANDBOX_ACTIVE`, and `GIT_SIGNING_DISABLED` accept case-insensitive `1/true/yes/on` and `0/false/no/off`. Unset or empty means false; any other value is a usage error with status `2`. A bypass reports its reason on stderr. Wrapper `--dry-run` prints the selected direct command without executing it or preparing state, including when either bypass is true. An agent’s own `--dry-run` after its name remains an agent argument.
 
 ## Git signing and GitHub access
 
-The wrapper selects the signing identity from global Git configuration, ignoring repository-local overrides:
+When signing is disabled, the wrapper skips key and socket discovery and probing, omits socket mounts and `SSH_AUTH_SOCK`, and supplies only the normalized disabled marker and `commit.gpgsign=false` override after clearing the environment. Arbitrary inherited `GIT_CONFIG_*` overrides are not forwarded.
+
+Otherwise, the wrapper selects the signing identity from global Git configuration, ignoring repository-local overrides:
 
 1. Require `gpg.format=ssh` and a nonempty `user.signingkey`.
 2. Accept an inline public key, optionally prefixed with `key::`, or a public-key file whose first line has a recognized SSH key type and which has exactly one nonblank line.
@@ -127,7 +131,7 @@ The sandbox shares the network and the invoking environment's kernel. It isolate
 | `TIOCSTI escape unmitigated` | Have the host provide `/proc/sys/dev/tty/legacy_tiocsti` with value `0` |
 | Workspace bind refused | Launch from a project directory outside the denied locations |
 | State ownership or symlink error | Correct the named host state path; pinned symlinks must stay within the selected state trees |
-| Protected settings or plugin installation fails | Edit or install from the host |
+| Writing a pinned configuration file fails | Edit the named pinned file from the host |
 | SSH agent not forwarded | Check global signing configuration, socket ownership, and the socket's identity list |
 | `bwrap: open /proc/2/ns/ns failed: No such file or directory` in the dev container | Use `c -a=--init CMD` so Podman supplies an init process |
 

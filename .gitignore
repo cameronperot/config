@@ -376,3 +376,6 @@ dotfiles/.pi/**/models-store.json
 dotfiles/.pi/**/docs
 specs
 dotfiles/.plannotator
+
+# opencode runtime state (db, locks, logs)
+dotfiles/.local/

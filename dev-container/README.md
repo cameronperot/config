@@ -29,24 +29,47 @@ GIT_SIGNING_KEY="$(cat ~/.ssh/llm_agent_ed25519.pub)" ./dev-container/build.sh  
 
 | Option | Effect |
 | :--- | :--- |
-| `-c NAME` | Select a running container; implies `-r` |
-| `--cpus`, `--ram-mib` | Set resource limits, or microVM size under `-k` |
-| `--plannotator-port PORT` | Pin the Plannotator UI port |
+| `-c NAME` | Select an exact container name or ID, then a unique ID prefix; ambiguous prefixes are errors; implies `-r` |
+| `--cpus`, `--ram-mib` | Positive integer resource limits, or microVM size under `-k`; omitted plain-container limits remain unlimited |
+| `--plannotator-port PORT` | Pin the Plannotator UI port, from 1 through 65535 |
 | `--no-plannotator-port` | Disable Plannotator port publishing |
 | `--no-git-signing`, `--ngs` | Disable commit signing |
 | `--no-git-root`, `--ngr` | Mount only the current directory |
 | `-a=ARG` | Add a `podman run` argument |
-| `--dry-run` | Print the command without running it |
+| `--dry-run` | Print the redacted command and describe missing state directories without creating them or running the command |
+| `--interactive`, `--no-interactive` | Attach stdin by default, or explicitly disable it; valid for run and exec |
+| `--tty`, `--no-tty` | Override terminal allocation; by default both stdin and stdout must be terminals |
+
+Wrapper options precede the command; all later arguments pass through unchanged. Stdin and TTY controls are independent: pipes default to `-i` without `-t`, and `--tty --no-interactive` requests terminal output without stdin. Automatic container selection still prefers `dev_container`, then the deepest containing mount, with the first inspected candidate winning ties. The selected immutable ID is used for exec; diagnostics retain its friendly name.
+
+Diagnostics redact known API-key values, proxy URL user information, and literal environment assignments supplied through `-a` (`-e KEY=value`, `--env KEY=value`, or `--env=KEY=value`). Execution arguments are preserved. Arbitrary unknown secrets embedded in command arguments cannot be recognized automatically. Invalid flags/ranges return `2`; missing Git/Podman or final exec targets return `127`, and other exec errors return `126`, without tracebacks.
 
 A throwaway container starts in the current directory and receives:
 
-- the repository root mounted at its host path; for a `.bare` layout, the directory holding `.bare`; outside Git or with `--no-git-root`, only the current directory
-- `$AGENT_CONFIG_DIR/{.agent,.pi/agent,.omp/agent,.plannotator}` at the same paths under `/home/user` when `AGENT_CONFIG_DIR` is non-empty; when unset or empty, no agent config directories are mounted and the image's bundled dotfiles are used
+- the repository root mounted at its host path; for a `.bare` layout, the directory holding `.bare` plus an external worktree when needed; for an ordinary linked worktree, its toplevel plus the common Git directory; outside Git or with `--no-git-root`, only the current directory
+- the dedicated `AGENT_CONFIG_DIR` configuration and state mounts listed below when configured; when unset or empty, no agent configuration/state directories are mounted and the image’s bundled dotfiles are used
+- the `dev-pre-commit` named volume at `/home/user/.cache/pre-commit` in both modes
 - the isolated ssh-agent as `SSH_AUTH_SOCK`: socket bind-mount, or under `c -k` a TCP bridge to the host signer (see [Isolation](#isolation) and [Signing under `c -k`](#signing-under-c--k-pasta-bridge)); when the host socket is absent, `c` warns and starts the container without it, and signing fails at commit time unless `--no-git-signing`/`GIT_SIGNING_DISABLED` is used
 - a port for the Plannotator plan UI: a free loopback port is published one-to-one (`--plannotator-port PORT` to pin it, `--no-plannotator-port` to opt out), with `PLANNOTATOR_REMOTE=1` and `PLANNOTATOR_PORT` set inside
 - no API-key environment variables (use the harness' login functionality)
 
 Without agent config mounts, host agent credentials and customizations are not imported, and agent state created inside the throwaway container is lost when it exits.
+
+### Persistent agent state
+
+`AGENT_CONFIG_DIR` selects a dedicated agent-only store, not your personal home. The selected store path becomes absolute with symlinks resolved, so aliases for the store or its parent directories are accepted. Required directories, source types, ownership, and symlinked configuration/state roots beneath that canonical store are validated before creating state or probing signers. Missing creatable directories are made private (`0700`) and invoker-owned on real launches only. Existing files and credentials in the selected store are preserved, including credentials created by agent login. `c` never discovers or copies credentials from personal `$HOME`.
+
+| Source beneath `AGENT_CONFIG_DIR` | Destination beneath `/home/user` | Missing source |
+| :--- | :--- | :--- |
+| `.agent` | `.agent` | Error: required configuration |
+| `.pi/agent`, `.omp/agent` | Same child paths | Error: required configuration and existing state |
+| `.agent/skills`, `.agent/prompts` | Corresponding children beneath both `.pi/agent` and `.omp/agent`, mounted after their parents | Error: required shared configuration |
+| `.plannotator` | `.plannotator` | Create private persistent state |
+| `.opencode`, `.config/opencode` | Same paths | Create private persistent state/configuration |
+| `.local/share/opencode`, `.local/state/opencode`, `.local/share/opentui` | Same paths | Create private persistent state |
+| `.claude`, `.local/state/claude` | Same paths | Create private persistent state |
+
+The binds are writable at the container layer. Each agent’s [sandbox configuration pins](../docs/agent-sandbox.md#persistent-state-and-protected-configuration) restrict the listed protected configuration to read-only access. Pi/Claude settings and OMP configuration remain writable. Although `c` persists `.config/opencode` in the outer container, the sandbox does not mount that directory. Pi/OMP mounts remain their `agent` children. Fresh `.opencode` state is empty; no `.opencode/bin` is seeded or imported. The image installs OpenCode normally, then moves its binary to `.local/lib/opencode/opencode` and links `.local/bin/opencode` there, so persistent `.opencode` state does not hide the image tool.
 
 `compose.yml` mounts its own directory at `/work`, Jupyter's root. Keep machine-specific additions such as project mounts or the signing socket in a second compose file passed with another `-f`.
 
@@ -112,7 +135,9 @@ Build with `GIT_SIGNING_KEY` as in [Build](#build). `c` mounts the socket automa
 -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock \
 ```
 
-To disable signing, pass `c --no-git-signing`, `c --ngs`, or set `GIT_SIGNING_DISABLED=1` when launching `c`. `c` omits the host socket mount and `SSH_AUTH_SOCK`, skips the microVM signer probe, and sets `commit.gpgsign=false` and `GIT_SIGNING_DISABLED=1` inside the container. Under `c -k`, pasta networking remains enabled without the signer-port forwarding, and the entrypoint does not start the signing bridge. Commits are unsigned, and missing-signer warnings are suppressed.
+`GIT_SIGNING_DISABLED`, `AGENT_SANDBOX_DISABLE`, and `AGENT_SANDBOX_ACTIVE` use case-insensitive `1/true/yes/on` and `0/false/no/off`; unset or empty means false and other values are errors. The two sandbox bypass controls report the reason on stderr, and wrapper dry-run never executes the direct command.
+
+To disable signing, pass `c --no-git-signing`, `c --ngs`, or set `GIT_SIGNING_DISABLED=1` when launching `c`. `c` omits the host socket mount and `SSH_AUTH_SOCK`, skips the microVM signer probe, and sets `commit.gpgsign=false` and `GIT_SIGNING_DISABLED=1` inside the container. Under `c -k`, pasta networking remains enabled without the signer-port forwarding, and the entrypoint does not start the signing bridge. The sandbox reconstructs `commit.gpgsign=false` after clearing its environment and omits supplied sockets too, so commits remain unsigned inside it.
 
 ### 5. Verify (container)
 ```bash
@@ -122,7 +147,7 @@ git log --show-signature -1
 Expected: `Good "git" signature for <your GitHub email> with ED25519 key SHA256:...`
 
 ### Signing under `c -k` (pasta bridge)
-When signing is enabled, `c -k` adds `--network=pasta:-T,7777`; the image entrypoint bridges `127.0.0.1:7777` to `SSH_AUTH_SOCK` inside the microVM, with the socket owned by the container user so `agent-sandbox` accepts it. Before booting, `c -k` probes that host port and warns when no signer answers. The bridge is unauthenticated: any local host user can request signatures while it runs. Use it only on a single-user machine.
+When signing is enabled, `c -k` adds `--network=pasta:-T,7777`; the image entrypoint bridges `127.0.0.1:7777` to `SSH_AUTH_SOCK` inside the microVM, with the socket owned by the container user so `agent-sandbox` accepts it. Before booting, `c -k` probes that host port with one total one-second deadline across connect, send, and receive. A failed probe warns that no signer responded while the bridge remains configured. This is a transport diagnostic; the sandbox separately checks the configured signing identity. The bridge is unauthenticated: any local host user can request signatures while it runs. Use it only on a single-user machine.
 
 The dotfiles include [llm-ssh-agent-tcp.socket](../dotfiles/.config/systemd/user/llm-ssh-agent-tcp.socket), which listens on host loopback port 7777 and activates [llm-ssh-agent-tcp.service](../dotfiles/.config/systemd/user/llm-ssh-agent-tcp.service), a `systemd-socket-proxyd` bridge to `$XDG_RUNTIME_DIR/llm-agent.sock`. For a fresh installation, enable the listener:
 
