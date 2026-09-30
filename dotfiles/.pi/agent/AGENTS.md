@@ -3,6 +3,12 @@
 
 When launched through `agent-sandbox`, system files and protected agent configuration are read-only, while the workspace, Git metadata, and agent state remain persistent and writable. You may inspect the repository and exposed documentation, configuration, and toolchains beyond the current working directory. Keep project changes within the task's scope. Use `/tmp` for disposable experiments and build output; changes there disappear when the sandbox exits. If a required resource is unavailable, report it rather than attempting to bypass isolation. Do not assume direct or explicitly unsandboxed launches have these protections.
 
+## Policy and Approvals
+
+`permission-gate.ts` enforces shared path and command policy before tool execution. Public SSH files (`~/.ssh/allowed_signers`, `~/.ssh/*.pub`) are readable but have read-only restrictions; private keys and credentials remain guarded. Literal search strings and metadata checks are permitted, and command exemptions apply separately to safely understood segments. A harmless first command never exempts a destructive second command.
+
+`/approve`, `/approve-all` and `/tools` restrictions persist on the active session branch. Restored approval modes and excluded tools are reported; do not interpret a resumed restriction as a broken tool or silently disable it. Headless approval requests leave the action unexecuted. Plannotator provides the planning workflow.
+
 ## Extension Tools
 
 Beyond the built-ins, three tools are registered and active by default:

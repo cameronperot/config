@@ -1,5 +1,5 @@
 {
-  "zeroAccessAllowPaths": [".env.example", ".env-example", ".env.template", ".env.sample"],
+  "zeroAccessAllowPaths": [".env.example", ".env-example", ".env.template", ".env.sample", "~/.ssh/allowed_signers", "~/.ssh/*.pub"],
 
   "zeroAccessPaths": [
     "*.env",
@@ -31,6 +31,8 @@
   ],
 
   "readOnlyPaths": [
+    "~/.ssh/allowed_signers",
+    "~/.ssh/*.pub"
   ],
 
   "noDeletePaths": [

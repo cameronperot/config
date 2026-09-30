@@ -1,25 +1,9 @@
 /**
  * Built-in Tool Renderer + Read Audit
  *
- * Merge of two shipped examples:
- * - built-in-tool-renderer.ts - compact renderCall/renderResult for read, bash,
- *   edit and write, delegating execution to the original implementations.
- * - tool-override.ts - access logging and zero-access blocking on `read`,
- *   plus the /read-log command. The paths it refuses come from the
- *   `zeroAccessPaths` policy in guard-rules.json, shared with the bash guard.
- *
- * They are merged rather than installed side by side because Pi keeps the
- * FIRST registration for a given tool name (runner.js getAllRegisteredTools)
- * and extension discovery is an unsorted readdir, so shipping both files would
- * drop one `read` registration nondeterministically.
- *
- * Difference from the shipped tool-override.ts: `read` delegates to
- * createReadTool() rather than reimplementing the read. The shipped example
- * returns its own details shape and does naive byte-slice truncation, which
- * loses image support, ReadToolDetails and the built-in truncation semantics.
- * Here the block check and the log entry wrap the real implementation, and a
- * block also notifies and appends the same `guard-block` session entry the other
- * three guards do, so the read path leaves the same trace they leave.
+ * Compact rendering for read, bash, edit and write, delegating execution to
+ * Pi's implementations. Successful read access is logged here; policy decisions
+ * and blocked-access logging belong to permission-gate.ts.
  *
  * All four render through `shared/render.ts`: a call row (glyph, tool name,
  * argument), a body bounded to a visual-row budget behind a gutter or a
@@ -80,9 +64,7 @@ import {
 	SYM,
 	type TimedState,
 } from "./shared/render.ts";
-import { blockReason, type GuardAudit, takeLoadIssue, zeroAccessMatch } from "./shared/rules.ts";
 
-const BLOCKED_PREFIX = "Access denied:";
 
 /** Width budget for a path in a call row, before the middle ellipsis kicks in. */
 const PATH_WIDTH = 72;
@@ -194,35 +176,6 @@ export default function (pi: ExtensionAPI) {
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const absolutePath = resolve(ctx.cwd, params.path);
 
-			if (ctx.hasUI) {
-				const issue = takeLoadIssue(ctx.cwd);
-				if (issue) ctx.ui.notify(`Guard policy: ${issue}`, "warning");
-			}
-
-			const secret = zeroAccessMatch(params.path, ctx.cwd);
-			if (secret) {
-				const rule = `zero-access path "${secret}"`;
-				await logAccess(absolutePath, false, `matches zero-access rule "${secret}"`);
-				if (ctx.hasUI) {
-					ctx.ui.notify(`Blocked read of ${rule}: ${params.path}`, "warning");
-				}
-				pi.appendEntry<GuardAudit>("guard-block", {
-					tool: "read",
-					rule,
-					action: "blocked",
-					detail: absolutePath,
-				});
-				return {
-					content: [
-						{
-							type: "text",
-							text: `${BLOCKED_PREFIX} ${blockReason(`"${params.path}" matches the ${rule} in guard-rules.json.`)}`,
-						},
-					],
-					details: undefined,
-				};
-			}
-
 			await logAccess(absolutePath, true);
 			return baseTools(ctx.cwd).read.execute(toolCallId, params, signal, onUpdate);
 		},
@@ -264,9 +217,6 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (content?.type !== "text") {
 				return new Text(statusRow(theme, "error", "no content"), 0, 0);
-			}
-			if (content.text.startsWith(BLOCKED_PREFIX)) {
-				return new Text(statusRow(theme, "error", "blocked (zero-access path)"), 0, 0);
 			}
 
 			const meta = [theme.fg("dim", plural(countLines(content.text), "line"))];

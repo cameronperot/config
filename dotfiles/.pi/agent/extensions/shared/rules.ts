@@ -1,9 +1,8 @@
 /**
  * Guard policy — rule loading and path matching.
  *
- * The three guard extensions (`protected-paths.ts`, `protected-paths-bash.ts`,
- * `permission-gate.ts`) and the `read` guard in `built-in-tool-renderer.ts` are
- * the *mechanism*. Global `~/.pi/agent/guard-rules.json` defines the policy;
+ * `permission-gate.ts` enforces the shared decisions in this module.
+ * Global `~/.pi/agent/guard-rules.json` defines the policy;
  * `<cwd>/.pi/guard-rules.json` may add restrictions but cannot weaken it.
  *
  * Rule classes:
@@ -228,9 +227,7 @@ export function getRules(cwd: string): LoadedRules {
  * policy is announced rather than quietly degrading to the floor, without every
  * guard announcing it on every tool call.
  *
- * The report is one-shot, so only call it when you can actually deliver it —
- * every guard guards the call with `ctx.hasUI`. Calling it headless would burn
- * the single report on a run with nowhere to show it.
+ * The central guard delivers this through UI notifications or headless stderr.
  */
 export function takeLoadIssue(cwd: string): string | undefined {
 	const { error } = getRules(cwd);
@@ -329,10 +326,14 @@ export interface TokenMatch {
 	pattern: string;
 }
 
-/** First token in `command` that matches one of `patterns`, honouring the allowlist. */
-export function commandPathMatch(command: string, patterns: string[], cwd: string): TokenMatch | undefined {
-	for (const token of commandTokens(command)) {
-		if (isAllowlisted(token, cwd)) continue;
+/** Only zero-access matching uses content-only inspection and its allowlist. */
+export function commandPathMatch(command: string, patterns: string[], cwd: string, zeroAccess = false): TokenMatch | undefined {
+	const segments = zeroAccess ? literalSegments(command) : undefined;
+	const tokens = segments
+		? segments.flatMap((segment) => contentPaths(segment) ?? commandTokens(segment))
+		: commandTokens(command);
+	for (const token of tokens) {
+		if (zeroAccess && isAllowlisted(token, cwd)) continue;
 		const pattern = firstMatch(token, patterns, cwd);
 		if (pattern) return { token, pattern };
 	}
@@ -366,6 +367,48 @@ function literalWords(command: string): { value: string; quoted: boolean }[] | u
 	return words;
 }
 
+/** Only literal segments separated by |, &&, || or ;. Unknown syntax stays raw. */
+function literalSegments(command: string): string[] | undefined {
+	const segments: string[] = [];
+	let quote = "";
+	let start = 0;
+	for (let i = 0; i < command.length; i++) {
+		const char = command[i];
+		if (quote) {
+			if (char === quote) quote = "";
+			continue;
+		}
+		if (char === "'" || char === '"') { quote = char; continue; }
+		if (!"|&;".includes(char)) continue;
+		const operator = command.slice(i, i + 2);
+		if (char === "&" && operator !== "&&") return undefined;
+		segments.push(command.slice(start, i).trim());
+		if (operator === "&&" || operator === "||") i++;
+		else if (char === "|") {
+			// An executable consumer can turn upstream search/print data into code.
+			const consumer = command.slice(i + 1).trim().match(/^[a-z]+\b/)?.[0];
+			if (!consumer || !["head", "tail", "wc", "uniq", "cat"].includes(consumer)) return undefined;
+		}
+		start = i + 1;
+	}
+	segments.push(command.slice(start).trim());
+	return segments.every((segment) => literalWords(segment)?.length) ? segments : undefined;
+}
+
+/** Paths actually read by a bounded search or metadata command; undefined means inspect raw. */
+function contentPaths(command: string): string[] | undefined {
+	const words = literalWords(command)?.map((word) => word.value);
+	if (!words) return undefined;
+	if (words[0] === "test" && words.length === 3 && ["-f", "-d", "-e", "-L", "-s"].includes(words[1])) return [];
+	if (words[0] === "git" && words[1] === "check-ignore" && words.slice(2).every((word) => !word.startsWith("-"))) return [];
+	if (!["rg", "grep"].includes(words[0])) return undefined;
+	let index = 1;
+	while (/^-[inlqsvwFx]+$/.test(words[index] ?? "")) index++;
+	if (words[index] === "--") index++;
+	else if (words.slice(index).some((word) => word.startsWith("-"))) return undefined;
+	return words.length > index ? words.slice(index + 1) : undefined;
+}
+
 /** Missing targets are safe only when their nearest existing ancestor resolves inside /tmp. */
 function isTemporaryTarget(target: string): boolean {
 	if (!target.startsWith("/tmp/") || target.split("/").includes("..") || resolve(target) === "/tmp") return false;
@@ -380,7 +423,7 @@ function isTemporaryTarget(target: string): boolean {
 	}
 }
 
-/** Only exempt a standalone rm with literal targets beneath ephemeral /tmp. */
+/** Only exempt a literal rm segment with targets beneath ephemeral /tmp. */
 function isTemporaryCleanup(command: string): boolean {
 	const parsed = literalWords(command);
 	if (!parsed) return false;
@@ -430,27 +473,42 @@ function isHarmlessGitCommand(command: string, exemption: BashPattern["commandEx
 
 /** Match both the original command and common Git global-option spellings. */
 export function matchingBashPatterns(command: string, cwd: string): CompiledBashPattern[] {
-	const words = literalWords(command);
-	// Quoted search/print arguments are data. Keep raw inspection for pipelines,
-	// substitutions, interpreters and rg's executable preprocessor option.
-	const textOnly = words && ["echo", "printf", "rg", "grep"].includes(words[0]?.value) &&
-		!words.some((word) => word.value === "--pre" || word.value.startsWith("--pre="));
-	const inspected = textOnly
-		? words.map((word, index) => index > 0 && word.quoted ? "__quoted_data__" : word.value).join(" ")
-		: command;
-	const normalized = inspected.replace(
-		/\bgit\s+(?:(?:-C|-c|--git-dir|--work-tree)\s+(?:"[^"\n]*"|'[^'\n]*'|[^\s|;&]+)\s+|--(?:git-dir|work-tree)=[^\s|;&]+\s+|--(?:no-pager|paginate|bare|no-optional-locks)\s+)*/g,
-		"git ",
-	);
+	const segments = literalSegments(command);
+	const inspected = (segments ?? [command]).map((raw) => {
+		const words = segments ? literalWords(raw) : undefined;
+		const textOnly = words && (["echo", "printf"].includes(words[0]?.value) || contentPaths(raw) !== undefined);
+		const inspected = textOnly
+			? words.map((word, index) => index > 0 && word.quoted ? "__quoted_data__" : word.value).join(" ")
+			: raw;
+		const normalized = inspected.replace(
+			/\bgit\s+(?:(?:-C|-c|--git-dir|--work-tree)\s+(?:"[^"\n]*"|'[^'\n]*'|[^\s|;&]+)\s+|--(?:git-dir|work-tree)=[^\s|;&]+\s+|--(?:no-pager|paginate|bare|no-optional-locks)\s+)*/g,
+			"git ",
+		);
+		return { raw, inspected, normalized };
+	});
+	function joined(field: "inspected" | "normalized"): string {
+		let offset = 0;
+		let result = "";
+		for (const segment of inspected) {
+			const start = command.indexOf(segment.raw, offset);
+			result += command.slice(offset, start) + segment[field];
+			offset = start + segment.raw.length;
+		}
+		return result + command.slice(offset);
+	}
 	return getRules(cwd).rules.bashPatterns.flatMap((entry) => {
 		const regex = new RegExp(entry.pattern);
-		if (!regex.test(inspected) && !regex.test(normalized)) return [];
-		if (entry.commandExemption && isHarmlessGitCommand(normalized, entry.commandExemption)) return [];
-		if (
-			SANDBOX_ACTIVE && (entry.sandboxExemption === "host" ||
-				(entry.sandboxExemption === "tmp-cleanup" && isTemporaryCleanup(command)) ||
-				(entry.sandboxExemption === "tmp-permissions" && isTemporaryPermissionChange(command)))
-		) return [];
+		const hits = inspected.filter((segment) => regex.test(segment.inspected) || regex.test(segment.normalized));
+		// Retain project rules matching across literal segments as well.
+		if (hits.length === 0) {
+			if (!regex.test(joined("inspected")) &&
+				!regex.test(joined("normalized"))) return [];
+		} else if (hits.every((segment) =>
+			(entry.commandExemption && isHarmlessGitCommand(segment.normalized, entry.commandExemption)) ||
+			(SANDBOX_ACTIVE && (entry.sandboxExemption === "host" ||
+				(entry.sandboxExemption === "tmp-cleanup" && isTemporaryCleanup(segment.raw)) ||
+				(entry.sandboxExemption === "tmp-permissions" && isTemporaryPermissionChange(segment.raw))))
+		)) return [];
 		return [{ regex, reason: entry.reason, ask: entry.ask === true }];
 	});
 }
@@ -473,6 +531,45 @@ export const WRITE_INDICATORS = [
 	/\bsed\b[^|;]*\s-i/,
 	/\b(chmod|chown)\b/,
 ];
+
+/** A policy decision shared by enforcement and optional approval modes. */
+export interface PolicyDecision {
+	ask: boolean;
+	reason: string;
+	blockedAccess?: string;
+}
+
+export function policyDecision(tool: string, input: Record<string, unknown>, cwd: string): PolicyDecision | undefined {
+	if (["read", "write", "edit", "grep"].includes(tool)) {
+		const path = (input.path as string | undefined) ?? ".";
+		const secret = zeroAccessMatch(path, cwd);
+		if (secret) return {
+			ask: false,
+			reason: `zero-access path "${secret}"`,
+			blockedAccess: tool === "read" ? resolve(cwd, path) : undefined,
+		};
+		const readOnly = tool === "write" || tool === "edit" ? readOnlyMatch(path, cwd) : undefined;
+		return readOnly ? { ask: false, reason: `read-only path "${readOnly}"` } : undefined;
+	}
+	if (tool !== "bash") return undefined;
+
+	const command = input.command as string;
+	const { rules } = getRules(cwd);
+	const decisions: PolicyDecision[] = matchingBashPatterns(command, cwd);
+	const secret = commandPathMatch(command, rules.zeroAccessPaths, cwd, true);
+	if (secret) decisions.push({ ask: false, reason: `zero-access path "${secret.pattern}"`, blockedAccess: secret.token });
+	const noDelete = DELETE_INDICATORS.some((r) => r.test(command)) && commandPathMatch(command, rules.noDeletePaths, cwd);
+	if (noDelete) decisions.push({ ask: false, reason: `no-delete path "${noDelete.pattern}"` });
+	const readOnly = WRITE_INDICATORS.some((r) => r.test(command)) && commandPathMatch(command, rules.readOnlyPaths, cwd);
+	if (readOnly) decisions.push({ ask: true, reason: `Possible write to read-only path "${readOnly.pattern}"` });
+	if (decisions.length === 0) return undefined;
+	const blocked = decisions.filter((decision) => !decision.ask);
+	return {
+		ask: blocked.length === 0,
+		reason: [...new Set((blocked.length > 0 ? blocked : decisions).map((decision) => decision.reason))].join("; "),
+		blockedAccess: secret?.token,
+	};
+}
 
 // --- Block text ------------------------------------------------------------
 

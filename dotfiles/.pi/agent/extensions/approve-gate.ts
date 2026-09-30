@@ -8,7 +8,7 @@
  *                    ALWAYS_ALLOWED.
  *
  * This fills the gap between the other protections, which are *prevention*
- * (plan mode and the `review` preset remove `edit`/`write` entirely),
+ * (the `review` preset removes `edit`/`write` entirely),
  * *selective confirmation* (the guards prompt only on a `guard-rules.json`
  * match) and *undo* (`pi-rewind`). Nothing else gates an ordinary edit.
  *
@@ -19,8 +19,7 @@
  * `questionnaire` would mean approving the model's request to ask you a
  * question.
  *
- * The gate is additive to the guards in `protected-paths*.ts` and
- * `permission-gate.ts`: turning a mode on can only ever add confirmations,
+ * The gate is additive to `permission-gate.ts`: turning a mode on can only ever add confirmations,
  * never remove one. It is TUI/RPC only — with no UI to ask through it blocks,
  * like every `ask` rule.
  * It also does not reach subagent children, which spawn `--no-session` and so
@@ -36,17 +35,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { approvalRequiredReason } from "./shared/approval.ts";
-import {
-	blockReason,
-	commandPathMatch,
-	DELETE_INDICATORS,
-	getRules,
-	type GuardAudit,
-	matchingBashPatterns,
-	readOnlyMatch,
-	WRITE_INDICATORS,
-	zeroAccessMatch,
-} from "./shared/rules.ts";
+import { blockReason, type GuardAudit, policyDecision } from "./shared/rules.ts";
 
 type ApproveMode = "off" | "writes" | "all";
 
@@ -236,35 +225,6 @@ function auditDetail(event: ToolCallEvent): string {
 	return typeof path === "string" ? path : clamp(JSON.stringify(event.input));
 }
 
-/**
- * Will one of the guards already deal with this call?
- *
- * Extension load order is unsorted `readdir` and the first handler to block
- * wins, so without this check the gate can prompt for a call another guard is
- * about to refuse — or prompt a second time for one it is about to ask about.
- * Either way the answer the user gives is not the one that decides the call.
- * Deferring keeps it to exactly one prompt whichever handler runs first.
- */
-function guardHandles(event: ToolCallEvent, cwd: string): boolean {
-	if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-		const path = event.input.path;
-		return zeroAccessMatch(path, cwd) !== undefined || readOnlyMatch(path, cwd) !== undefined;
-	}
-	if (!isToolCallEventType("bash", event)) return false;
-
-	const command = event.input.command;
-	if (matchingBashPatterns(command, cwd).length > 0) return true;
-
-	const { rules } = getRules(cwd);
-	if (commandPathMatch(command, rules.zeroAccessPaths, cwd)) return true;
-	if (DELETE_INDICATORS.some((r) => r.test(command)) && commandPathMatch(command, rules.noDeletePaths, cwd)) {
-		return true;
-	}
-	return (
-		WRITE_INDICATORS.some((r) => r.test(command)) && commandPathMatch(command, rules.readOnlyPaths, cwd) !== undefined
-	);
-}
-
 export default function (pi: ExtensionAPI) {
 	let mode: ApproveMode = "off";
 	// Set by "Yes to all remaining" so a ten-file refactor is not ten prompts.
@@ -303,7 +263,7 @@ export default function (pi: ExtensionAPI) {
 		if (mode === "off" || approveRestOfRun) return undefined;
 
 		const gated = mode === "writes" ? WRITE_TOOLS.has(event.toolName) : !ALWAYS_ALLOWED.has(event.toolName);
-		if (!gated || guardHandles(event, ctx.cwd)) return undefined;
+		if (!gated || policyDecision(event.toolName, event.input, ctx.cwd)) return undefined;
 
 		const rule = `approve mode "${mode}"`;
 		const detail = auditDetail(event);
@@ -359,6 +319,11 @@ export default function (pi: ExtensionAPI) {
 		mode = entry?.data?.mode ?? "off";
 		approveRestOfRun = false;
 		updateStatus(ctx);
+		if (mode !== "off") {
+			const notice = `Restored restriction: ${MODE_NOTICE[mode]}`;
+			if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+			else process.stderr.write(`${notice}\n`);
+		}
 	}
 
 	pi.on("session_start", async (_event, ctx) => restore(ctx));

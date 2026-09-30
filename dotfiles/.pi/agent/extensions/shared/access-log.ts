@@ -1,8 +1,8 @@
 /**
  * The shared read-access log.
  *
- * Imported by built-in-tool-renderer.ts (guards the `read` tool) and
- * protected-paths-bash.ts (guards `bash`), so a path blocked for `read` and the
+ * Imported by built-in-tool-renderer.ts (records allowed reads) and
+ * permission-gate.ts (records blocked access), so a path blocked for `read` and the
  * same path blocked for `cat` land in one file. Policy itself lives in
  * `rules.ts`; this module only records what happened.
  *

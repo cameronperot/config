@@ -10,10 +10,10 @@ Project-level files layer on top rather than replacing this: a repo's `AGENTS.md
 |---|---|
 | `settings.json` | Provider, default model, default tool set, npm packages, TUI |
 | `models.json` | Per-provider overrides — OpenRouter routing only |
-| `guard-rules.json` | Path and bash-command policy the guard extensions enforce |
+| `guard-rules.json` | Path and bash-command policy enforced by `permission-gate.ts` |
 | `plannotator.json` | Plannotator's planning-phase instructions — the prompt spliced in while its planning mode is active |
 | `AGENTS.md` | Prepended to every request; describes the extension tools and the subagent roles |
-| `extensions/` | 21 local extensions plus shared modules — see [`extensions/README.md`](extensions/README.md) |
+| `extensions/` | 18 local extensions plus shared modules — see [`extensions/README.md`](extensions/README.md) |
 
 ## Models and providers
 
@@ -25,11 +25,11 @@ The default provider, model and `thinkingLevel` live in `settings.json` and chan
 
 The `preset` extension (`preset.ts`) reads named presets from `~/.pi/agent/presets.json`, with `<cwd>/.pi/presets.json` overriding by name, and switches provider, model, thinking level, tool set and instructions via `/preset`, `--preset` or Ctrl+Shift+U. A preset's `instructions` are appended to the system prompt while it is active, so they cost tokens only then.
 
-No `presets.json` exists, so no presets are defined: every session runs the default provider and model from `settings.json`, and `/preset` reports "No presets defined". A preset that should be read-only achieves it by *construction* — it removes `edit` and `write` from its `tools` list rather than instructing the model not to use them.
+No `presets.json` is shipped; custom deployments may define presets. Without one, `/preset` reports "No presets defined" and fresh sessions use the defaults from `settings.json`. A preset that should be read-only achieves it by *construction* — it removes `edit` and `write` from its `tools` list rather than instructing the model not to use them.
 
 ## Modes
 
-Session modes, all off or neutral at start and all toggles — running the command again turns the mode off, or pass an explicit `off`.
+Fresh-session modes start off or neutral; saved approval and tool-selection restrictions restore on resume and branch navigation. Modes are toggles — running the command again turns the mode off, or pass an explicit `off`.
 
 | Mode | Toggle | What changes |
 |---|---|---|
@@ -37,31 +37,31 @@ Session modes, all off or neutral at start and all toggles — running the comma
 | Preset | `/preset`, `--preset`, Ctrl+Shift+U | Swaps model, thinking level, tool set and instructions — see [Presets](#presets). |
 | Approve | `/approve` | Confirms every `write` and `edit` before it runs. |
 | Approve-all | `/approve-all` | Confirms every tool except `read`, `grep`, `find`, `ls`, `todo` and `questionnaire`. |
-| Tool selection | `/tools` | Interactive checklist over the active tool set. Persists to the session, so a stale selection can override `defaultTools` on resume. |
-
-The bundled `plan-mode/` extension — `/plan`, `/steps`, a read-only bash allowlist, `Plan:`-block step tracking — is staged as `extensions/plan-mode/index.ts.disabled` and does not load. The `--plan` flag and Ctrl+Alt+P shortcut it used to register now belong to plannotator; re-enabling it would overlap both.
+| Tool selection | `/tools` | Interactive checklist over the active tool set. Persists to the session; restoration reports excluded tools. |
 
 Presets, plannotator's planning phase and `/tools` all drive the same active tool set, so use one at a time. The approve modes are a separate axis: they gate calls rather than removing tools, and they stay quiet when a guard is already going to block or ask about the same call, so turning one on can only add confirmations.
 
-Together the modes cover three different controls. The planning phases **prevent** — plannotator gates writes to markdown inside the working directory, and plan-mode (when re-enabled) removes `edit` and `write` outright; the approve modes **confirm** at the moment of use; `/rewind` **undoes** after the fact. Note that both approve modes need a UI to ask through — under `-p` a gated call blocks instead, and the mode is restored from the session, so a resumed `/approve-all` session blocks every gated call.
+Plannotator gates planning writes to markdown inside the working directory; the approve modes confirm at the moment of use; `/rewind` undoes after the fact. Saved approval modes remain active on resume and branch navigation, with a warning and status indicator. In headless mode, restrictions are reported on stderr and gated calls return exact-action approval requests without executing.
 
 ## Guard policy
 
-`guard-rules.json` is data; the extensions that enforce it are the mechanism. This global file defines policy. `<cwd>/.pi/guard-rules.json` may add restrictions, but cannot replace global rules or add zero-access exceptions. Put exceptions in the global file on the host.
+`permission-gate.ts` enforces `guard-rules.json` for `read`, `write`, `edit`, `grep` and `bash`. Decisions live in `extensions/shared/rules.ts` and are shared with optional approval mode. Rendering and allowed-read logging remain in `built-in-tool-renderer.ts`; blocked read and bash access is logged by the central guard. This global file defines policy. `<cwd>/.pi/guard-rules.json` may add restrictions, but cannot replace global rules or add zero-access exceptions. Put exceptions in the global file on the host.
 
 | Class | Effect | What it covers here |
 |---|---|---|
 | `zeroAccessPaths` | Blocks direct reads, edits, explicit grep targets and literal bash references | Environment secrets, credential/auth data files, `*.key`, `*key.pem`, `*.priv`, `*.p12`, `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, git credentials |
-| `zeroAccessAllowPaths` | Exceptions to the above | `.env.example`, `.env-example`, `.env.template`, `.env.sample` |
-| `readOnlyPaths` | Blocks write/edit; confirms suspected bash writes | Empty in the shipped policy; system and protected agent files are mounted read-only by the sandbox |
+| `zeroAccessAllowPaths` | Exceptions to the above | `.env.example`, `.env-example`, `.env.template`, `.env.sample`, `~/.ssh/allowed_signers`, `~/.ssh/*.pub` |
+| `readOnlyPaths` | Blocks write/edit; confirms suspected bash writes | `~/.ssh/allowed_signers` and `~/.ssh/*.pub`; system and protected agent files are mounted read-only by the sandbox |
 | `noDeletePaths` | Deletion and move-away refused | Empty in the shipped policy |
 | `bashPatterns` | Regexes over the command string | Destructive `rm`, `sudo`, `chmod 777`; history-rewriting and work-discarding git; unqualified SQL `DROP` / `TRUNCATE` / `DELETE`; `curl \| sh`; `mkfs`; `dd of=/dev/` |
 
-Severity belongs to the rule: `ask: true` prompts for confirmation, its absence blocks outright. All matching command rules are considered; hard blocks win, otherwise one prompt lists the matching reasons. A missing or malformed global policy falls back to a `SAFETY_FLOOR` in `extensions/shared/rules.ts` rather than to no protection.
+Severity belongs to the rule: `ask: true` prompts for confirmation, its absence blocks outright. All matching command rules are considered; hard blocks win, otherwise one prompt lists the matching reasons. A missing or malformed global policy falls back to a `SAFETY_FLOOR` in `extensions/shared/rules.ts` rather than to no protection, with a warning once per cwd through the UI or headless stderr. Zero-access exceptions do not exempt read-only or no-delete rules.
 
-In sandbox mode, standalone recursive cleanup of literal paths beneath `/tmp` runs without a rule confirmation, including quoted paths and missing targets whose existing ancestors resolve inside `/tmp`. Workspace cleanup remains gated. Host-oriented `sudo`, `mkfs` and raw-device rules are exempt in sandbox mode; downloaded scripts piped into a shell require confirmation. Optional `/approve-all` still gates exempt commands. See [sandbox exemptions](extensions/README.md#guard-policy) for the exact conditions.
+In sandbox mode, recursive cleanup in a safely understood command segment of literal paths beneath `/tmp` runs without a rule confirmation, including quoted paths and missing targets whose existing ancestors resolve inside `/tmp`. Workspace cleanup remains gated. Host-oriented `sudo`, `mkfs` and raw-device rules are exempt in sandbox mode; downloaded scripts piped into a shell require confirmation. Optional `/approve-all` still gates exempt commands. See [sandbox exemptions](extensions/README.md#guard-policy) for the exact conditions.
 
-Standalone unstaging with `git restore --staged`/`-S` and supported `git clean`/`git worktree prune` dry runs are exempt from their command rules. Quoted arguments to standalone `echo`, `printf`, `rg` and `grep` are treated as data when matching command rules. Interpreters, substitutions and pipelines retain conservative inspection; path guards still apply independently.
+Literal unstaging with `git restore --staged`/`-S` and supported `git clean`/`git worktree prune` dry runs are exempt from their command rules. Exemptions apply separately to literal sequences: `rm -rf /tmp/pi-review-scratch && true` is permitted in sandbox mode and `git restore --staged src/file.ts && git status` is permitted in either mode, while destructive second commands retain their guards.
+
+Bounded search and metadata forms such as `rg '.env' README.md`, `test -f .env`, `git check-ignore .env`, and `rg 'DROP DATABASE' migrations | head` are permitted. Search targets still obey secret-path rules. Interpreters, executable preprocessors, substitutions and unsupported shell syntax retain conservative inspection. Private keys, `.env.test` and fixture credentials remain guarded.
 
 Sandboxed, nonrecursive permission and ownership changes on disposable `/tmp` files or directories are exempt from the `777` rule. Targets must exist on `/tmp`'s filesystem; special files and regular files with multiple hard links remain guarded. Recursive operations and workspace targets retain the existing guard.
 
@@ -77,23 +77,25 @@ Headless children cannot answer confirmation prompts. The guards return an appro
 
 ## AGENTS.md
 
-Prepended to every request, which is why it is kept short. It carries the one thing Pi's default system prompt does not: that `todo`, `questionnaire` and `subagent` exist, and when to reach for them. A model that is not told about a tool will not call it.
+Prepended to every request, which is why it is kept short. It describes the sandbox boundary, policy and approval behavior, extension tools and subagent roles.
 
-`defaultTools` in `settings.json` is the initial active set — `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `todo`, `questionnaire`, `subagent` — and lists all three, so `AGENTS.md` holds true in a session with no preset. Registering a tool is not the same as activating it.
+On the verified Pi 0.85.1 runtime, `defaultTools` selects the seven built-ins: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. Pi also activates extension tools on a fresh session, including `todo`, `questionnaire` and `subagent`. Explicit tool allowlists, saved selections, presets and Plannotator phases can restrict that set.
 
 ## Extensions
 
-Twenty-one extensions load from `extensions/` (`plan-mode/` is staged disabled and does not load), plus two npm packages installed via `packages` in `settings.json`.
+Eighteen local extensions load from `extensions/`, plus two npm packages installed via `packages` in `settings.json`.
 
 | Group | Extensions | Adds |
 |---|---|---|
-| Guards | `permission-gate`, `protected-paths`, `protected-paths-bash`, `approve-gate` | `/approve`, `/approve-all` |
+| Guards | `permission-gate`, `approve-gate` | `/approve`, `/approve-all` |
 | Tools | `built-in-tool-renderer`, `todo`, `questionnaire` | tools `todo` `questionnaire`; `/todos`, `/read-log` |
 | Workflow | `preset`, `tools`, `handoff`, `commands`, `subagent/` | tool `subagent`; `/preset`, `/tools`, `/handoff`, `/commands` |
 | Git | `worktree` | `/worktree`, `pi --gwt <name>` |
 | Display | `custom-footer`, `notify`, `system-prompt-header` | `/footer` |
 | Context | `claude-rules`, `rules-loader`, `shake` | `/shake`, `/unshake` |
-| Session | `session-name`, `bookmark` | `/session-name`, `/bookmark`, `/unbookmark` |
+| Session | `bookmark` | `/bookmark`, `/unbookmark` |
 | npm | `pi-rewind` 0.5.0, `@plannotator/pi-extension` 0.27.9 | `/rewind`, Esc Esc; `plannotator_submit_plan` tool, `/plannotator-plan-mode`, `/plannotator-review`, `/plannotator-annotate`, `/plannotator-last`, `--plan`, Ctrl+Alt+P |
 
 Mechanism, per-request token cost, known gaps, local modifications and extension interactions are in [`extensions/README.md`](extensions/README.md).
+
+Deployment must explicitly retire installed `extensions/protected-paths.ts`, `extensions/protected-paths-bash.ts` and `extensions/plan-mode/`; `install.py` copies files without deleting old destinations. Preserve other configuration and session state, and restart Pi after deployment. Plannotator owns the planning commands.

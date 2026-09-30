@@ -1,75 +1,67 @@
-/**
- * Permission Gate Extension
- *
- * Applies the `bashPatterns` list from `guard-rules.json` to every bash command.
- * Severity is a property of the rule rather than of this file: an entry with
- * `ask: true` prompts for confirmation, an entry without it blocks outright. So
- * `git reset --hard` can ask while `git filter-branch` refuses, from one list.
- *
- * Rules that ask still block when there is no UI to ask through.
- */
+/** Enforce shared path and command policy, with one confirmation per call. */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { logAccess } from "./shared/access-log.ts";
 import { approvalRequiredReason } from "./shared/approval.ts";
-import { blockReason, type GuardAudit, matchingBashPatterns, takeLoadIssue } from "./shared/rules.ts";
+import { blockReason, type GuardAudit, policyDecision, takeLoadIssue } from "./shared/rules.ts";
 
 export default function (pi: ExtensionAPI) {
+	function reportPolicyIssue(ctx: ExtensionContext): void {
+		const issue = takeLoadIssue(ctx.cwd);
+		if (!issue) return;
+		if (ctx.hasUI) ctx.ui.notify(`Guard policy: ${issue}`, "warning");
+		else process.stderr.write(`Guard policy: ${issue}\n`);
+	}
+
+	pi.on("session_start", async (_event, ctx) => reportPolicyIssue(ctx));
 	pi.on("tool_call", async (event, ctx) => {
-		if (event.toolName !== "bash") return undefined;
+		reportPolicyIssue(ctx);
 
-		if (ctx.hasUI) {
-			const issue = takeLoadIssue(ctx.cwd);
-			if (issue) ctx.ui.notify(`Guard policy: ${issue}`, "warning");
-		}
-
-		const command = event.input.command as string;
-		const hits = matchingBashPatterns(command, ctx.cwd);
-		if (hits.length === 0) return undefined;
-		const blocked = hits.filter((rule) => !rule.ask);
-		const hit = {
-			ask: blocked.length === 0,
-			reason: [...new Set((blocked.length > 0 ? blocked : hits).map((rule) => rule.reason))].join("; "),
-		};
+		const hit = policyDecision(event.toolName, event.input, ctx.cwd);
+		if (!hit) return undefined;
+		const input = event.input as Record<string, unknown>;
+		const detail = (input.command ?? input.path ?? ".") as string;
+		if (hit.blockedAccess) await logAccess(hit.blockedAccess, false, `${event.toolName}: ${hit.reason}`);
 
 		if (!hit.ask) {
 			if (ctx.hasUI) {
-				ctx.ui.notify(`Blocked bash command: ${hit.reason}`, "warning");
+				ctx.ui.notify(`Blocked ${event.toolName}: ${hit.reason}`, "warning");
 			}
 			pi.appendEntry<GuardAudit>("guard-block", {
-				tool: "bash",
+				tool: event.toolName,
 				rule: hit.reason,
 				action: "blocked",
-				detail: command,
+				detail,
 			});
 			return { block: true, reason: blockReason(`${hit.reason}. Blocked by guard-rules.json.`) };
 		}
 
 		if (!ctx.hasUI) {
 			pi.appendEntry<GuardAudit>("guard-block", {
-				tool: "bash",
+				tool: event.toolName,
 				rule: hit.reason,
 				action: "blocked",
-				detail: command,
+				detail,
 			});
-			return { block: true, reason: approvalRequiredReason("bash", event.input, ctx.cwd, hit.reason) };
+			return { block: true, reason: approvalRequiredReason(event.toolName, event.input, ctx.cwd, hit.reason) };
 		}
 
-		const choice = await ctx.ui.select(`⚠️ ${hit.reason}:\n\n  ${command}\n\nAllow?`, ["Yes", "No"]);
+		const choice = await ctx.ui.select(`⚠️ ${hit.reason}:\n\n  ${detail}\n\nAllow?`, ["Yes", "No"]);
 		if (choice !== "Yes") {
 			pi.appendEntry<GuardAudit>("guard-block", {
-				tool: "bash",
+				tool: event.toolName,
 				rule: hit.reason,
 				action: "blocked_by_user",
-				detail: command,
+				detail,
 			});
 			return { block: true, reason: blockReason(`Blocked by user: ${hit.reason}.`) };
 		}
 
 		pi.appendEntry<GuardAudit>("guard-block", {
-			tool: "bash",
+			tool: event.toolName,
 			rule: hit.reason,
 			action: "allowed_by_user",
-			detail: command,
+			detail,
 		});
 		return undefined;
 	});

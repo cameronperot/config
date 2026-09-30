@@ -18,10 +18,7 @@
     "write",
     "grep",
     "find",
-    "ls",
-    "todo",
-    "questionnaire",
-    "subagent"
+    "ls"
   ],
   "packages": [
     "npm:@plannotator/pi-extension",

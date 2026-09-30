@@ -57,6 +57,12 @@ export default function toolsExtension(pi: ExtensionAPI) {
 			const allToolNames = allTools.map((t) => t.name);
 			enabledTools = new Set(savedTools.filter((t: string) => allToolNames.includes(t)));
 			applyTools();
+			const excluded = allToolNames.filter((name) => !enabledTools.has(name));
+			if (excluded.length > 0) {
+				const notice = `Restored tool selection excludes: ${excluded.join(", ")}. Use /tools to change it.`;
+				if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+				else process.stderr.write(`${notice}\n`);
+			}
 		} else {
 			// No saved state - sync with currently active tools
 			enabledTools = new Set(pi.getActiveTools());

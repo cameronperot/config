@@ -12,5 +12,5 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["node"]
   },
-  "include": ["*.ts", "plan-mode/**/*.ts", "shared/**/*.ts", "subagent/**/*.ts"]
+  "include": ["*.ts", "shared/**/*.ts", "subagent/**/*.ts"]
 }

@@ -24,6 +24,7 @@ registerHooks({
 				export const isToolCallEventType = (name, event) => event.toolName === name;
 				export const CONFIG_DIR_NAME = '.pi';
 				export const getMarkdownTheme = () => ({});
+				export const getSettingsListTheme = () => ({});
 				export const withFileMutationQueue = async (_path, callback) => callback();
 			` };
 		}
@@ -34,7 +35,7 @@ registerHooks({
 				export const truncateToWidth = text => text;
 				export const visibleWidth = text => text.length;
 				export const wrapTextWithAnsi = text => [text];
-				export class Container {} export class Markdown {} export class Spacer {} export class Text {}
+				export class SettingsList {} export class Container {} export class Markdown {} export class Spacer {} export class Text {}
 			` };
 		}
 		if (url === "mock:@earendil-works/pi-ai") return { format: "module", shortCircuit: true, source: "export const StringEnum = () => ({});" };
@@ -57,8 +58,7 @@ after(() => rmSync(root, { recursive: true, force: true }));
 const rules = await import("../dotfiles/.pi/agent/extensions/shared/rules.ts");
 const { default: permissionGate } = await import("../dotfiles/.pi/agent/extensions/permission-gate.ts");
 const { default: approveGate } = await import("../dotfiles/.pi/agent/extensions/approve-gate.ts");
-const { default: protectedPaths } = await import("../dotfiles/.pi/agent/extensions/protected-paths.ts");
-const { default: protectedPathsBash } = await import("../dotfiles/.pi/agent/extensions/protected-paths-bash.ts");
+const { default: toolsExtension } = await import("../dotfiles/.pi/agent/extensions/tools.ts");
 const { default: subagent } = await import("../dotfiles/.pi/agent/extensions/subagent/index.ts");
 const { getApprovalRequests } = await import("../dotfiles/.pi/agent/extensions/shared/approval.ts");
 const policy = JSON.parse(readFileSync(new URL("../dotfiles/.pi/agent/guard-rules.json", import.meta.url)));
@@ -82,7 +82,14 @@ function harness(extension, cwd, hasUI = true) {
 	const tools = new Map();
 	const audit = [];
 	const prompts = [];
+	const notices = [];
+	const statuses = new Map();
+	let branch = [];
+	let activeTools = ["read", "bash", "write", "edit"];
 	const pi = {
+		getAllTools: () => ["read", "bash", "write", "edit"].map(name => ({ name })),
+		getActiveTools: () => activeTools,
+		setActiveTools: names => { activeTools = names; },
 		on: (name, handler) => handlers.set(name, handler),
 		registerCommand: (name, command) => commands.set(name, command),
 		registerTool: tool => tools.set(tool.name, tool),
@@ -90,14 +97,17 @@ function harness(extension, cwd, hasUI = true) {
 	};
 	const ctx = {
 		cwd, hasUI, mode: "rpc",
+		sessionManager: { getBranch: () => branch },
 		ui: {
-			notify() {}, setStatus() {}, theme: { fg: (_color, text) => text },
+			notify: (text) => notices.push(text), setStatus: (key, text) => statuses.set(key, text), theme: { fg: (_color, text) => text },
 			select: async (prompt) => { prompts.push(prompt); return "Yes"; },
 		},
 	};
 	extension(pi);
 	return {
-		audit, prompts,
+		audit, prompts, notices, statuses,
+		activeTools: () => activeTools,
+		restore: async (entries = [], event = "session_start") => { branch = entries; await handlers.get(event)({}, ctx); },
 		call: (toolName, input) => handlers.get("tool_call")({ toolName, input }, ctx),
 		command: name => commands.get(name).handler("", ctx),
 		tool: (name, input) => tools.get(name).execute("test-call", input, undefined, undefined, ctx),
@@ -137,7 +147,7 @@ test("common Git global options and restore variants retain protection", () => {
 	}
 });
 
-test("only standalone literal temporary cleanup is exempt", () => {
+test("literal temporary cleanup retains unsafe-target checks", () => {
 	const cwd = fixture();
 	assert.equal(rules.matchingBashPatterns(`rm -rf ${root}`, cwd).length, 0);
 	assert.equal(rules.matchingBashPatterns(`rm --recursive --force -- ${root}`, cwd).length, 0);
@@ -150,7 +160,7 @@ test("only standalone literal temporary cleanup is exempt", () => {
 	symlinkSync(join(process.cwd(), "nonexistent-guard-test-target"), dangling);
 	for (const command of [
 		"rm -rf src", "rm -rf /tmp", `rm -rf ${root}/..`, `rm -rf ${link}`,
-		`rm -rf ${root}/outside/dotfiles`, `rm -rf ${root} src`, `rm -rf ${root} && true`,
+		`rm -rf ${root}/outside/dotfiles`, `rm -rf ${root} src`,
 		`rm -rf ${root}\n${root}`, `rm -rf ${root}\r\n${root}`,
 		`rm -rf ${root}/*`, 'rm -rf "$TMPDIR"', `rm -rf '${link}/missing'`, `rm -rf '${dangling}/missing'`,
 		`rm -rf ${root}/[ab]/file`, `rm -rf "${root}/"[ab]/file`,
@@ -236,7 +246,7 @@ test("headless confirmations carry the exact action and cwd, but hard blocks do 
 	const approval = harness(approveGate, cwd, false);
 	await approval.command("approve");
 	assert.match((await approval.call("write", { path: "file", content: "data" })).reason, /^Approval required/);
-	const protectedGate = harness(protectedPathsBash, fixture({ readOnlyPaths: ["file"] }), false);
+	const protectedGate = harness(permissionGate, fixture({ readOnlyPaths: ["file"] }), false);
 	assert.match((await protectedGate.call("bash", { command: "touch file > file" })).reason, /^Approval required/);
 });
 
@@ -332,10 +342,10 @@ test("source, certificates and environment examples are accessible; credentials 
 	}
 	for (const path of ["auth.json", "auth.yaml", ".env", ".env.production", "tls/private-key.pem", "tls/server.key", "credentials.json", "~/.ssh/id_ed25519"]) {
 		assert.ok(rules.zeroAccessMatch(path, cwd), path);
-		const gate = harness(protectedPaths, cwd);
+		const gate = harness(permissionGate, cwd);
 		for (const tool of ["write", "edit", "grep"]) assert.equal((await gate.call(tool, { path })).block, true, `${tool}: ${path}`);
 	}
-	const gate = harness(protectedPaths, fixture({ readOnlyPaths: ["public.txt"] }));
+	const gate = harness(permissionGate, fixture({ readOnlyPaths: ["public.txt"] }));
 	assert.equal(await gate.call("grep", { path: "public.txt" }), undefined);
 });
 
@@ -347,4 +357,189 @@ test("download-to-shell requires confirmation and destructive SQL stays guarded"
 	assert.equal(gate.audit[0].action, "allowed_by_user");
 	assert.ok(rules.matchingBashPatterns("DROP DATABASE example", cwd).some(rule => !rule.ask));
 	assert.ok(rules.matchingBashPatterns("TRUNCATE TABLE example", cwd).some(rule => rule.ask));
+});
+
+test("central policy covers built-in paths and leaves metadata tools unchanged", async () => {
+	const cwd = fixture({ readOnlyPaths: ["readonly"], noDeletePaths: ["keep"] });
+	const gate = harness(permissionGate, cwd);
+	for (const tool of ["read", "write", "edit", "grep"]) {
+		assert.equal((await gate.call(tool, { path: ".env" })).block, true, tool);
+		assert.equal(await gate.call(tool, { path: "ordinary" }), undefined, tool);
+	}
+	for (const tool of ["find", "ls"]) assert.equal(await gate.call(tool, { path: ".env" }), undefined);
+	for (const tool of ["write", "edit"]) assert.equal((await gate.call(tool, { path: "readonly" })).block, true);
+	for (const tool of ["read", "grep"]) assert.equal(await gate.call(tool, { path: "readonly" }), undefined);
+	assert.equal((await gate.call("bash", { command: "rm keep" })).block, true);
+	assert.equal((await gate.call("bash", { command: "cat .env" })).block, true);
+	assert.equal(await gate.call("bash", { command: "echo text > readonly" }), undefined);
+	assert.equal(gate.prompts.length, 1);
+	assert.match(readFileSync(join(root, "read-access.log"), "utf8"), /BLOCKED: .*\.env/);
+	assert.ok(gate.audit.some(entry => entry.tool === "read" && entry.action === "blocked"));
+});
+
+test("policy and optional approval prompt once in either extension order", async () => {
+	const cwd = fixture({ readOnlyPaths: ["readonly"], noDeletePaths: ["keep"] });
+	for (const reversed of [false, true]) {
+		const policyGate = harness(permissionGate, cwd);
+		const optional = harness(approveGate, cwd);
+		await optional.command("approve-all");
+		const gates = reversed ? [optional, policyGate] : [policyGate, optional];
+		for (const [command, blocked, prompts] of [
+			["git reset --hard && echo text > readonly", false, 1],
+			["git reset --hard && cat .env", true, 0],
+			["git reset --hard && rm keep", true, 0],
+			["echo ordinary", false, 1],
+		]) {
+			const before = policyGate.prompts.length + optional.prompts.length;
+			let result;
+			for (const gate of gates) {
+				result = await gate.call("bash", { command });
+				if (result?.block) break;
+			}
+			assert.equal(!!result?.block, blocked, command);
+			assert.equal(policyGate.prompts.length + optional.prompts.length - before, prompts, command);
+		}
+	}
+});
+
+test("blocked reads stop before underlying tool execution", async () => {
+	const gate = harness(permissionGate, fixture(), false);
+	let reads = 0;
+	async function guardedRead(path) {
+		const result = await gate.call("read", { path });
+		if (result?.block) return result;
+		reads++;
+		return { content: "fixture content" };
+	}
+	assert.equal((await guardedRead(".env")).block, true);
+	assert.equal(reads, 0);
+	assert.equal((await guardedRead("README.md")).content, "fixture content");
+	assert.equal(reads, 1);
+});
+
+for (const command of ["rg '.env' README.md", "test -f .env", "git check-ignore .env", "rg 'DROP DATABASE' migrations | head"]) {
+	test(`harmless literal command: ${command}`, async () => {
+		assert.equal(await harness(permissionGate, fixture(), false).call("bash", { command }), undefined);
+	});
+}
+
+test("literal data exemptions retain secret and executable access checks", async () => {
+	const gate = harness(permissionGate, fixture(), false);
+	for (const command of [
+		"cat '.env'", "rg pattern '.env'", "grep pattern .env", "rg -f .env README.md",
+		"rg --pre 'cat .env' pattern README.md", "rg --pre='cat .env' pattern README.md",
+		"rg --pre 'git push --force' pattern", "rg '.env' README.md && cat .env",
+		'test -f "$(cat .env)"', "python -c 'print(open(\".env\").read())'",
+		"rg 'DROP DATABASE' migrations | bash", "printf 'git push --force' | sort --compress-program=bash", "printf 'git push --force' | bash",
+		"echo `git push --force`", 'echo "$(git push --force)"', "psql -c 'DROP DATABASE example'",
+	]) assert.equal((await gate.call("bash", { command }))?.block, true, command);
+});
+
+test("segment exemptions never exempt a destructive second command", async () => {
+	const cwd = fixture();
+	const gate = harness(permissionGate, cwd, false);
+	for (const command of [
+		`rm -rf ${root}/scratch && true`, "git restore --staged src/file.ts && git status",
+		`rm -rf ${root}/scratch; git restore --staged src/file.ts`,
+		"rg 'DROP DATABASE' migrations | head || true",
+	]) assert.equal(await gate.call("bash", { command }), undefined, command);
+	for (const suffix of ["rm -rf src", "git reset --hard", "git push --force", "psql -c 'DROP DATABASE example'"]) {
+		for (const prefix of [`rm -rf ${root}/scratch`, "git restore --staged src/file.ts", "test -f .env", "rg '.env' README.md"]) {
+			assert.equal((await gate.call("bash", { command: `${prefix} && ${suffix}` }))?.block, true, suffix);
+		}
+	}
+	delete process.env.AGENT_SANDBOX_ACTIVE;
+	try {
+		const direct = await import("../dotfiles/.pi/agent/extensions/shared/rules.ts?segments-direct");
+		assert.equal(direct.policyDecision("bash", { command: `rm -rf ${root}/scratch && true` }, cwd).ask, true);
+		assert.equal(direct.policyDecision("bash", { command: "git restore --staged file && git status" }, cwd), undefined);
+	} finally { process.env.AGENT_SANDBOX_ACTIVE = "1"; }
+});
+
+test("zero-access exceptions do not override read-only or no-delete policy", async () => {
+	const cwd = fixture({ readOnlyPaths: [".env.example"], noDeletePaths: [".env.example"] });
+	const gate = harness(permissionGate, cwd, false);
+	assert.equal(await gate.call("bash", { command: "cat .env.example" }), undefined);
+	assert.equal((await gate.call("write", { path: ".env.example" })).block, true);
+	assert.match((await gate.call("bash", { command: "echo example > .env.example" }))?.reason ?? "", /^Approval required/);
+	assert.match((await gate.call("bash", { command: "rm .env.example" }))?.reason ?? "", /no-delete/);
+});
+
+test("public SSH exceptions permit reads but retain writes and private-key protections in both modes", async () => {
+	const cwd = fixture();
+	delete process.env.AGENT_SANDBOX_ACTIVE;
+	try {
+		const direct = await import("../dotfiles/.pi/agent/extensions/shared/rules.ts?ssh-direct");
+		for (const engine of [rules, direct]) {
+			for (const path of ["~/.ssh/allowed_signers", "~/.ssh/id_ed25519.pub"]) {
+				for (const tool of ["read", "grep"]) assert.equal(engine.policyDecision(tool, { path }, cwd), undefined);
+				assert.equal(engine.policyDecision("bash", { command: `cat ${path}` }, cwd), undefined);
+				for (const tool of ["write", "edit"]) assert.equal(engine.policyDecision(tool, { path }, cwd).ask, false);
+				assert.equal(engine.policyDecision("bash", { command: `echo public > ${path}` }, cwd).ask, true);
+				assert.equal(engine.policyDecision("bash", { command: `rm ${path}` }, cwd).ask, true);
+			}
+			for (const path of ["~/.ssh/id_ed25519", "~/.ssh/nested/key.pub", ".env.test", "fixtures/credentials.json"]) {
+				assert.equal(engine.policyDecision("read", { path }, cwd).ask, false, path);
+				assert.equal(engine.policyDecision("bash", { command: `cat ${path}` }, cwd).ask, false, path);
+			}
+		}
+	} finally { process.env.AGENT_SANDBOX_ACTIVE = "1"; }
+});
+
+test("approval restoration announces restrictions and follows branch state", async () => {
+	for (const mode of ["writes", "all"]) {
+		const gate = harness(approveGate, fixture());
+		await gate.restore();
+		assert.equal(gate.notices.length, 0);
+		await gate.restore([{ type: "custom", customType: "approve-mode", data: { mode } }]);
+		assert.match(gate.notices[0], /Restored restriction/);
+		assert.match(gate.notices[0], mode === "writes" ? /Every write and edit/ : /Every tool/);
+		assert.ok(gate.statuses.get("approve"));
+		await gate.call("write", { path: "file", content: "data" });
+		assert.equal(gate.prompts.length, 1);
+		await gate.restore([], "session_tree");
+		assert.equal(gate.statuses.get("approve"), undefined);
+		await gate.call("write", { path: "file", content: "data" });
+		assert.equal(gate.prompts.length, 1);
+	}
+});
+
+test("restored tool selection reports exclusions without enabling them", async () => {
+	const gate = harness(toolsExtension, fixture());
+	await gate.restore();
+	assert.equal(gate.notices.length, 0);
+	await gate.restore([{ type: "custom", customType: "tools-config", data: { enabledTools: ["read", "write", "edit"] } }]);
+	assert.deepEqual(gate.activeTools(), ["read", "write", "edit"]);
+	assert.match(gate.notices[0], /excludes: bash/);
+	await gate.restore([{ type: "custom", customType: "tools-config", data: { enabledTools: ["read"] } }], "session_tree");
+	assert.deepEqual(gate.activeTools(), ["read"]);
+	assert.match(gate.notices[1], /bash, write, edit/);
+});
+
+test("policy fallback diagnostics are visible once in UI and on headless stderr", async () => {
+	for (const hasUI of [true, false]) {
+		for (const malformed of [false, true]) {
+			const cwd = fixture(undefined, null);
+			if (malformed) writeFileSync(join(cwd, "agent/guard-rules.json"), "{");
+			const gate = harness(permissionGate, cwd, hasUI);
+			const stderr = [];
+			const originalWrite = process.stderr.write;
+			process.stderr.write = text => { stderr.push(text); return true; };
+			try {
+				await gate.restore();
+				assert.equal((await gate.call("read", { path: ".env" })).block, true);
+				assert.equal((await gate.call("read", { path: ".env" })).block, true);
+			} finally { process.stderr.write = originalWrite; }
+			const diagnostics = hasUI ? gate.notices.filter(text => text.startsWith("Guard policy:")) : stderr;
+			assert.equal(diagnostics.length, 1);
+			assert.match(diagnostics[0], /built-in safety floor/);
+			assert.match(diagnostics[0], malformed ? /could not be parsed/ : /No guard-rules.json/);
+		}
+	}
+});
+
+
+test("compound project rules retain their literal operators", () => {
+	const cwd = fixture({ bashPatterns: [{ pattern: "git status && git diff", reason: "compound project policy" }] });
+	assert.equal(rules.policyDecision("bash", { command: "git status && git diff" }, cwd).ask, false);
 });
