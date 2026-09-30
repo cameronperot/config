@@ -26,7 +26,12 @@ local M = {
             },
         })
 
+        local rust_analyzer = vim.fn.expand("~/.cargo/bin/rust-analyzer")
+        if vim.fn.executable(rust_analyzer) ~= 1 then
+            rust_analyzer = vim.fn.stdpath("data") .. "/mason/bin/rust-analyzer"
+        end
         vim.lsp.config("rust_analyzer", {
+            cmd = { rust_analyzer },
             settings = {
                 ["rust-analyzer"] = {
                     checkOnSave = {
@@ -41,6 +46,7 @@ local M = {
                 },
             },
         })
+        vim.lsp.enable("rust_analyzer")
 
         vim.lsp.config("lua_ls", {
             settings = {

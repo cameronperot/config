@@ -46,6 +46,9 @@ local M = {
     },
     config = function()
         require("telescope").setup({
+            defaults = {
+                preview = { check_mime_type = false },
+            },
             extensions = {
                 fzf = {
                     fuzzy = true,

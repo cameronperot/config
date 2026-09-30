@@ -137,11 +137,9 @@ include:
         include:
           - init.lua
           - init-vscode.lua
+          - lazy-lock.json
           - lua
           - stylua.sh
-        exclude:
-          - pattern: '^lazy-lock\.json$'
-            optional: true
       - pnpm
       - ranger
       - rofi

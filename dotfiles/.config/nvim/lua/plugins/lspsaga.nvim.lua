@@ -28,6 +28,7 @@ local M = {
         { "]d", "<Cmd>Lspsaga diagnostic_jump_next<CR>", desc = "LSP: Next diagnostic" },
     },
     opts = {
+        hover = { open_link = {} },
         symbol_in_winbar = { enable = false },
         lightbulb = { enable = false },
     },

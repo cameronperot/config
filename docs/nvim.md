@@ -39,7 +39,9 @@ The [micromamba `dev` environment](../environment.yml) includes `pynvim`, `debug
 
 [lazy.nvim](https://github.com/folke/lazy.nvim) clones itself into Neovim's data directory if absent and installs the declared plugins on first launch. Most UI and editing plugins load on a key, command, filetype, or event. Onedark, Snacks, and the two Treesitter plugins are explicitly loaded at startup. LSP setup can load Blink before its normal `InsertEnter` trigger because Blink is an LSP dependency.
 
-Plugin versions are only partly constrained: Telescope uses `0.2.1`, Blink uses `1.*`, Rustaceanvim uses `^5`, Neo-tree uses `v3.x`, and both Treesitter plugins use `main`. The [sync manifest](../dotfiles.yaml) excludes `lazy-lock.json`, so the repository does not preserve a complete set of plugin revisions across machines.
+Plugin specs constrain some versions: Telescope uses `0.2.1`, Blink uses `1.*`, Neo-tree uses `v3.x`, and both Treesitter plugins use `main`. The repository includes [`lazy-lock.json`](../dotfiles/.config/nvim/lazy-lock.json), which records exact plugin Git revisions. The [sync manifest](../dotfiles.yaml) includes it when copying local dotfiles back into the repository, and installation copies it to the destination Neovim configuration.
+
+After deploying the configuration, use `:Lazy restore` to match installed plugins to the lockfile. Plugin updates rewrite the local lockfile; review revision changes before syncing and committing them. The lockfile does not pin Mason packages or other external tools, and the initial lazy.nvim bootstrap still clones its `stable` branch.
 
 ## Editor defaults
 
@@ -83,6 +85,8 @@ The leader key is Neovim's default, **`\`**: `<Leader>ff` means press `\`, then 
 | `<Leader>zm` | Toggle Zen mode, configured to half the editor width |
 
 Neo-tree opens on the right at width 48, follows the current file, shows dotfiles and Git-ignored entries, groups empty directories, and closes when a file is opened. Inside its window, `h` closes a node and `l` opens it. Bufferline entries are buffers, not Neovim tab pages.
+
+Telescope disables shell-based MIME detection for previews to prevent filenames from being interpreted as shell commands.
 
 `Ctrl+Q` is disabled in Normal, Visual, Select, and Operator-pending modes.
 
@@ -149,7 +153,7 @@ The selection keys work in Visual and Operator-pending modes, for example `vaf` 
 | Language | Server | Local customization |
 | :--- | :--- | :--- |
 | Python | `pyright` | Provider interpreter as initial Python path; push and pull diagnostic handlers suppressed |
-| Rust | `rust_analyzer` | Clippy check-on-save setting, all Cargo features, diagnostics enabled; see the Rust caveat below |
+| Rust | `rust_analyzer` | Neovim's built-in LSP, with Clippy check-on-save setting, all Cargo features, and diagnostics enabled |
 | C/C++ | `clangd` | Server defaults |
 | JSON | `jsonls` | Server defaults |
 | LaTeX | `texlab` | Server defaults |
@@ -178,7 +182,7 @@ Julia has a parser but its Mason server entry is commented out. There is no conf
 | `<Leader>xL` / `<Leader>xQ` | Toggle location list / quickfix list in Trouble |
 | `<Leader>dg` | Generate documentation with Neogen; Python uses reStructuredText annotations |
 
-LSP actions depend on an attached server and its capabilities. Lspsaga disables its lightbulb and symbol winbar. `gt`, `gT`, and `gr` replace their usual Normal-mode meanings.
+LSP actions depend on an attached server and its capabilities. Lspsaga disables its lightbulb, symbol winbar, and hover-link mapping; its shell-based link opener is not bound to a key. `gt`, `gT`, and `gr` replace their usual Normal-mode meanings.
 
 ### ALE linting and fixing
 
@@ -202,7 +206,7 @@ ALE's Python uv options are enabled for Ruff and ty. Paths matching `lsq/ccxt` d
 The Python provider, project interpreter, and debugger interpreter have separate roles:
 
 - The Neovim Python provider remains `~/.micromamba/envs/dev/bin/python` and needs `pynvim`.
-- `<Leader>pv` opens `:VenvSelect` through Telescope. In addition to the selector's default searches, the configuration searches `~/.micromamba/envs` with `fd`.
+- `<Leader>pv` opens `:VenvSelect` through Telescope using the `cameronperot/venv-selector.nvim` fork. In addition to the selector's default searches, the configuration searches `~/.micromamba/envs` with `fd`. `options.auto_install_script_dependencies = false` disables automatic script dependency installation; script interpreter discovery runs offline with Python downloads disabled.
 - On a Python `FileType` event, the custom hook attempts to activate `.venv/bin/python` under Neovim's **current working directory**. After its first successful activation, that hook stops looking for another environment for the rest of the session; use the selector when changing projects.
 - Each environment activation reconfigures `dap-python` to run its adapter with the selected Python. That interpreter must have `debugpy`; this is separate from the provider's `pynvim` requirement. See [dap-python's interpreter requirements](https://github.com/mfussenegger/nvim-dap-python#usage).
 
@@ -233,7 +237,7 @@ The Python provider, project interpreter, and debugger interpreter have separate
 
 The UI opens when debugging initializes and closes on termination or exit. Scopes, breakpoints, stacks, and watches appear on the left; REPL and console appear below.
 
-Rustaceanvim adds `<Leader>rh` for hover actions and `<Leader>ra` for Rust code actions, scoped to Rust files. **The Rust LSP configuration overlaps:** Mason's automatic enablement includes `rust_analyzer`, and Rustaceanvim also starts a Rust client. This can attach two clients to the same file, with separate settings. [Rustaceanvim advises against also setting up rust-analyzer separately](https://github.com/mrcjkb/rustaceanvim#quick-setup). Resolve which integration owns the server before relying on a single set of diagnostics or actions.
+Rust uses Neovim's built-in LSP through [`nvim-lspconfig.lua`](../dotfiles/.config/nvim/lua/plugins/nvim-lspconfig.lua), which explicitly enables `rust_analyzer`. It prefers `~/.cargo/bin/rust-analyzer` when executable, falling back to the absolute Mason path under Neovim's data directory. Server settings are defined in the Neovim configuration; `.vscode/settings.json` and `rust-analyzer.json` are not loaded to select the executable. Use the shared `K` hover and `<Leader>ca` code-action mappings. Normal Rust analysis can still execute project build scripts and procedural macros; these controls do not sandbox untrusted projects.
 
 ## Git
 
