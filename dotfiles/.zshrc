@@ -6,21 +6,22 @@ zstyle :omz:update mode disabled
 
 # Keep the basic shell usable if plugin installation fails
 () {
-    local pin="9bb69ab99c6f05d6e6ae237f7ce222eeeb5b4a14" bootstrap
+    local pin="9bb69ab99c6f05d6e6ae237f7ce222eeeb5b4a14"
     local bundle_txt="${HOME}/.zsh_plugins.txt" bundle_zsh="${HOME}/.zsh_plugins.zsh" bundle_tmp
     if [[ ! -e "${HOME}/.antidote" && ! -L "${HOME}/.antidote" ]]; then
-        bootstrap="$(mktemp -d "${HOME}/.antidote-bootstrap.XXXXXX")" || return 1
-        {
-            git clone --depth 1 --branch v2.3.0 https://github.com/mattmc3/antidote "${bootstrap}/repo" || return 1
-            [[ "$(git -C "${bootstrap}/repo" rev-parse HEAD)" == "$pin" ]] || {
-                print -u2 -- "zshrc: downloaded antidote does not match the pinned commit"
-                return 1
-            }
-            # A concurrent shell may have installed the same release already
-            mv -T -n -- "${bootstrap}/repo" "${HOME}/.antidote" || return 1
-        } always {
-            rm -rf -- "$bootstrap"
-        }
+        mkdir -p -- "${HOME}/.antidote" || return 1
+    fi
+    if [[ -d "${HOME}/.antidote" && ! -L "${HOME}/.antidote" ]]; then
+        (
+            local lock_fd
+            # Lock the directory itself so a mounted volume stays empty for git clone.
+            exec {lock_fd}< "${HOME}/.antidote" || exit 1
+            flock -x "$lock_fd" || exit 1
+            local -a entries=("${HOME}/.antidote"/*(ND))
+            if (( ${#entries} == 0 )); then
+                git clone --depth 1 --branch v2.3.0 https://github.com/mattmc3/antidote "${HOME}/.antidote" || exit 1
+            fi
+        ) || return 1
     fi
     # Refuse to run an antidote that drifted from the pin (antidote update self-pulls)
     if [[ ! -s "${HOME}/.antidote/antidote.zsh" || "$(git -C "${HOME}/.antidote" rev-parse HEAD)" != "$pin" ]]; then
