@@ -1,6 +1,7 @@
 # VS Code
 
-The checked-in [settings](../dotfiles/.config/Code/User/settings.json) and [key bindings](../dotfiles/.config/Code/User/keybindings.json) deploy to `~/.config/Code/User/`. They use JSON with comments and configure Neovim integration, Python/Ruff, Jupyter notebooks, Julia, and terminal profiles. `install.py` copies these files but does not install VS Code extensions or rewrite the account-specific paths.
+The checked-in [settings](../dotfiles/.config/Code/User/settings.json) and [key bindings](../dotfiles/.config/Code/User/keybindings.json) deploy to `~/.config/Code/User/` only when `~/.config/Code` is missing.
+The settings use JSON with comments and configure Neovim integration, Python/Ruff, Jupyter notebooks, Julia, and terminal profiles.
 
 ## Setup
 

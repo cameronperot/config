@@ -4,7 +4,7 @@ The [Lua configuration](../dotfiles/.config/nvim/) combines Telescope and Neo-tr
 
 ## Installation and requirements
 
-[`install.py`](../install.py) downloads the requested Neovim AppImage to `~/bin/nvim` and copies the repository's dotfiles, including this configuration, into the home directory. The default release channel is `stable`. `--neovim-version none` skips the Neovim download but still copies dotfiles; `--dry-run` previews the copy. On systems without FUSE, `--extract-appimage` extracts the AppImage and makes `~/bin/nvim` a symlink to the extracted executable. See the [installation instructions](../README.md#install).
+[`install.py`](../install.py) copies the repository's dotfiles, including this configuration, into the home directory and skips the Neovim download by default (`--neovim-version none`). Pass `--neovim-version stable`, `nightly`, or a release tag to install a Neovim AppImage to `~/bin/nvim`; `--dry-run` previews the copy. On systems without FUSE, `--extract-appimage` extracts the AppImage and makes `~/bin/nvim` a symlink to the extracted executable. See the [installation instructions](../README.md#install).
 
 Check `nvim --version` and `command -v nvim` to confirm which binary the shell runs. The configuration uses `vim.lsp.config`, introduced in Neovim 0.11, but the unpinned Treesitter `main` branch currently requires **Neovim 0.12+** and **tree-sitter CLI 0.26.1+**. Check the [upstream Treesitter requirements](https://github.com/nvim-treesitter/nvim-treesitter#requirements) when choosing or updating Neovim; the installer's release argument does not validate plugin compatibility.
 

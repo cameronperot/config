@@ -24,7 +24,7 @@ class EnvironmentInstaller:
 
     def __init__(
         self,
-        neovim_version: str = "stable",
+        neovim_version: str = "none",
         extract_appimage: bool = False,
         dry_run: bool = False,
         home_dir: Path | None = None,
@@ -153,13 +153,20 @@ class EnvironmentInstaller:
         dest_dir = self._home_dir
 
         # run the command; never deploy local aider history
-        command = [
-            "rsync",
-            "-av",
-            "--exclude=.aider*",
-            str(source_dir) + "/",
-            str(dest_dir) + "/",
-        ]
+        command = ["rsync", "-av", "--exclude=.aider*"]
+        protected_paths = (
+            ".gitconfig",
+            ".config/sway",
+            ".config/waybar",
+            ".config/Code",
+        )
+        for relative_path in protected_paths:
+            destination = dest_dir / relative_path
+            if destination.exists() or destination.is_symlink():
+                command.append(f"--exclude=/{relative_path}")
+                self._logger.info(f"Skipping existing configuration: {destination}")
+
+        command.extend((str(source_dir) + "/", str(dest_dir) + "/"))
         if self._dry_run:
             command.append("--dry-run")
         self._run_command(command)
@@ -231,11 +238,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--neovim-version",
         action="store",
         type=str,
-        default="stable",
+        default="none",
         metavar="<NVIM_VERSION>",
         help=(
             "Version of Neovim to install, e.g., v0.11.0, stable, or nightly. "
-            "Use 'none' to skip."
+            "Use 'none' to skip (default)."
         ),
     )
     parser.add_argument(

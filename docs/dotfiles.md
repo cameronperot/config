@@ -2,7 +2,7 @@
 
 [`install.py`](../install.py) copies the repository's `dotfiles/` tree into `$HOME`. [`sync_dotfiles.py`](../sync_dotfiles.py) works in the other direction, using [`dotfiles.yaml`](../dotfiles.yaml) to select files.
 
-The manifest controls syncing back into the repository, not installation. The installer copies the whole dotfiles tree except `.aider*` entries and can overwrite existing home configuration; see [installation](../README.md#install). Syncing treats `$HOME` as the source of truth and never edits it.
+The manifest controls syncing back into the repository, not installation. The installer excludes `.aider*` entries and preserves existing `~/.gitconfig`, `~/.config/sway`, `~/.config/waybar`, and `~/.config/Code` paths. Other home configuration can still be overwritten; see [installation](../README.md#install). Syncing treats `$HOME` as the source of truth and never edits it.
 
 ## Requirements
 

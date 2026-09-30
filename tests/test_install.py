@@ -6,8 +6,159 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from conftest import snapshot, write_tree
 
 import install
+
+PROTECTED_CONFIGS = (
+    (".gitconfig", ".gitconfig"),
+    (".config/sway", ".config/sway/config"),
+    (".config/waybar", ".config/waybar/config"),
+    (".config/Code", ".config/Code/User/settings.json"),
+)
+
+
+@pytest.fixture
+def copy_env(tmp_path):
+    """Build temporary home and repository trees for real rsync calls."""
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    (home / ".config").mkdir(parents=True)
+    write_tree(
+        root=repo / "dotfiles",
+        files={
+            relative_file: "repository defaults\n"
+            for _, relative_file in PROTECTED_CONFIGS
+        },
+    )
+    return home, repo
+
+
+@pytest.mark.parametrize(("relative_path", "relative_file"), PROTECTED_CONFIGS)
+def test_copy_dotfiles_preserves_existing_configuration(
+    copy_env, relative_path, relative_file
+):
+    home, repo = copy_env
+    write_tree(root=home, files={relative_file: "custom configuration\n"})
+    target = home / relative_file
+    target.chmod(0o600)
+    before = snapshot(home)
+    installer = install.EnvironmentInstaller(home_dir=home, repo_dir=repo)
+
+    installer.copy_dotfiles()
+
+    assert snapshot(home)[relative_file] == before[relative_file]
+
+
+@pytest.mark.parametrize(
+    "relative_path", (".config/sway", ".config/waybar", ".config/Code")
+)
+@pytest.mark.parametrize(
+    "existing_files", ({}, {"custom.conf": "custom configuration\n"})
+)
+def test_copy_dotfiles_skips_entire_existing_directory(
+    copy_env, relative_path, existing_files
+):
+    home, repo = copy_env
+    target = home / relative_path
+    target.mkdir()
+    write_tree(root=target, files=existing_files)
+    target.chmod(0o700)
+    before = snapshot(target)
+    before_stat = target.stat()
+    installer = install.EnvironmentInstaller(home_dir=home, repo_dir=repo)
+
+    installer.copy_dotfiles()
+
+    assert snapshot(target) == before
+    assert target.stat().st_mode == before_stat.st_mode
+    assert target.stat().st_mtime_ns == before_stat.st_mtime_ns
+
+
+@pytest.mark.parametrize(("relative_path", "relative_file"), PROTECTED_CONFIGS)
+def test_copy_dotfiles_installs_missing_configuration(
+    copy_env, relative_path, relative_file
+):
+    home, repo = copy_env
+    installer = install.EnvironmentInstaller(home_dir=home, repo_dir=repo)
+
+    installer.copy_dotfiles()
+
+    assert (home / relative_file).read_text() == "repository defaults\n"
+
+
+@pytest.mark.parametrize("relative_path", tuple(path for path, _ in PROTECTED_CONFIGS))
+@pytest.mark.parametrize("target_root", ("repo/dotfiles", "missing"))
+def test_copy_dotfiles_preserves_configuration_symlinks(
+    copy_env, tmp_path, relative_path, target_root
+):
+    home, repo = copy_env
+    target = tmp_path / target_root / relative_path
+    link = home / relative_path
+    link.symlink_to(target)
+    before = snapshot(repo)
+    installer = install.EnvironmentInstaller(home_dir=home, repo_dir=repo)
+
+    installer.copy_dotfiles()
+
+    assert link.is_symlink()
+    assert link.readlink() == target
+    assert snapshot(repo) == before
+    assert not (tmp_path / "missing").exists()
+
+
+@pytest.mark.parametrize(("relative_path", "relative_file"), PROTECTED_CONFIGS)
+def test_copy_dotfiles_dry_run_skips_existing_configuration(
+    copy_env, caplog, relative_path, relative_file
+):
+    home, repo = copy_env
+    write_tree(root=home, files={relative_file: "custom configuration\n"})
+    before = snapshot(home)
+    installer = install.EnvironmentInstaller(home_dir=home, repo_dir=repo, dry_run=True)
+
+    with caplog.at_level(logging.INFO):
+        installer.copy_dotfiles()
+
+    assert snapshot(home) == before
+    assert f"Skipping existing configuration: {home / relative_path}" in caplog.text
+    assert relative_file not in caplog.text.splitlines()
+
+
+def test_copy_dotfiles_dry_run_previews_missing_configuration(copy_env, caplog):
+    home, repo = copy_env
+    before = snapshot(home)
+    installer = install.EnvironmentInstaller(home_dir=home, repo_dir=repo, dry_run=True)
+
+    with caplog.at_level(logging.INFO):
+        installer.copy_dotfiles()
+
+    assert snapshot(home) == before
+    assert ".gitconfig" in caplog.text.splitlines()
+    assert ".config/sway/config" in caplog.text.splitlines()
+    assert ".config/waybar/config" in caplog.text.splitlines()
+    assert ".config/Code/User/settings.json" in caplog.text.splitlines()
+
+
+def test_copy_dotfiles_updates_unprotected_files(copy_env):
+    home, repo = copy_env
+    write_tree(root=home, files={".gitconfig": "custom git\n", ".zshrc": "old\n"})
+    write_tree(
+        root=repo / "dotfiles",
+        files={
+            ".zshrc": "updated shell\n",
+            "nested/.gitconfig": "nested git\n",
+            ".config/Code-extra/settings.json": "other editor\n",
+            ".aider.history": "local history\n",
+        },
+    )
+    installer = install.EnvironmentInstaller(home_dir=home, repo_dir=repo)
+
+    installer.copy_dotfiles()
+
+    assert (home / ".zshrc").read_text() == "updated shell\n"
+    assert (home / "nested/.gitconfig").read_text() == "nested git\n"
+    assert (home / ".config/Code-extra/settings.json").read_text() == "other editor\n"
+    assert not (home / ".aider.history").exists()
 
 
 class RecordingInstaller(install.EnvironmentInstaller):
@@ -56,7 +207,7 @@ def make_installer(tmp_path, recorder, **kwargs):
 def test_parse_args_defaults():
     args = install.parse_args([])
 
-    assert args.neovim_version == "stable"
+    assert args.neovim_version == "none"
     assert args.extract_appimage is False
     assert args.dry_run is False
 
@@ -105,11 +256,12 @@ def test_wget_is_required_only_when_neovim_is_installed(tmp_path, monkeypatch):
         install.shutil, "which", lambda command: command if command in present else None
     )
 
+    make_installer(tmp_path, [])._check_dependencies()
     make_installer(tmp_path, [], neovim_version="none")._check_dependencies()
     make_installer(tmp_path, [], dry_run=True)._check_dependencies()
 
     with pytest.raises(SystemExit):
-        make_installer(tmp_path, [])._check_dependencies()
+        make_installer(tmp_path, [], neovim_version="stable")._check_dependencies()
 
 
 def test_unsupported_architecture_exits_one(tmp_path, monkeypatch, caplog):
@@ -144,7 +296,7 @@ def test_neovim_appimage_url_follows_the_architecture(
 def test_neovim_install_downloads_and_marks_executable(tmp_path, monkeypatch):
     monkeypatch.setattr(install.platform, "machine", lambda: "x86_64")
     recorder = []
-    installer = make_installer(tmp_path, recorder)
+    installer = make_installer(tmp_path, recorder, neovim_version="stable")
 
     installer.install_neovim()
 
@@ -159,7 +311,9 @@ def test_neovim_install_downloads_and_marks_executable(tmp_path, monkeypatch):
 def test_extract_appimage_adds_the_extraction_sequence(tmp_path, monkeypatch):
     monkeypatch.setattr(install.platform, "machine", lambda: "x86_64")
     recorder = []
-    installer = make_installer(tmp_path, recorder, extract_appimage=True)
+    installer = make_installer(
+        tmp_path, recorder, neovim_version="stable", extract_appimage=True
+    )
 
     installer.install_neovim()
 

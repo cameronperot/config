@@ -6,7 +6,7 @@ Configuration and setup scripts for a Linux development environment built around
 
 | Path | Purpose |
 | :--- | :--- |
-| `install.py` | Rsyncs `dotfiles/` into `$HOME`, installs Neovim, and adjusts the deployed copies to the host |
+| `install.py` | Rsyncs `dotfiles/` into `$HOME`, optionally installs Neovim, and adjusts the deployed copies to the host |
 | `dotfiles/` | Tracked dotfiles |
 | `dotfiles/bin/` | User scripts deployed to `~/bin` |
 | `dotfiles/bin/agent-sandbox` | Python 3.12+ wrapper for `unshare`/bubblewrap isolation |
@@ -33,11 +33,13 @@ cd environment-setup
 
 Options:
 
-- `--neovim-version <version>`: Neovim release to install (default `stable`; `none` skips it)
+- `--neovim-version <version>`: Neovim release to install (default `none` skips it; use `stable`, `nightly`, or a release tag to install)
 - `--extract-appimage`: extract the appimage instead of running it directly (systems without FUSE)
 - `--dry-run`: preview the dotfile changes without modifying anything
 
 `make install` takes `NEOVIM_VERSION=vX.Y.Z` and `EXTRACT_APPIMAGE=1` for the same options.
+
+The installer preserves existing `~/.gitconfig`, `~/.config/sway`, `~/.config/waybar`, and `~/.config/Code` paths, including symlinks and broken symlinks.
 
 ## Documentation
 

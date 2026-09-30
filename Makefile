@@ -1,6 +1,6 @@
 CONTAINER_COMPOSE ?= podman-compose
 MICROMAMBA ?= micromamba
-NEOVIM_VERSION ?= stable
+NEOVIM_VERSION ?= none
 
 .DEFAULT_GOAL := help
 .PHONY: help install update-dotfiles test test-cov container-build mamba-install \
