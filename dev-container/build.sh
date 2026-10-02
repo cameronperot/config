@@ -13,4 +13,5 @@ podman build \
     --build-arg "NEW_UID=$(id -u)" \
     --build-arg "NEW_GID=$(id -g)" \
     -t dev:latest \
+    "$@" \
     -f dev-container/Containerfile .

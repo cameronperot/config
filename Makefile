@@ -26,8 +26,8 @@ test-cov: ## Run the test suite with a coverage report
 	uv run --no-project --with pytest --with pytest-cov --with pyyaml \
 		pytest --cov=sync_dotfiles --cov=install --cov=dotfiles --cov-report=term-missing
 
-container-build: ## Build the dev container image (dev:latest)
-	./dev-container/build.sh
+container-build: ## Build the dev container image (dev:latest; ARGS is passed through to podman build, e.g. ARGS=--no-cache)
+	./dev-container/build.sh $(ARGS)
 
 mamba-install: ## Install micromamba
 	curl -Ls https://raw.githubusercontent.com/cameronperot/shell-scripts/refs/heads/master/scripts/install_micromamba.sh | bash

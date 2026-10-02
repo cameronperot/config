@@ -5,7 +5,7 @@
 | File | Purpose |
 | :--- | :--- |
 | `Containerfile` | Image: Debian 13, user `user` (`/home/user`), micromamba env `dev`, uv, the coding agents, dotfiles via `install.py` |
-| `build.sh` | Builds the image from the repository root with the builder's UID/GID and `GIT_SIGNING_KEY` |
+| `build.sh` | Builds the image from the repository root with the builder's UID/GID and `GIT_SIGNING_KEY`; extra arguments go to `podman build` |
 | `compose.yml` | Long-running JupyterLab container `dev_container` |
 | `entrypoint.sh` | Execs the command; under `--runtime=krun` first drops from guest root to the image user, disables TIOCSTI and, when signing is enabled, bridges the TCP signer to `SSH_AUTH_SOCK` |
 | `jupyter_server_config.py` | JupyterLab settings baked into the image (root `/work`, token `dev`) |
@@ -15,6 +15,7 @@
 GIT_SIGNING_KEY="$(cat ~/.ssh/llm_agent_ed25519.pub)" ./dev-container/build.sh   # or: make container-build
 ```
 - The build context is the repository root, filtered by `.containerignore`. `GIT_SIGNING_KEY` (see [Commit Signing](#commit-signing)) is written into the image's git config.
+- Extra arguments are forwarded to `podman build` (e.g. `./dev-container/build.sh --no-cache`); with `make container-build`, pass them via `ARGS` (e.g. `make container-build ARGS=--no-cache`).
 - The image user takes the builder's UID/GID and containers run with `--userns keep-id`, so each host user builds their own image and rebuilds after a UID change.
 
 ## Run
