@@ -1,5 +1,6 @@
 local M = {
     "MeanderingProgrammer/render-markdown.nvim",
+    commit = "640a3ec6d538bad17c328be373c7cad0293d9589",
     ft = { "markdown" },
     dependencies = {
         "nvim-treesitter/nvim-treesitter",

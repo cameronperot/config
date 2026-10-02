@@ -6,7 +6,7 @@ The [Lua configuration](../dotfiles/.config/nvim/) combines Telescope and Neo-tr
 
 [`install.py`](../install.py) copies the repository's dotfiles, including this configuration, into the home directory and skips the Neovim download by default (`--neovim-version none`). Pass `--neovim-version stable`, `nightly`, or a release tag to install a Neovim AppImage to `~/bin/nvim`; `--dry-run` previews the copy. On systems without FUSE, `--extract-appimage` extracts the AppImage and makes `~/bin/nvim` a symlink to the extracted executable. See the [installation instructions](../README.md#install).
 
-Check `nvim --version` and `command -v nvim` to confirm which binary the shell runs. The configuration uses `vim.lsp.config`, introduced in Neovim 0.11, but the unpinned Treesitter `main` branch currently requires **Neovim 0.12+** and **tree-sitter CLI 0.26.1+**. Check the [upstream Treesitter requirements](https://github.com/nvim-treesitter/nvim-treesitter#requirements) when choosing or updating Neovim; the installer's release argument does not validate plugin compatibility.
+Check `nvim --version` and `command -v nvim` to confirm which binary the shell runs. The configuration uses `vim.lsp.config`, introduced in Neovim 0.11, but the pinned Treesitter revision requires **Neovim 0.12+** and **tree-sitter CLI 0.26.1+**. Check the [pinned Treesitter requirements](https://github.com/nvim-treesitter/nvim-treesitter/blob/e6be2ff65d89df5039cad7a422600757bbf81d02/README.md#requirements) when choosing or updating Neovim; the installer's release argument does not validate plugin compatibility.
 
 | Tool | Used for |
 | :--- | :--- |
@@ -37,11 +37,13 @@ The [micromamba `dev` environment](../environment.yml) includes `pynvim`, `debug
 | [`lua/plugins/`](../dotfiles/.config/nvim/lua/plugins/) | Plugin declarations, load triggers, options, and mappings |
 | [`init-vscode.lua`](../dotfiles/.config/nvim/init-vscode.lua) | Alternate entry point for VS Code |
 
-[lazy.nvim](https://github.com/folke/lazy.nvim) clones itself into Neovim's data directory if absent and installs the declared plugins on first launch. Most UI and editing plugins load on a key, command, filetype, or event. Onedark, Snacks, and the two Treesitter plugins are explicitly loaded at startup. LSP setup can load Blink before its normal `InsertEnter` trigger because Blink is an LSP dependency.
+[lazy.nvim](https://github.com/folke/lazy.nvim) is cloned without a checkout into Neovim's data directory if absent. The bootstrap checks out and verifies its approved commit before loading it, including for existing installations; Git failures or tracked local modifications stop startup. It installs the declared plugins on first launch. Most UI and editing plugins load on a key, command, filetype, or event. Onedark, Snacks, and the two Treesitter plugins are explicitly loaded at startup. LSP setup can load Blink before its normal `InsertEnter` trigger because Blink is an LSP dependency.
 
-Plugin specs constrain some versions: Telescope uses `0.2.1`, Blink uses `1.*`, Neo-tree uses `v3.x`, and both Treesitter plugins use `main`. The repository includes [`lazy-lock.json`](../dotfiles/.config/nvim/lazy-lock.json), which records exact plugin Git revisions. The [sync manifest](../dotfiles.yaml) includes it when copying local dotfiles back into the repository, and installation copies it to the destination Neovim configuration.
+All 46 plugin targets, including lazy.nvim and seven dependency-only plugins, have explicit full-length commit pins matching [`lazy-lock.json`](../dotfiles/.config/nvim/lazy-lock.json). The dependency-only pins live in [`dependencies.lua`](../dotfiles/.config/nvim/lua/plugins/dependencies.lua) and retain lazy loading. Neo-tree and Treesitter retain branch names as repository metadata; their commit fields fix the actual revisions. The [sync manifest](../dotfiles.yaml) includes the lockfile when copying local dotfiles back into the repository, and installation copies it to the destination Neovim configuration.
 
-After deploying the configuration, use `:Lazy restore` to match installed plugins to the lockfile. Plugin updates rewrite the local lockfile; review revision changes before syncing and committing them. The lockfile does not pin Mason packages or other external tools, and the initial lazy.nvim bootstrap still clones its `stable` branch.
+After deploying the configuration, use `:Lazy restore` and restart Neovim to match installed plugins to the lockfile. Ordinary `:Lazy update` and `:Lazy sync` keep the explicit commit targets. To upgrade, review the upstream changes, update the relevant specification's commit and matching lockfile entry together, then restore and test. Change lazy.nvim's bootstrap commit in `init.lua` alongside its lockfile entry. Commit pins do not verify downloaded release binaries, external tools, or locally modified plugin files.
+
+Mason uses registry snapshot `2026-10-02-phobic-pull` and the eight server versions listed below, preserving the installation receipts used to establish these pins. The registry is a fixed release identifier, not a Git commit or an independently pinned archive hash. Its package downloads and transitive dependencies retain Mason's existing integrity behavior.
 
 ## Editor defaults
 
@@ -148,18 +150,20 @@ The selection keys work in Visual and Operator-pending modes, for example `vaf` 
 
 ## Language servers, diagnostics, and formatting
 
-[`mason-lspconfig.nvim.lua`](../dotfiles/.config/nvim/lua/plugins/mason-lspconfig.nvim.lua) requests the following servers. [Mason-lspconfig automatically enables Mason-installed servers by default](https://github.com/mason-org/mason-lspconfig.nvim#automatically-enable-installed-servers); the configuration leaves that behavior enabled.
+[`mason-lspconfig.nvim.lua`](../dotfiles/.config/nvim/lua/plugins/mason-lspconfig.nvim.lua) requests the following exact server versions. [Mason-lspconfig automatically enables Mason-installed servers by default](https://github.com/mason-org/mason-lspconfig.nvim#automatically-enable-installed-servers); the configuration leaves that behavior enabled.
 
-| Language | Server | Local customization |
-| :--- | :--- | :--- |
-| Python | `pyright` | Provider interpreter as initial Python path; push and pull diagnostic handlers suppressed |
-| Rust | `rust_analyzer` | Neovim's built-in LSP, with Clippy check-on-save setting, all Cargo features, and diagnostics enabled |
-| C/C++ | `clangd` | Server defaults |
-| JSON | `jsonls` | Server defaults |
-| LaTeX | `texlab` | Server defaults |
-| YAML | `yamlls` | Server defaults |
-| TOML | `taplo` | Server defaults |
-| Lua | `lua_ls` | Recognize `vim` as a global |
+| Language | Server | Pinned version | Local customization |
+| :--- | :--- | :--- | :--- |
+| Python | `pyright` | `1.1.409` | Provider interpreter as initial Python path; push and pull diagnostic handlers suppressed |
+| Rust | `rust_analyzer` | `2026-04-13` | Neovim's built-in LSP, with Clippy check-on-save setting, all Cargo features, and diagnostics enabled |
+| C/C++ | `clangd` | `22.1.0` | Server defaults |
+| JSON | `jsonls` | `4.10.0` | Server defaults |
+| LaTeX | `texlab` | `v5.25.1` | Server defaults |
+| YAML | `yamlls` | `1.22.0` | Server defaults |
+| TOML | `taplo` | `0.10.0` | Server defaults |
+| Lua | `lua_ls` | `3.18.2` | Recognize `vim` as a global |
+
+Automatic installation only fills missing packages; it does not reconcile an already installed version. Run `:MasonRestore` after deployment or after changing these pins, wait for the installations to finish in `:Mason`, then restart Neovim. This command passes all eight pinned server identifiers to Mason-lspconfig's `:LspInstall`, which also reinstalls existing packages. Installation failures remain visible through Mason. Explicit manual installation commands can select other versions; run `:MasonRestore` to return to the configured versions. The Rust pin applies to the Mason package; the preferred `~/.cargo/bin/rust-analyzer` executable remains separately managed, as described below.
 
 Julia has a parser but its Mason server entry is commented out. There is no configured JavaScript/TypeScript language server or parser installation entry.
 
@@ -276,7 +280,7 @@ VimTeX loads for TeX/LaTeX files, with selected overfull/underfull, hyperref, an
 
 ## VS Code
 
-[`init-vscode.lua`](../dotfiles/.config/nvim/init-vscode.lua) bootstraps lazy.nvim if absent, but its plugin setup call is commented out. It loads `core.options-vscode`, the shared core keymaps, `:Scratch`, and diagnostic settings. The VS Code options use a **98-column** marker and do not apply Onedark; they retain the Python provider path and save-time whitespace cleanup.
+[`init-vscode.lua`](../dotfiles/.config/nvim/init-vscode.lua) loads `core.options-vscode`, the shared core keymaps, `:Scratch`, and diagnostic settings without bootstrapping lazy.nvim or configuring plugins. The VS Code options use a **98-column** marker and do not apply Onedark; they retain the Python provider path and save-time whitespace cleanup.
 
 This entry point does not supply plugin mappings, completion, text objects, or language servers. Shared clipboard mappings for functions/classes still refer to Treesitter text objects, so those need separate support in the host setup. The [checked-in VS Code settings](../dotfiles/.config/Code/User/settings.json) point to `/home/user/bin/nvim` and `/home/user/.config/nvim/init-vscode.lua`; adjust both paths for the actual account. `install.py` does not rewrite those settings.
 
@@ -286,6 +290,7 @@ This entry point does not supply plugin mappings, completion, text objects, or l
 | :--- | :--- |
 | `:Lazy` | Inspect plugin load state, installation/build errors, and updates |
 | `:Mason` | Inspect installed language servers and manually install tools |
+| `:MasonRestore` | Reinstall the eight language servers at their configured versions |
 | `:checkhealth` | Check editor and plugin dependencies |
 | `:checkhealth vim.lsp` | Inspect LSP configuration and attached clients |
 | `:checkhealth vim.provider` | Check Python and clipboard providers |

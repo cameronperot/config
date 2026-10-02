@@ -1,6 +1,7 @@
 local M = {
     {
         "mfussenegger/nvim-dap",
+        commit = "cfa2d58f4537aca6ca83e2de1a0d9f1491121264",
         dependencies = {
             "rcarriga/nvim-dap-ui",
             "mfussenegger/nvim-dap-python",

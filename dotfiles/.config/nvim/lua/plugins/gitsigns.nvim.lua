@@ -1,5 +1,6 @@
 local M = {
     "lewis6991/gitsigns.nvim",
+    commit = "070a5d7b985546cc57e1fc61e5bc507fecac6045",
     event = { "BufReadPost", "BufNewFile", "FocusGained" },
     keys = {
         {

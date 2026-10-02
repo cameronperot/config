@@ -1,5 +1,6 @@
 local M = {
     "cameronperot/venv-selector.nvim",
+    commit = "05bd233ec2197c1c79143dbcb3951425e8a993d9",
     dependencies = {
         "neovim/nvim-lspconfig",
         "nvim-telescope/telescope.nvim",

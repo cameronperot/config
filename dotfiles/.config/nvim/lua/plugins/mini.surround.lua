@@ -1,6 +1,6 @@
 local M = {
     "nvim-mini/mini.surround",
-    version = "*",
+    commit = "580e4cb98c5900d9fe743865fb5a5b2178b4ab18",
     event = "VeryLazy",
     opts = {
         mappings = {

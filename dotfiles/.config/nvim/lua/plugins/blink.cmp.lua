@@ -1,7 +1,7 @@
 local M = {
     "saghen/blink.cmp",
+    commit = "78336bc89ee5365633bcf754d93df01678b5c08f",
     event = "InsertEnter",
-    version = "1.*",
     ---@module 'blink.cmp'
     ---@type blink.cmp.Config
     opts = {

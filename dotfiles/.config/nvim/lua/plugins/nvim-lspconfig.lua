@@ -1,5 +1,6 @@
 local M = {
     "neovim/nvim-lspconfig",
+    commit = "3e8d598d3b5f8338a41699c436e5fa11d2666cf0",
     dependencies = { "saghen/blink.cmp" },
     event = { "BufReadPre", "BufNewFile" },
     -- LSP keybindings handled by lspsaga.nvim

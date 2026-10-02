@@ -1,5 +1,6 @@
 local M = {
     "nvim-treesitter/nvim-treesitter-textobjects",
+    commit = "5c7b0263797dfd1bd6202f2b219f3b53a80b2187",
     branch = "main",
     lazy = false,
     dependencies = { "nvim-treesitter/nvim-treesitter" },

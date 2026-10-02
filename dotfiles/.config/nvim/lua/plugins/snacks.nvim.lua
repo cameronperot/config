@@ -1,5 +1,6 @@
 local M = {
     "folke/snacks.nvim",
+    commit = "882c996cf28183f4d63640de0b4c02ec886d01f2",
     lazy = false,
     priority = 1000,
     ---@type snacks.Config

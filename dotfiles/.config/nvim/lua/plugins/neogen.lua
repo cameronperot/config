@@ -1,5 +1,6 @@
 local M = {
     "danymat/neogen",
+    commit = "b2e78708876f4da507839726816010a68e33fec8",
     dependencies = "nvim-treesitter/nvim-treesitter",
     ft = {
         "python",
@@ -28,7 +29,6 @@ local M = {
             },
         })
     end,
-    version = "*",
 }
 
 return { M }

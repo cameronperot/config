@@ -1,5 +1,6 @@
 local M = {
     "nvim-neo-tree/neo-tree.nvim",
+    commit = "1a14083046d96e88e361d1da00761c40d45012f3",
     branch = "v3.x",
     dependencies = {
         "nvim-lua/plenary.nvim",

@@ -1,5 +1,6 @@
 local M = {
     "hedyhli/outline.nvim",
+    commit = "2a132953b944561d45b52e4541ebfff71934a742",
     lazy = true,
     cmd = { "Outline", "OutlineOpen" },
     opts = {

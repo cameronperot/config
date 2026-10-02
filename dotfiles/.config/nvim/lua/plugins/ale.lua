@@ -1,5 +1,6 @@
 local M = {
     "dense-analysis/ale",
+    commit = "e1789bc54483d76ac9ddb40b633d1645c8281914",
     event = { "BufReadPost", "BufWritePre" },
     ft = {
         "c",

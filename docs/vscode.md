@@ -21,7 +21,7 @@ The file also contains `vim.*` preferences, including `vim.neovimPath=/usr/bin/n
 
 ## Editor and Neovim behavior
 
-The VS Code settings enable relative line numbers, a 98-column ruler, word wrapping, and formatting on save. The [Neovim entry point](../dotfiles/.config/nvim/init-vscode.lua) bootstraps lazy.nvim but leaves plugin setup disabled. It loads the VS Code core options, shared keymaps, commands, and diagnostic settings. See [Neovim's VS Code notes](nvim.md#vs-code) for the shared mappings and their limitations.
+The VS Code settings enable relative line numbers, a 98-column ruler, word wrapping, and formatting on save. The [Neovim entry point](../dotfiles/.config/nvim/init-vscode.lua) loads the VS Code core options, shared keymaps, commands, and diagnostic settings without downloading lazy.nvim or configuring plugins. See [Neovim's VS Code notes](nvim.md#vs-code) for the shared mappings and their limitations.
 
 The Neovim options also apply save-time whitespace cleanup and select `~/.micromamba/envs/dev/bin/python` as the Python provider. `Ctrl+Shift+/` invokes the VS Code Neovim restart command.
 

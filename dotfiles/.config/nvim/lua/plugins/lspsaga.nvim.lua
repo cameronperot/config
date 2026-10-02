@@ -1,5 +1,6 @@
 local M = {
     "nvimdev/lspsaga.nvim",
+    commit = "cf6fc9473bba1d332eda9887855ea29ed9b37701",
     event = "LspAttach",
     dependencies = {
         "nvim-treesitter/nvim-treesitter",
