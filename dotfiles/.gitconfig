@@ -15,6 +15,16 @@
     diffFilter = delta --color-only
 [delta]
     navigate = true
+    dark = true
+    minus-style = normal "#75171a"
+    minus-emph-style = bold "#ffffff" "#da0023"
+    plus-style = syntax "#0b4112"
+    plus-emph-style = bold "#ffffff" "#008020"
+    line-numbers = true
+    line-numbers-minus-style = bold "#f76c66"
+    line-numbers-plus-style = bold "#34c448"
+[merge]
+    conflictStyle = zdiff3
 [pull]
     rebase = false
 [gc]
