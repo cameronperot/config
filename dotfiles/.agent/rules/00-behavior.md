@@ -21,3 +21,8 @@ Always address the user as "Grandmaster".
 
 ## Markdown
 - When writing markdown, do not limit the line length; sentences must not be broken with new lines.
+
+## Secrets
+- Never read the full `env` as it may contain secrets (e.g., API keys); look up specific variables by name when needed.
+- Never read any secret files (credentials, auth, keys, etc.) unless the user explicitly requests it in the conversation.
+- Never print, copy, commit, or forward secret values; reference them by name or path instead. If a secret is already exposed in the repo, report it rather than reproducing it.

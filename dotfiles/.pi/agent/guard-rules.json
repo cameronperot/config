@@ -42,7 +42,7 @@
     { "pattern": "\\brm\\s+(-[^\\s]*)*-[rRf]", "reason": "rm with recursive or force flags", "ask": true, "sandboxExemption": "host" },
     { "pattern": "\\brm\\s+--(recursive|force)\\b", "reason": "rm with --recursive or --force", "ask": true, "sandboxExemption": "host" },
     { "pattern": "\\bsudo\\b", "reason": "sudo (runs as root)", "ask": true, "sandboxExemption": "host" },
-    { "pattern": "\\b(chmod|chown)\\b[^|;]*\\b777\\b", "reason": "chmod/chown involving 777 (permissions or ownership)", "ask": true, "sandboxExemption": "tmp-permissions" },
+    { "pattern": "\\b(chmod|chown)\\b[^|;]*\\b777\\b", "reason": "chmod/chown involving 777 (permissions or ownership)", "ask": true, "sandboxExemption": "host" },
 
     { "pattern": "\\bgit\\s+reset\\b[^|;&\\n]*\\s--hard\\b", "reason": "git reset --hard discards uncommitted work (use --soft or stash)", "ask": true },
     { "pattern": "\\bgit\\s+clean\\s+(-[^\\s]*)*-[fd]", "reason": "git clean -f/-d deletes untracked files", "ask": true, "commandExemption": "git-dry-run" },

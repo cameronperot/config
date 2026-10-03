@@ -1,13 +1,7 @@
 # Global Agent Notes
 ## Environment
 
-When launched through `agent-sandbox`, system files and protected agent configuration are read-only, while the workspace, Git metadata, and agent state remain persistent and writable. You may inspect the repository and exposed documentation, configuration, and toolchains beyond the current working directory. Keep project changes within the task's scope. Use `/tmp` for disposable experiments and build output; changes there disappear when the sandbox exits. If a required resource is unavailable, report it rather than attempting to bypass isolation. Do not assume direct or explicitly unsandboxed launches have these protections.
-
-## Policy and Approvals
-
-`permission-gate.ts` enforces shared path and command policy before tool execution. Public SSH files (`~/.ssh/allowed_signers`, `~/.ssh/*.pub`) are readable but have read-only restrictions; private keys and credentials remain guarded. Literal search strings and metadata checks are permitted, and command exemptions apply separately to safely understood segments. A harmless first command never exempts a destructive second command.
-
-`/approve`, `/approve-all` and `/tools` restrictions persist on the active session branch. Restored approval modes and excluded tools are reported; do not interpret a resumed restriction as a broken tool or silently disable it. Headless approval requests leave the action unexecuted. Plannotator provides the planning workflow.
+You are running in a sandbox: system files and protected agent configuration are read-only, while the workspace, Git metadata, and agent state remain persistent and writable. You may inspect the repository and exposed documentation, configuration, and toolchains beyond the current working directory. Keep project changes within the task's scope. Use `/tmp` for disposable experiments and build output; changes there disappear when the sandbox exits. You do not have root or sudo privileges. If a required resource is unavailable, report it rather than attempting to bypass isolation.
 
 ## Extension Tools
 
@@ -30,6 +24,6 @@ Beyond the built-ins, three tools are registered and active by default:
 - `security-auditor` — read-only security audit of specified code/diff; reachable vulnerabilities with attack scenarios and remediation.
 - `pr-summarizer` — generates a PR/commit title and summary from the current git diff.
 
-Children cannot see this conversation and cannot delegate further — make each task well-defined and self-contained.
+Children cannot see this conversation and cannot delegate further — make each task well-defined and self-contained with appropriate context.
 
-When a child reports an approval request, review the exact tool input and working directory. Present the action through the parent's normal approval guards, execute it only after approval, then delegate any remaining work. Do not repeatedly send the blocked action back to a headless child. Hard policy blocks still require a policy decision from the user; they are not approval requests.
+When a child reports an approval request, review the exact tool input and working directory. Present the action through the parent's normal approval guards, execute it only after approval, then delegate any remaining work. Do not repeatedly send the blocked action back to a headless child.
