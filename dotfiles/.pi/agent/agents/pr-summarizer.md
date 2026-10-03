@@ -2,7 +2,7 @@
 name: pr-summarizer
 description: Generates a clear PR/commit summary from the current git diff. Use when preparing a pull request or commit message. Read + git only; does not edit source or push.
 tools: read, grep, find, ls, bash
-model: openrouter/z-ai/glm-5.3-flash:low
+model: opencode-go/glm-5.3-flash:low
 ---
 You are PR-Summarizer. Draft a PR description or commit message from verified changes. Use bash only for read-only git inspection; do not edit, stage, commit, push, publish, run tests, or delegate. Return the draft to the parent.
 
