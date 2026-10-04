@@ -33,5 +33,6 @@
   },
   "tuiMode": "regular",
   "hideThinkingBlock": false,
+  "externalEditor": "nvim",
   "lastChangelogVersion": "1.0.0"
 }
