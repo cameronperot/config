@@ -14,6 +14,7 @@
  * | `readOnlyPaths`        | Reads fine; write/edit and bash writes blocked.     |
  * | `noDeletePaths`        | Deletion and move-away blocked.                     |
  * | `bashPatterns`         | Regex over the bash command; `ask: true` confirms.  |
+ * |                        | Skipped entirely while the sandbox is active.       |
  *
  * JSON rather than YAML deliberately: Pi loads extensions through jiti with an
  * alias map covering only `@earendil-works/*` and `typebox`, and `~/.pi/agent`
@@ -27,20 +28,22 @@
  * recursion) does not try to load it as an extension.
  */
 
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 const HOME = homedir();
-// This is the launcher's mode indicator, not independent proof of isolation.
+// The launcher's mode indicator, not independent proof of isolation. While it
+// is set, bashPatterns are skipped wholesale — the filesystem damage they guard
+// against is contained by the sandbox — so the marker must never be exported
+// on the host. Path classes below remain active in either mode.
 const SANDBOX_ACTIVE = process.env.AGENT_SANDBOX_ACTIVE === "1" && !process.env.AGENT_SANDBOX_DISABLE;
 
 export interface BashPattern {
 	pattern: string;
 	reason: string;
 	ask?: boolean;
-	sandboxExemption?: "host" | "tmp-cleanup" | "tmp-permissions";
 	commandExemption?: "git-index" | "git-dry-run";
 }
 
@@ -77,9 +80,8 @@ const SAFETY_FLOOR: Rules = {
 			pattern: "\\brm\\s+(-[^\\s]*)*-[rRf]",
 			reason: "rm with recursive or force flags",
 			ask: true,
-			sandboxExemption: "tmp-cleanup",
 		},
-		{ pattern: "\\bsudo\\b", reason: "sudo (runs as root)", ask: true, sandboxExemption: "host" },
+		{ pattern: "\\bsudo\\b", reason: "sudo (runs as root)", ask: true },
 	],
 };
 
@@ -108,10 +110,6 @@ function isBashPatternArray(value: unknown): value is BashPattern[] {
 				typeof (entry as BashPattern).pattern === "string" &&
 				typeof (entry as BashPattern).reason === "string" &&
 				((entry as BashPattern).ask === undefined || typeof (entry as BashPattern).ask === "boolean") &&
-				((entry as BashPattern).sandboxExemption === undefined ||
-					(entry as BashPattern).sandboxExemption === "host" ||
-					(entry as BashPattern).sandboxExemption === "tmp-cleanup" ||
-					(entry as BashPattern).sandboxExemption === "tmp-permissions") &&
 				((entry as BashPattern).commandExemption === undefined ||
 					(entry as BashPattern).commandExemption === "git-index" ||
 					(entry as BashPattern).commandExemption === "git-dry-run"),
@@ -409,50 +407,6 @@ function contentPaths(command: string): string[] | undefined {
 	return words.length > index ? words.slice(index + 1) : undefined;
 }
 
-/** Missing targets are safe only when their nearest existing ancestor resolves inside /tmp. */
-function isTemporaryTarget(target: string): boolean {
-	if (!target.startsWith("/tmp/") || target.split("/").includes("..") || resolve(target) === "/tmp") return false;
-	let ancestor = target;
-	while (!lstatSync(ancestor, { throwIfNoEntry: false })) ancestor = dirname(ancestor);
-	try {
-		const real = realpathSync(ancestor);
-		return real === "/tmp" || real.startsWith("/tmp/");
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-		throw err;
-	}
-}
-
-/** Only exempt a literal rm segment with targets beneath ephemeral /tmp. */
-function isTemporaryCleanup(command: string): boolean {
-	const parsed = literalWords(command);
-	if (!parsed) return false;
-	const words = parsed.map((word) => word.value);
-	if (words.shift() !== "rm") return false;
-	while (words.length > 0 && /^(?:-[rRf]+|--recursive|--force)$/.test(words[0])) words.shift();
-	if (words[0] === "--") words.shift();
-	return words.length > 0 && words.every(isTemporaryTarget);
-}
-
-/** Permission changes affect inodes, so exclude other filesystems, special files and shared hard links. */
-function isTemporaryPermissionChange(command: string): boolean {
-	const parsed = literalWords(command);
-	if (!parsed) return false;
-	const words = parsed.map((word) => word.value);
-	if (!["chmod", "chown"].includes(words.shift() ?? "")) return false;
-	while (words.length > 0 && /^(?:-[vcf]+|--verbose|--changes|--silent|--quiet)$/.test(words[0])) words.shift();
-	if (words[0] === "--") words.shift();
-	const modeOrOwner = words.shift();
-	if (!modeOrOwner || modeOrOwner.startsWith("-")) return false;
-	if (words[0] === "--") words.shift();
-	return words.length > 0 && words.every((target) => {
-		if (!isTemporaryTarget(target)) return false;
-		const stat = statSync(target, { throwIfNoEntry: false });
-		return stat !== undefined && stat.dev === statSync("/tmp").dev &&
-			(stat.isDirectory() || (stat.isFile() && stat.nlink === 1));
-	});
-}
-
 function isHarmlessGitCommand(command: string, exemption: BashPattern["commandExemption"]): boolean {
 	const words = literalWords(command)?.map((word) => word.value);
 	if (!words || words[0] !== "git") return false;
@@ -471,8 +425,14 @@ function isHarmlessGitCommand(command: string, exemption: BashPattern["commandEx
 		flags.every((flag) => ["--dry-run", "--verbose"].includes(flag) || /^-[ndfxXv]+$/.test(flag));
 }
 
-/** Match both the original command and common Git global-option spellings. */
+/**
+ * Match both the original command and common Git global-option spellings.
+ * While the sandbox is active no command rule triggers at all — the marker is
+ * trusted to mean the filesystem damage these patterns guard against is
+ * contained — while the path classes stay enforced either way.
+ */
 export function matchingBashPatterns(command: string, cwd: string): CompiledBashPattern[] {
+	if (SANDBOX_ACTIVE) return [];
 	const segments = literalSegments(command);
 	const inspected = (segments ?? [command]).map((raw) => {
 		const words = segments ? literalWords(raw) : undefined;
@@ -504,10 +464,7 @@ export function matchingBashPatterns(command: string, cwd: string): CompiledBash
 			if (!regex.test(joined("inspected")) &&
 				!regex.test(joined("normalized"))) return [];
 		} else if (hits.every((segment) =>
-			(entry.commandExemption && isHarmlessGitCommand(segment.normalized, entry.commandExemption)) ||
-			(SANDBOX_ACTIVE && (entry.sandboxExemption === "host" ||
-				(entry.sandboxExemption === "tmp-cleanup" && isTemporaryCleanup(segment.raw)) ||
-				(entry.sandboxExemption === "tmp-permissions" && isTemporaryPermissionChange(segment.raw))))
+			entry.commandExemption !== undefined && isHarmlessGitCommand(segment.normalized, entry.commandExemption)
 		)) return [];
 		return [{ regex, reason: entry.reason, ask: entry.ask === true }];
 	});
