@@ -1,5 +1,6 @@
 # ---- Ignored directories ----
 /scratch/
+/specs/
 
 # ---- Temp & backup ----
 *.tmp
@@ -20,3 +21,6 @@ venv/
 auth.*
 credentials.*
 secrets.*
+
+# ---- Local configurations ----
+.claude/settings.local.json
