@@ -210,7 +210,7 @@ ALE's Python uv options are enabled for Ruff and ty. Paths matching `lsq/ccxt` d
 The Python provider, project interpreter, and debugger interpreter have separate roles:
 
 - The Neovim Python provider remains `~/.micromamba/envs/dev/bin/python` and needs `pynvim`.
-- `<Leader>pv` opens `:VenvSelect` through Telescope using the `cameronperot/venv-selector.nvim` fork. In addition to the selector's default searches, the configuration searches `~/.micromamba/envs` with `fd`. `options.auto_install_script_dependencies = false` disables automatic script dependency installation; script interpreter discovery runs offline with Python downloads disabled.
+- `<Leader>pv` opens `:VenvSelect` through Telescope using the `cameronperot/venv-selector.nvim` fork pinned to the `feat/optional-uv-venv-creation` branch. In addition to the selector's default searches, the configuration searches `~/.micromamba/envs` with `fd`. `options.uv_venv_auto_create = false` keeps uv from creating PEP-723 script venvs automatically; existing uv venvs are still re-synced and discovered offline with Python downloads disabled.
 - On a Python `FileType` event, the custom hook attempts to activate `.venv/bin/python` under Neovim's **current working directory**. After its first successful activation, that hook stops looking for another environment for the rest of the session; use the selector when changing projects.
 - Each environment activation reconfigures `dap-python` to run its adapter with the selected Python. That interpreter must have `debugpy`; this is separate from the provider's `pynvim` requirement. See [dap-python's interpreter requirements](https://github.com/mfussenegger/nvim-dap-python#usage).
 

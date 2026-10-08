@@ -1,6 +1,7 @@
 local M = {
     "cameronperot/venv-selector.nvim",
-    commit = "05bd233ec2197c1c79143dbcb3951425e8a993d9",
+    branch = "feat/optional-uv-venv-creation",
+    commit = "8ddb78c35a5be1bc605f50deafe88d203d80fb6b",
     dependencies = {
         "neovim/nvim-lspconfig",
         "nvim-telescope/telescope.nvim",
@@ -12,7 +13,7 @@ local M = {
     },
     opts = {
         options = {
-            auto_install_script_dependencies = false,
+            uv_venv_auto_create = false,
             picker = "telescope",
             notify_user_on_venv_activation = true,
             on_venv_activate_callback = function()

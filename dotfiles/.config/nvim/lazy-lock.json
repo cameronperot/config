@@ -38,7 +38,7 @@
   "telescope.nvim": { "branch": "master", "commit": "3333a52ff548ba0a68af6d8da1e54f9cd96e9179" },
   "trouble.nvim": { "branch": "main", "commit": "bd67efe408d4816e25e8491cc5ad4088e708a69a" },
   "uv.nvim": { "branch": "main", "commit": "b0bce1b61584fde99c316aa0587a4996c52df206" },
-  "venv-selector.nvim": { "branch": "main", "commit": "05bd233ec2197c1c79143dbcb3951425e8a993d9" },
+  "venv-selector.nvim": { "branch": "feat/optional-uv-venv-creation", "commit": "8ddb78c35a5be1bc605f50deafe88d203d80fb6b" },
   "vim-fugitive": { "branch": "master", "commit": "3b753cf8c6a4dcde6edee8827d464ba9b8c4a6f0" },
   "vim-grammarous": { "branch": "master", "commit": "db46357465ce587d5325e816235b5e92415f8c05" },
   "vim-rhubarb": { "branch": "master", "commit": "5496d7c94581c4c9ad7430357449bb57fc59f501" },
