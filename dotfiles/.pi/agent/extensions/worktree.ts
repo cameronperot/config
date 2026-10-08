@@ -145,7 +145,9 @@ function findWorktree(worktrees: Worktree[], name: string, root: string): Worktr
 }
 
 async function isDirty(pi: ExtensionAPI, path: string): Promise<number> {
-	const out = await git(pi, ["status", "--porcelain", "--untracked-files=no"], path);
+	// Untracked files count: remove() deletes them with --force. The explicit mode
+	// also overrides status.showUntrackedFiles=no.
+	const out = await git(pi, ["status", "--porcelain", "--untracked-files=normal"], path);
 	return out ? out.split("\n").length : 0;
 }
 
@@ -631,7 +633,10 @@ export default async function worktreeExtension(pi: ExtensionAPI): Promise<void>
 		} else {
 			const dirtyCount = await isDirty(pi, target.path);
 			if (dirtyCount > 0) {
-				const ok = await ctx.ui.confirm("Remove dirty worktree?", `${dirtyCount} tracked files modified in ${target.path}`);
+				const ok = await ctx.ui.confirm(
+					"Remove dirty worktree?",
+					`${dirtyCount} modified or untracked files in ${target.path} will be deleted (an untracked directory counts as one)`,
+				);
 				if (!ok) return;
 			}
 		}

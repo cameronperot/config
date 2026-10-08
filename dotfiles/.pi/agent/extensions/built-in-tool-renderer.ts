@@ -31,10 +31,10 @@ import type {
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
-	createBashTool,
-	createEditTool,
-	createReadTool,
-	createWriteTool,
+	createBashToolDefinition,
+	createEditToolDefinition,
+	createReadToolDefinition,
+	createWriteToolDefinition,
 	getLanguageFromPath,
 	highlightCode,
 	renderDiff,
@@ -138,13 +138,13 @@ function makeBaseTools() {
 	function buildForCwd(cwd: string) {
 		const settings = SettingsManager.create(cwd);
 		return {
-			read: createReadTool(cwd, { autoResizeImages: settings.getImageAutoResize() }),
-			bash: createBashTool(cwd, {
+			read: createReadToolDefinition(cwd, { autoResizeImages: settings.getImageAutoResize() }),
+			bash: createBashToolDefinition(cwd, {
 				commandPrefix: settings.getShellCommandPrefix(),
 				shellPath: settings.getShellPath(),
 			}),
-			edit: createEditTool(cwd),
-			write: createWriteTool(cwd),
+			edit: createEditToolDefinition(cwd),
+			write: createWriteToolDefinition(cwd),
 		};
 	}
 
@@ -161,9 +161,13 @@ function makeBaseTools() {
 export default function (pi: ExtensionAPI) {
 	const baseTools = makeBaseTools();
 
-	// Registration needs a description and schema before any ctx exists. Both are
-	// cwd- and option-independent, so the startup-cwd set supplies them; every
-	// execute() resolves its own set from ctx.cwd.
+	// Registration needs each built-in's metadata before any ctx exists: description,
+	// schema, prompt snippet and guidelines, constrained sampling, and edit's
+	// argument repair. Pi's definitions carry all of it, and core lists a tool in the
+	// system prompt only when the definition that wins has a snippet. None of it
+	// depends on cwd or on the options core passes, so the startup-cwd set supplies
+	// it; every execute() resolves its own set from ctx.cwd and passes ctx on, which
+	// the built-ins need for PI_* session variables and model-aware image reads.
 	const template = baseTools(process.cwd());
 
 	// --- Read tool: audit access, then show path and a highlighted preview ---
@@ -171,13 +175,16 @@ export default function (pi: ExtensionAPI) {
 		name: "read",
 		label: "read (audited)",
 		description: template.read.description,
+		promptSnippet: template.read.promptSnippet,
+		promptGuidelines: template.read.promptGuidelines,
 		parameters: template.read.parameters,
+		constrainedSampling: template.read.constrainedSampling,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const absolutePath = resolve(ctx.cwd, params.path);
 
 			await logAccess(absolutePath, true);
-			return baseTools(ctx.cwd).read.execute(toolCallId, params, signal, onUpdate);
+			return baseTools(ctx.cwd).read.execute(toolCallId, params, signal, onUpdate, ctx);
 		},
 
 		renderCall(args, theme, context) {
@@ -252,10 +259,13 @@ export default function (pi: ExtensionAPI) {
 		name: "bash",
 		label: "bash",
 		description: template.bash.description,
+		promptSnippet: template.bash.promptSnippet,
+		promptGuidelines: template.bash.promptGuidelines,
 		parameters: template.bash.parameters,
+		constrainedSampling: template.bash.constrainedSampling,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return baseTools(ctx.cwd).bash.execute(toolCallId, params, signal, onUpdate);
+			return baseTools(ctx.cwd).bash.execute(toolCallId, params, signal, onUpdate, ctx);
 		},
 
 		renderCall(args, theme, context) {
@@ -319,11 +329,15 @@ export default function (pi: ExtensionAPI) {
 		name: "edit",
 		label: "edit",
 		description: template.edit.description,
+		promptSnippet: template.edit.promptSnippet,
+		promptGuidelines: template.edit.promptGuidelines,
 		parameters: template.edit.parameters,
+		constrainedSampling: template.edit.constrainedSampling,
 		renderShell: "default",
+		prepareArguments: template.edit.prepareArguments,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return baseTools(ctx.cwd).edit.execute(toolCallId, params, signal, onUpdate);
+			return baseTools(ctx.cwd).edit.execute(toolCallId, params, signal, onUpdate, ctx);
 		},
 
 		renderCall(args, theme, context) {
@@ -387,10 +401,13 @@ export default function (pi: ExtensionAPI) {
 		name: "write",
 		label: "write",
 		description: template.write.description,
+		promptSnippet: template.write.promptSnippet,
+		promptGuidelines: template.write.promptGuidelines,
 		parameters: template.write.parameters,
+		constrainedSampling: template.write.constrainedSampling,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return baseTools(ctx.cwd).write.execute(toolCallId, params, signal, onUpdate);
+			return baseTools(ctx.cwd).write.execute(toolCallId, params, signal, onUpdate, ctx);
 		},
 
 		renderCall(args, theme, context) {

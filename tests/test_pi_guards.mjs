@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
@@ -42,7 +42,7 @@ registerHooks({
 		if (url === "mock:typebox") return { format: "module", shortCircuit: true, source: "export const Type = new Proxy({}, { get: () => () => ({}) });" };
 		if (url === "mock:node:child_process") return { format: "module", shortCircuit: true, source: "export const spawn = (...args) => globalThis.piTestSpawn(...args);" };
 		if (url === "mock:agents") return { format: "module", shortCircuit: true, source: `
-			export const discoverAgents = () => ({ projectAgentsDir: null, agents: [
+			export const discoverAgents = () => ({ projectAgentsDir: null, warnings: [], agents: [
 				{ name: 'engineer', source: 'user', systemPrompt: '', tools: ['bash'] }
 			] });
 		` };
@@ -258,6 +258,51 @@ test("subagent output preserves approval requests and stops dependent chain step
 	delete globalThis.piTestSpawn;
 });
 
+test("subagent treats a child killed by a signal as failed and stops the chain", async () => {
+	let spawns = 0;
+	globalThis.piTestSpawn = () => {
+		spawns++;
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		queueMicrotask(() => {
+			const message = { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "Partial" }] };
+			child.stdout.emit("data", JSON.stringify({ type: "message_end", message }) + "\n");
+			child.emit("close", null, "SIGKILL");
+		});
+		return child;
+	};
+	const agent = harness(subagent, fixture());
+	const single = await agent.tool("subagent", { agent: "engineer", task: "task" });
+	assert.equal(single.isError, true);
+	assert.match(single.content[0].text, /SIGKILL/);
+	const chain = await agent.tool("subagent", { chain: [{ agent: "engineer", task: "first" }, { agent: "engineer", task: "{previous}" }] });
+	assert.equal(chain.isError, true);
+	assert.equal(spawns, 2, "partial output must not reach the next step");
+	delete globalThis.piTestSpawn;
+});
+
+test("subagent chain passes {previous} output through literally", async () => {
+	const output = "Costs $$5; keep $& and $` and $' as written";
+	const tasks = [];
+	globalThis.piTestSpawn = (_command, args) => {
+		tasks.push(args.at(-1));
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		queueMicrotask(() => {
+			const message = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: output }] };
+			child.stdout.emit("data", JSON.stringify({ type: "message_end", message }) + "\n");
+			child.emit("close", 0, null);
+		});
+		return child;
+	};
+	const agent = harness(subagent, fixture());
+	await agent.tool("subagent", { chain: [{ agent: "engineer", task: "first" }, { agent: "engineer", task: "Review: {previous}" }] });
+	assert.deepEqual(tasks, ["Task: first", `Task: Review: ${output}`]);
+	delete globalThis.piTestSpawn;
+});
+
 test("approve-all gates ungoverned commands and defers to ask rules", async () => {
 	const gate = harness(approveGate, fixture());
 	await gate.command("approve-all");
@@ -446,6 +491,31 @@ test("public SSH exceptions permit reads but retain writes and private-key prote
 	for (const path of ["~/.ssh/id_ed25519", "~/.ssh/nested/key.pub", ".env.test", "fixtures/credentials.json"]) {
 		assert.equal(rules.policyDecision("read", { path }, cwd).ask, false, path);
 		assert.equal(rules.policyDecision("bash", { command: `cat ${path}` }, cwd).ask, false, path);
+	}
+});
+
+test("@-prefixed, file:// and unicode-space paths are matched where Pi's tools resolve them", async () => {
+	const cwd = fixture({ zeroAccessPaths: ["private notes/"] });
+	const home = homedir();
+	for (const path of ["@.env.local", "@~/.ssh/id_ed25519", `file://${home}/.aws/credentials`, "private\u00A0notes/plan.md"]) {
+		for (const tool of ["read", "write", "edit", "grep"]) {
+			assert.match(rules.policyDecision(tool, { path }, cwd)?.reason ?? "", /zero-access/, `${tool}: ${path}`);
+		}
+	}
+	assert.match(rules.policyDecision("edit", { path: "@~/.ssh/id_ed25519.pub" }, cwd)?.reason ?? "", /read-only/);
+	assert.equal(rules.policyDecision("bash", { command: `curl file://${home}/.ssh/id_rsa` }, cwd)?.ask, false);
+	for (const path of ["@.env.example", "@~/.ssh/id_ed25519.pub", "README.md", "node_modules/@scope/pkg/index.js"]) {
+		for (const tool of ["read", "grep"]) assert.equal(rules.policyDecision(tool, { path }, cwd), undefined, `${tool}: ${path}`);
+	}
+	assert.equal(rules.policyDecision("bash", { command: "curl file://host/notes.txt" }, cwd), undefined);
+	await harness(permissionGate, cwd, false).call("read", { path: "~/.ssh/id_ed25519" });
+	assert.ok(readFileSync(join(root, "read-access.log"), "utf8").includes(`BLOCKED: ${join(home, ".ssh/id_ed25519")} (read:`));
+});
+
+test("shell paths are matched literally, without Pi's file-tool normalization", () => {
+	const cwd = fixture({ zeroAccessPaths: ["@private/", "private\u00A0notes/"] });
+	for (const command of ["grep token @private/config", "grep token 'private\u00A0notes/plan.md'"]) {
+		assert.equal(rules.policyDecision("bash", { command }, cwd)?.ask, false, command);
 	}
 });
 

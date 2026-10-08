@@ -12,8 +12,8 @@ The extensions themselves, by what they do:
 - [Workflow](#workflow) — `preset.ts`, `tools.ts`, `handoff.ts`, `commands.ts`, `subagent/`
   - [Subagent roles](#subagent-roles) — where `subagent/` reads its agent definitions (ten, in `~/.pi/agent/agents/`)
 - [Worktree](#worktree) — `worktree.ts`
-- [Display](#display) — `custom-footer.ts`, `notify.ts`, `system-prompt-header.ts`, `system-prompt-dump.ts.disabled`
-- [Context](#context) — `claude-rules.ts`, `rules-loader.ts`, `shake.ts`
+- [Display](#display) — `notify.ts`, `system-prompt-header.ts`, `system-prompt-dump.ts.disabled`
+- [Context](#context) — `rules-loader.ts`, `shake.ts`
 - [Session](#session) — `bookmark.ts`
 - [npm packages](#npm-packages) — `pi-rewind` and `@plannotator/pi-extension`, installed rather than staged here
 
@@ -43,7 +43,7 @@ Every block and every answered confirmation — including a blocked `read` — i
 **Known gaps.** These are speed bumps, not a security boundary:
 
 - Path matching tokenizes the command on shell metacharacters, so indirection defeats it — `sh -c`, `python -c`, base64, or a path built from a variable.
-- Recursive `grep` or shell searches can read protected files without naming them as the search target. Paths are matched by spelling, not by resolving symlinks. Filename guards cannot identify secrets in otherwise permitted files such as `.envrc` or `server.pem`.
+- Recursive `grep` or shell searches can read protected files without naming them as the search target. Paths are normalized the way Pi's file tools resolve them, but symlinks are not followed. Filename guards cannot identify secrets in otherwise permitted files such as `.envrc` or `server.pem`.
 - Secrets held in **environment variables** cannot be protected at all. The `bash` tool inherits the process environment and `echo $TOKEN` is indistinguishable from any other `echo`. Anything in the environment is readable by the agent; treat it that way when deciding what to export.
 - Overriding a built-in tool does **not** bypass the guards: `tool_call` fires on the tool *name*, before execution, regardless of which implementation backs it.
 
@@ -73,7 +73,7 @@ The shipped zero-access exceptions include environment templates and public SSH 
 
 When no UI is available, a confirmation returns an `Approval required (no UI)` result with exact tool input, cwd and reason. `shared/approval.ts` collects these from failed tool-result messages. The subagent extension includes outstanding requests in returned text and `approvalRequests` details, reports those children as needing approval, and stops dependent chain steps even if the child exits successfully or omits the request from its final text. The parent must use its normal approval guards to execute the action in the stated cwd before delegating remaining work. This does not approve anything automatically or convert hard blocks into approval requests.
 
-Matching is per **path segment**, with `*`/`?` confined to one segment, `~` expanded, and relative patterns matching a contiguous run of segments at any depth, so `node_modules/` catches it however deep it is nested.
+Matching is per **path segment**, with `*`/`?` confined to one segment, `~` expanded, and relative patterns matching a contiguous run of segments at any depth, so `node_modules/` catches it however deep it is nested. A file-tool path is first normalized the way Pi's file tools resolve it — unicode spaces, one leading `@`, `~` and `file://` URLs — because Pi does not export that step; without it `read @.env.local` or `read file:///home/me/.aws/credentials` would reach the file while matching no pattern. Bash paths get only `~` and `file://` handling, since a shell passes `@` and unicode spaces through literally.
 
 `shared/rules.ts` holds a small `SAFETY_FLOOR`. A missing, malformed or partial global policy falls back to it, and the problem is announced once per cwd through UI notifications or stderr in headless mode, preserving structured stdout. A class the global file omits keeps the floor's value; a class it states replaces the floor's, so it can be narrowed on purpose. Invalid command regexes retain the fallback command rules. Malformed project policy leaves global protection active.
 
@@ -95,7 +95,7 @@ Two choices are worth knowing. Glyphs are Nerd Font with no ascii fallback, and 
 
 | Extension | What it does | Registers |
 |---|---|---|
-| `preset.ts` | Named presets from `~/.pi/agent/presets.json` setting provider, model, thinking level, tool set and instructions. | `/preset`, `--preset`, Ctrl+Shift+U |
+| `preset.ts` | Named presets from `~/.pi/agent/presets.json` setting provider, model, thinking level, tool set and instructions. The active preset is recorded when applied or cleared and restored from the current branch on resume and `/tree` — name and instructions only. | `/preset`, `--preset`, Ctrl+Shift+U |
 | `tools.ts` | Interactive checklist to enable/disable tools mid-session; persists to the session and restores on start and on `/tree` navigation, reporting excluded tools. | `/tools` |
 | `handoff.ts` | `/handoff <goal>` summarises the session into a self-contained prompt and opens it in a fresh session. Non-lossy alternative to `/compact`. Costs one LLM call. | `/handoff` |
 | `commands.ts` | Lists every slash command, filterable by source. | `/commands` |
@@ -111,7 +111,6 @@ Two choices are worth knowing. Glyphs are Nerd Font with no ascii fallback, and 
 
 | Extension | What it does | Registers |
 |---|---|---|
-| `custom-footer.ts` | Footer with live `↑input ↓output $cost` summed from session usage, plus model id and git branch. **Off until you run `/footer`.** | `/footer` |
 | `notify.ts` | Desktop notification when the agent finishes — OSC 777 (Ghostty/iTerm2/WezTerm), OSC 99 (Kitty), WSL toast. Interactive sessions only. | — |
 | `system-prompt-header.ts` | Status widget showing system prompt length in chars — a watchdog on prompt bloat. | — |
 | `system-prompt-dump.ts.disabled` | **Not loaded** — renamed so Pi's loader skips it. When re-enabled, it appends the **full** system prompt to `~/.pi/agent/system-prompt.log` on every model request; `/system-prompt` prints the current one to standard out. | `/system-prompt` |
@@ -120,11 +119,10 @@ Two choices are worth knowing. Glyphs are Nerd Font with no ascii fallback, and 
 
 | Extension | What it does | Registers |
 |---|---|---|
-| `claude-rules.ts` | Lists `<cwd>/.claude/rules/*.md` **paths** in the system prompt; the agent reads a rule only when it needs it. Project-scoped — does **not** pick up `~/.claude/rules/`. | — |
 | `rules-loader.ts` | Splices the **full text** of `~/.agent/rules/*.md` into the system prompt inside the first AGENTS.md `<project_instructions>` block, so the rules read as a continuation of it; appended at the end when no AGENTS.md block is present. A no-op when the directory is missing or empty. | — |
 | `shake.ts` | Replaces old tool results with short stubs in the payload sent to the model, leaving the transcript intact. Manual only. | `/shake`, `/unshake` |
 
-`rules-loader.ts` is the counterpart to `claude-rules.ts` by intent, not mechanism: `claude-rules.ts` serves project rules on demand (paths only, read when needed), while `rules-loader.ts` inlines rules that must hold in every session — the Behavior and Change Discipline sections formerly inline in `~/.pi/agent/AGENTS.md`, now split into `~/.agent/rules/*.md` with one concern per file. Splicing inside the `<project_instructions>` block keeps the rules at the same standing as the agent notes instead of dangling after the prompt. `~/.agent/` is not a Pi directory, and the per-request cost is the house pattern's: full rule text on every request. Rules are read once per `session_start`, so edits land only after a restart.
+`rules-loader.ts` inlines rules that must hold in every session — the Behavior and Change Discipline sections formerly inline in `~/.pi/agent/AGENTS.md`, now split into `~/.agent/rules/*.md` with one concern per file. Splicing inside the `<project_instructions>` block keeps the rules at the same standing as the agent notes instead of dangling after the prompt. `~/.agent/` is not a Pi directory, and the per-request cost is the house pattern's: full rule text on every request. Rules are read once per `session_start`, so edits land only after a restart.
 
 `shake.ts` is non-destructive by construction: the `context` handler is a pure transform that core applies on the way to the provider and never writes back, so the session file, the TUI rendering and `/export` keep the full text. The only state is a set of shaken tool-call ids. Selection skips the newest 20k tokens, results under 200 tokens, and results containing images, and `/shake` refuses unless it reclaims at least 2k tokens.
 
@@ -157,9 +155,8 @@ Everything that reaches the model on every request, as opposed to on demand:
 
 | Source | Cost | Notes |
 |---|---|---|
-| `read` `bash` `edit` `write` | none | Re-registrations of the built-ins with the same descriptions and schemas. |
+| `read` `bash` `edit` `write` | none | Re-registrations carrying the built-ins' own descriptions, schemas, prompt snippets and guidelines, so the system prompt matches the stock one. |
 | `todo` `questionnaire` `subagent` | ~350 tokens total | Three genuinely new tool definitions. |
-| `claude-rules.ts` | one line per rule file | Only in a cwd that has `.claude/rules/`. |
 | `rules-loader.ts` | full text of `~/.agent/rules/*.md` (~3 KB here) | Always-on global rules, in every request. |
 | `preset.ts` | length of `instructions` | Only while a preset is active. |
 | plannotator (npm) | planning-phase `instructions` from `plannotator.json` plus the `plannotator_submit_plan` tool definition | Only while a plannotator phase is active — the tool is added to the active set for the phase and released after. |
@@ -174,9 +171,12 @@ Nothing in Pi's default system prompt mentions `todo`, `questionnaire` or `subag
 
 These diverge from their `examples/extensions/` counterparts:
 
-- **`built-in-tool-renderer.ts`** — merged with the shipped `tool-override.ts`, which registered a competing `read`. The merged `read` delegates to `createReadTool()` rather than a hand-rolled implementation, builds base tools per `ctx.cwd` with the settings core passes in `_buildRuntime`, and logs allowed read access. Policy enforcement belongs to `permission-gate.ts`. All four renderers were then rewritten onto `shared/render.ts`: the shipped ones printed an unstyled dim block under a hardcoded 15/20/30-line cap, and read the bash exit code with `/exit code: (\d+)/` — a string core never emits, so every failed command rendered as a green `done`. Outcome now comes from `context.isError` plus core's `Command exited with code N` / `timed out after N seconds` / `aborted` trailer, which is stripped off the body rather than repeated in it.
-- **`todo.ts`** — renderers rewritten onto `shared/render.ts`. The shipped version printed a five-item `✓`/`○` list for `list` and a different one-line summary for every other action; this one always shows the list as a tree with a done count, so a `toggle` shows what it toggled in context.
-- **`notify.ts`** — returns early unless `ctx.hasUI`. `subagent/` spawns children with extensions loaded, and their stdout is the JSON protocol stream the parent parses; an OSC sequence written there corrupts whichever event line it lands in.
+- **`built-in-tool-renderer.ts`** — merged with the shipped `tool-override.ts`, which registered a competing `read`. All four delegate to Pi's `create*ToolDefinition()` implementations rather than hand-rolled ones, built per `ctx.cwd` with the settings core passes in `_buildRuntime`, and pass `ctx` on, which bash needs for its `PI_*` session variables and read for model-aware image handling. Registration copies each built-in's prompt snippet, guidelines, constrained sampling and `edit`'s argument repair: core lists a tool in the system prompt only when the winning definition has a snippet, and without the repair an `edits` array sent as a JSON string fails validation. `read` also logs allowed access. Policy enforcement belongs to `permission-gate.ts`. All four renderers were then rewritten onto `shared/render.ts`: the shipped ones printed an unstyled dim block under a hardcoded 15/20/30-line cap, and read the bash exit code with `/exit code: (\d+)/` — a string core never emits, so every failed command rendered as a green `done`. Outcome now comes from `context.isError` plus core's `Command exited with code N` / `timed out after N seconds` / `aborted` trailer, which is stripped off the body rather than repeated in it.
+- **`todo.ts`** — renderers rewritten onto `shared/render.ts`. The shipped version printed a five-item `✓`/`○` list for `list` and a different one-line summary for every other action; this one always shows the list as a tree with a done count, so a `toggle` shows what it toggled in context. Results snapshot copies of the todos, because Pi keeps each result's `details` by reference and a shared object let a later `add` or `toggle` rewrite the history `/tree` restores from.
+- **`notify.ts`** — returns early unless `ctx.mode` is `"tui"`. In JSON, print and RPC modes stdout is a protocol stream and Pi reroutes `process.stdout` writes to stderr, so the escape sequence would only land in whatever captures stderr — including `subagent/` children, which load this directory too. `ctx.hasUI` alone is not enough: RPC mode binds a UI.
+- **`preset.ts`** — the shipped version appended a `preset-state` entry on every turn, recorded nothing on clear and restored from every branch, so resuming brought back a cleared preset's instructions. This one records the state on apply and clear and restores it from the current branch on `session_start` and `session_tree`.
+- **`handoff.ts`** — builds the transcript with core's `buildContextEntries()` and `sessionEntryToContextMessages`, so branch summaries and custom messages are included, and reports provider errors and an empty result as failures rather than "Cancelled".
+- **`subagent/`** — besides the approval handling under [Guard policy](#guard-policy): the model-facing `confirmProjectAgents` parameter is removed, so project-local agents always need a UI confirmation and are refused without a UI; a child killed by a signal or failing to spawn counts as failed, with the reason in its output; `{previous}` is substituted literally; a relative `cwd` resolves against the dispatching session; and an unreadable or malformed agent file is skipped with a warning instead of failing every call.
 - **`permission-gate.ts`** — rule-driven rather than carrying their path lists and regexes as source literals, with the `ask` distinction, the audit entry, and path-segment matching added.
 - **`shared/rules.ts`**, **`shared/access-log.ts`**, **`shared/render.ts`**, **`shake.ts`** and **`approve-gate.ts`** — authored here, no upstream equivalent.
 - **`system-prompt-dump.ts`** — authored here, no upstream equivalent. Currently staged as `system-prompt-dump.ts.disabled`, so it does not load. The `context` hook (before every model call) calls `ctx.getSystemPrompt()` and appends the prompt to `~/.pi/agent/system-prompt.log`; `/system-prompt` prints the current prompt to stdout on demand. It writes to a file rather than the TUI/console because the prompt is large and a per-call dump into a live render or a `-p` protocol stream would be unusable. Note `ctx.getSystemPrompt()` reflects Pi's system prompt, not provider-payload rewrites other extensions make later in the chain.
@@ -185,7 +185,7 @@ Two shipped examples were staged and later removed: `inline-bash.ts` (its `!{cmd
 
 ## Interactions
 
-- `preset.ts`, `tools.ts` and plannotator's phase profiles all drive `setActiveTools()`. Use one at a time. `tools.ts` additionally restores its saved set on `session_start` and on `/tree` navigation, so a saved selection can override `defaultTools` on resume. Restoration reports exclusions; use `/tools` to change the selection.
+- `preset.ts`, `tools.ts` and plannotator's phase profiles all drive `setActiveTools()`. Use one at a time. `tools.ts` additionally restores its saved set on `session_start` and on `/tree` navigation, so a saved selection can override `defaultTools` on resume. Restoration reports exclusions; use `/tools` to change the selection. `preset.ts` restores from the current branch too, but only its name and instructions; it never calls `setActiveTools()` on restore.
 - Clearing a preset with no snapshot to restore falls back to `read, bash, edit, write` — narrower than the configured `defaultTools`. Use `/tools` to get the rest back.
 - Duplicate tool and command names resolve to whichever loads first, and load order is unsorted `readdir`. Extension commands shadow same-named prompt templates; Pi's built-ins win over both. Plannotator provides planning commands; no local `/plan` or `/steps` extension is shipped.
 - `approve-gate.ts` is **additive** to the other guards, not layered over them: all `tool_call` handlers run in sequence, the first to block wins and the rest never run, and load order is unsorted `readdir`. Because that order is not controllable, the gate calls the shared policy decision implementation before prompting and stays quiet when a guard is going to block or ask about the same call — so a call `guard-rules.json` refuses is never presented for approval, and an `ask` rule produces one prompt rather than two. Turning a mode on can therefore only ever *add* confirmations.

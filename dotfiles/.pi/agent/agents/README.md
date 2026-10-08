@@ -23,7 +23,7 @@ Consequences for the agent files:
 ## Install
 
 - User scope (all projects): `~/.pi/agent/agents/` — what this repo deploys.
-- Project scope: the nearest `.pi/agents/` directory found by walking upward from the dispatching session's working directory. The default scope is user-only; `agentScope: "both"` enables project overrides by name, and `"project"` selects only project agents. With a UI and `confirmProjectAgents` enabled (the default), the extension asks before each invocation that selects project agents; it does not store a first-use trust decision.
+- Project scope: the nearest `.pi/agents/` directory found by walking upward from the dispatching session's working directory. The default scope is user-only; `agentScope: "both"` enables project overrides by name, and `"project"` selects only project agents. The extension asks before each invocation that selects project agents and does not store a first-use trust decision; the model cannot skip the question, and without a UI the call is refused.
 
 ## Agents
 

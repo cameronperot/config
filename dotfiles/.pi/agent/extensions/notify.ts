@@ -50,11 +50,13 @@ function notify(title: string, body: string): void {
 
 export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", async (_event, ctx) => {
-		// Headless runs get nothing. subagent/ spawns children without
-		// --no-extensions, so this file loads inside them too, and their stdout is
-		// the JSON protocol stream the parent parses — an OSC sequence written
-		// there corrupts whichever event line it lands in.
-		if (!ctx.hasUI) return;
+		// Only the TUI owns a terminal. In JSON and RPC modes stdout is a protocol
+		// stream, so Pi reroutes process.stdout writes to stderr, and an OSC
+		// sequence would land in whatever captures that stream instead of a
+		// terminal. subagent/ children are one such case: it spawns them without
+		// --no-extensions, so this file loads inside them too. RPC mode binds a
+		// UI context, so hasUI alone does not exclude it.
+		if (ctx.mode !== "tui") return;
 		notify("Pi", "Ready for input");
 	});
 }

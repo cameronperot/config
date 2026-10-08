@@ -21,6 +21,8 @@ export interface AgentConfig {
 export interface AgentDiscoveryResult {
 	agents: AgentConfig[];
 	projectAgentsDir: string | null;
+	/** Agent files skipped because they could not be read or parsed. */
+	warnings: string[];
 }
 
 /**
@@ -59,7 +61,7 @@ function parseToolList(value: unknown): string[] | undefined {
 	return tools.length > 0 ? tools : undefined;
 }
 
-function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
+function loadAgentsFromDir(dir: string, source: "user" | "project", warnings: string[]): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
 	if (!fs.existsSync(dir)) {
@@ -81,11 +83,20 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 		let content: string;
 		try {
 			content = fs.readFileSync(filePath, "utf-8");
-		} catch {
+		} catch (e) {
+			warnings.push(`Skipped agent file ${filePath}: could not be read (${e instanceof Error ? e.message : String(e)})`);
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<AgentFrontmatter>(content);
+		// The YAML parser throws on invalid frontmatter; one bad file must not hide the rest
+		let frontmatter: AgentFrontmatter;
+		let body: string;
+		try {
+			({ frontmatter, body } = parseFrontmatter<AgentFrontmatter>(content));
+		} catch (e) {
+			warnings.push(`Skipped agent file ${filePath}: could not be parsed (${e instanceof Error ? e.message : String(e)})`);
+			continue;
+		}
 
 		if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") {
 			continue;
@@ -129,8 +140,9 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 	const userDir = path.join(getAgentDir(), "agents");
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 
-	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
-	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
+	const warnings: string[] = [];
+	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user", warnings);
+	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project", warnings);
 
 	const agentMap = new Map<string, AgentConfig>();
 
@@ -143,7 +155,7 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 		for (const agent of projectAgents) agentMap.set(agent.name, agent);
 	}
 
-	return { agents: Array.from(agentMap.values()), projectAgentsDir };
+	return { agents: Array.from(agentMap.values()), projectAgentsDir, warnings };
 }
 
 export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {

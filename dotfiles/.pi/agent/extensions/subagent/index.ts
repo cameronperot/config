@@ -277,6 +277,7 @@ async function runSingleAgent(
 	defaultCwd: string,
 	dispatchDefaults: DispatchDefaults,
 	agents: AgentConfig[],
+	discoveryWarnings: string[],
 	agentName: string,
 	task: string,
 	cwd: string | undefined,
@@ -289,13 +290,15 @@ async function runSingleAgent(
 
 	if (!agent) {
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+		// A definition that failed to load may be the agent that was asked for
+		const skipped = discoveryWarnings.map((w) => `\n${w}`).join("");
 		return {
 			agent: agentName,
 			agentSource: "unknown",
 			task,
 			exitCode: 1,
 			messages: [],
-			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
+			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.${skipped}`,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 			step,
 		};
@@ -347,8 +350,10 @@ async function runSingleAgent(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
+			// A relative cwd is relative to the dispatching session, not to this process
+			const resolvedCwd = path.resolve(defaultCwd, cwd ?? ".");
 			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
+				cwd: resolvedCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
@@ -402,12 +407,18 @@ async function runSingleAgent(
 				currentResult.stderr += data.toString();
 			});
 
-			proc.on("close", (code) => {
+			proc.on("close", (code, exitSignal) => {
 				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
+				// Node reports a signal death as a null code; the child's output is partial
+				if (exitSignal) {
+					currentResult.stderr += `${currentResult.stderr ? "\n" : ""}Subagent process terminated by ${exitSignal}.`;
+				}
+				resolve(code ?? 1);
 			});
 
-			proc.on("error", () => {
+			proc.on("error", (err) => {
+				// Node names only the executable in spawn errors, though ENOENT can mean a missing cwd
+				currentResult.stderr += `${currentResult.stderr ? "\n" : ""}${err.message} (cwd: ${resolvedCwd})`;
 				resolve(1);
 			});
 
@@ -416,7 +427,7 @@ async function runSingleAgent(
 					wasAborted = true;
 					proc.kill("SIGTERM");
 					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
+						if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
 					}, 5000);
 				};
 				if (signal.aborted) killProc();
@@ -467,9 +478,6 @@ const SubagentParams = Type.Object({
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
-	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
-	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 });
 
@@ -493,7 +501,10 @@ export default function (pi: ExtensionAPI) {
 			};
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
-			const confirmProjectAgents = params.confirmProjectAgents ?? true;
+			for (const warning of discovery.warnings) {
+				if (ctx.hasUI) ctx.ui.notify(`Subagent: ${warning}`, "warning");
+				else process.stderr.write(`Subagent: ${warning}\n`);
+			}
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
@@ -522,7 +533,8 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
+			// Project agents are repo-controlled: every use needs a human, so refuse when none can answer
+			if (agentScope === "project" || agentScope === "both") {
 				const requestedAgentNames = new Set<string>();
 				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
 				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
@@ -535,6 +547,17 @@ export default function (pi: ExtensionAPI) {
 				if (projectAgentsRequested.length > 0) {
 					const names = projectAgentsRequested.map((a) => a.name).join(", ");
 					const dir = discovery.projectAgentsDir ?? "(unknown)";
+					if (!ctx.hasUI)
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Refused: project-local agents require interactive confirmation, and no UI is available.\nAgents: ${names}\nSource: ${dir}`,
+								},
+							],
+							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+							isError: true,
+						};
 					const ok = await ctx.ui.confirm(
 						"Run project-local agents?",
 						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
@@ -553,7 +576,8 @@ export default function (pi: ExtensionAPI) {
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					// A replacer function keeps `$` patterns in the output literal
+					const taskWithContext = step.task.replace(/\{previous\}/g, () => previousOutput);
 
 					// Create update callback that includes all previous results
 					const chainUpdate: OnUpdateCallback | undefined = onUpdate
@@ -574,6 +598,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.cwd,
 						dispatchDefaults,
 						agents,
+						discovery.warnings,
 						step.agent,
 						taskWithContext,
 						step.cwd,
@@ -647,6 +672,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.cwd,
 						dispatchDefaults,
 						agents,
+						discovery.warnings,
 						t.agent,
 						t.task,
 						t.cwd,
@@ -690,6 +716,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.cwd,
 					dispatchDefaults,
 					agents,
+					discovery.warnings,
 					params.agent,
 					params.task,
 					params.cwd,

@@ -165,6 +165,7 @@ export default function presetExtension(pi: ExtensionAPI) {
 		// Store active preset for system prompt injection
 		activePresetName = name;
 		activePreset = preset;
+		pi.appendEntry("preset-state", { name });
 
 		return true;
 	}
@@ -271,6 +272,7 @@ export default function presetExtension(pi: ExtensionAPI) {
 			// Clear preset and restore original state
 			activePresetName = undefined;
 			activePreset = undefined;
+			pi.appendEntry("preset-state", { name: null });
 			if (originalState) {
 				if (originalState.model) {
 					await pi.setModel(originalState.model);
@@ -327,6 +329,7 @@ export default function presetExtension(pi: ExtensionAPI) {
 		if (nextName === "(none)") {
 			activePresetName = undefined;
 			activePreset = undefined;
+			pi.appendEntry("preset-state", { name: null });
 			if (originalState) {
 				if (originalState.model) {
 					await pi.setModel(originalState.model);
@@ -391,6 +394,30 @@ export default function presetExtension(pi: ExtensionAPI) {
 		}
 	});
 
+	/**
+	 * Restore the preset recorded by the latest preset-state entry on the current branch.
+	 */
+	function restoreFromBranch(ctx: ExtensionContext) {
+		// getBranch(), not getEntries(): a preset activated on a branch that /tree
+		// navigated away from must not follow you onto the branch you moved to.
+		// A cleared entry ({ name: null }), or none at all, leaves no preset active.
+		const presetEntry = ctx.sessionManager
+			.getBranch()
+			.filter((e) => e.type === "custom" && e.customType === "preset-state")
+			.pop() as { data?: { name: string | null } } | undefined;
+
+		activePresetName = undefined;
+		activePreset = undefined;
+		if (presetEntry?.data?.name) {
+			const preset = presets[presetEntry.data.name];
+			if (preset) {
+				activePresetName = presetEntry.data.name;
+				activePreset = preset;
+				// Don't re-apply model/tools on restore, just keep the name for instructions
+			}
+		}
+	}
+
 	// Initialize on session start
 	pi.on("session_start", async (_event, ctx) => {
 		// Load presets from config files
@@ -410,27 +437,16 @@ export default function presetExtension(pi: ExtensionAPI) {
 		}
 
 		// Restore preset from session state
-		const entries = ctx.sessionManager.getEntries();
-		const presetEntry = entries
-			.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "preset-state")
-			.pop() as { data?: { name: string } } | undefined;
-
-		if (presetEntry?.data?.name && !presetFlag) {
-			const preset = presets[presetEntry.data.name];
-			if (preset) {
-				activePresetName = presetEntry.data.name;
-				activePreset = preset;
-				// Don't re-apply model/tools on restore, just keep the name for instructions
-			}
+		if (!presetFlag) {
+			restoreFromBranch(ctx);
 		}
 
 		updateStatus(ctx);
 	});
 
-	// Persist preset state
-	pi.on("turn_start", async () => {
-		if (activePresetName) {
-			pi.appendEntry("preset-state", { name: activePresetName });
-		}
+	// Restore preset when navigating the session tree
+	pi.on("session_tree", async (_event, ctx) => {
+		restoreFromBranch(ctx);
+		updateStatus(ctx);
 	});
 }

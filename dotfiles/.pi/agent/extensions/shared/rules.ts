@@ -31,6 +31,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 const HOME = homedir();
@@ -241,6 +242,35 @@ function expandTilde(p: string): string {
 	return p.startsWith("~/") ? join(HOME, p.slice(2)) : p;
 }
 
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+/**
+ * A file-tool path as Pi's file tools read it: unicode spaces normalized and one
+ * leading `@` stripped. Pi does not export this step, so it is mirrored here;
+ * otherwise `read @.env.local` reaches the file without matching any pattern. A
+ * shell passes both through literally, so bash tokens never get it.
+ */
+function toolPath(path: string): string {
+	return path.replace(UNICODE_SPACES, " ").replace(/^@/, "");
+}
+
+/**
+ * The absolute path `target` names, with `~` expanded and a `file://` URL
+ * converted, as both Pi's file tools and commands such as `curl` resolve them.
+ */
+function resolveTarget(target: string, cwd: string): string {
+	let normalized = expandTilde(target);
+	if (normalized.startsWith("file://")) {
+		try {
+			normalized = fileURLToPath(normalized);
+		} catch {
+			// Pi's tools reject a malformed URL before touching a file; throwing here
+			// would instead block every bash command that merely mentions one.
+		}
+	}
+	return resolve(cwd, normalized);
+}
+
 /** One path segment, with `*` and `?` confined to that segment. */
 function segmentRegex(segment: string): RegExp {
 	const source = segment.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]");
@@ -266,7 +296,7 @@ function runMatches(target: string[], pattern: RegExp[], start: number): boolean
  * of segments anywhere in the path, so `node_modules/` catches it at any depth.
  */
 export function matchesPath(target: string, pattern: string, cwd: string): boolean {
-	const absoluteTarget = resolve(cwd, expandTilde(target));
+	const absoluteTarget = resolveTarget(target, cwd);
 	const expanded = expandTilde(pattern.endsWith("/") ? pattern.slice(0, -1) : pattern);
 	const targetSegments = segmentsOf(absoluteTarget);
 	const patternSegments = segmentsOf(expanded).map(segmentRegex);
@@ -498,12 +528,12 @@ export interface PolicyDecision {
 
 export function policyDecision(tool: string, input: Record<string, unknown>, cwd: string): PolicyDecision | undefined {
 	if (["read", "write", "edit", "grep"].includes(tool)) {
-		const path = (input.path as string | undefined) ?? ".";
+		const path = toolPath((input.path as string | undefined) ?? ".");
 		const secret = zeroAccessMatch(path, cwd);
 		if (secret) return {
 			ask: false,
 			reason: `zero-access path "${secret}"`,
-			blockedAccess: tool === "read" ? resolve(cwd, path) : undefined,
+			blockedAccess: tool === "read" ? resolveTarget(path, cwd) : undefined,
 		};
 		const readOnly = tool === "write" || tool === "edit" ? readOnlyMatch(path, cwd) : undefined;
 		return readOnly ? { ask: false, reason: `read-only path "${readOnly}"` } : undefined;

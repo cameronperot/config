@@ -81,7 +81,7 @@ On the verified Pi 0.85.1 runtime, `defaultTools` selects the seven built-ins: `
 
 ## Extensions
 
-Eighteen local extensions load from `extensions/`, plus two npm packages installed via `packages` in `settings.json`.
+Sixteen local extensions load from `extensions/`, plus two npm packages installed via `packages` in `settings.json`.
 
 | Group | Extensions | Adds |
 |---|---|---|
@@ -89,8 +89,8 @@ Eighteen local extensions load from `extensions/`, plus two npm packages install
 | Tools | `built-in-tool-renderer`, `todo`, `questionnaire` | tools `todo` `questionnaire`; `/todos`, `/read-log` |
 | Workflow | `preset`, `tools`, `handoff`, `commands`, `subagent/` | tool `subagent`; `/preset`, `/tools`, `/handoff`, `/commands` |
 | Git | `worktree` | `/worktree`, `pi --gwt <name>` |
-| Display | `custom-footer`, `notify`, `system-prompt-header` | `/footer` |
-| Context | `claude-rules`, `rules-loader`, `shake` | `/shake`, `/unshake` |
+| Display | `notify`, `system-prompt-header` | — |
+| Context | `rules-loader`, `shake` | `/shake`, `/unshake` |
 | Session | `bookmark` | `/bookmark`, `/unbookmark` |
 | npm | `pi-rewind` 0.5.0, `@plannotator/pi-extension` 0.27.9 | `/rewind`, Esc Esc; `plannotator_submit_plan` tool, `/plannotator-plan-mode`, `/plannotator-review`, `/plannotator-annotate`, `/plannotator-last`, `--plan`, Ctrl+Alt+P |
 
