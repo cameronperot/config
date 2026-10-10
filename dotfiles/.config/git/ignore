@@ -18,9 +18,15 @@ venv/
 *.p12
 *.pfx
 .ssh/
-auth.*
-credentials.*
-secrets.*
+auth.json
+auth.yaml
+auth.yml
+credentials.json
+credentials.yaml
+credentials.yml
+secrets.json
+secrets.yaml
+secrets.yml
 
 # ---- Local configurations ----
 .claude/settings.local.json
