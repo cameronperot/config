@@ -1,6 +1,6 @@
 # Micromamba initialization
 export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-${HOME}/.micromamba}"
-export MAMBA_EXE="${MAMBA_ROOT_PREFIX}/bin/micromamba"
+export MAMBA_EXE="${MAMBA_EXE:-${MAMBA_ROOT_PREFIX}/bin/micromamba}"
 
 __mamba_shell="${ZSH_VERSION:+zsh}"
 __mamba_shell="${__mamba_shell:-bash}"
