@@ -18,7 +18,7 @@ ENV COLORTERM=truecolor \
     LC_ALL=en_US.UTF-8 \
     MAMBA_ROOT_PREFIX=/opt/mamba \
     SHELL=/usr/bin/zsh \
-    TERM=tmux-256color \
+    TERM=xterm-kitty \
     TZ="${TZ}" \
     VISUAL=nvim
 ENV PATH="${HOME_DIR}/bin:${HOME_DIR}/.local/bin:${MAMBA_ROOT_PREFIX}/envs/dev/bin:${MAMBA_ROOT_PREFIX}/bin:${PATH}"
@@ -49,6 +49,7 @@ RUN apt-get update \
     ipset \
     iputils-ping \
     jq \
+    kitty-terminfo \
     less \
     libclang-dev \
     libglib2.0-0 \
@@ -164,7 +165,7 @@ RUN zsh -ic exit
 # Configure root environment
 USER root
 RUN chown -R root:root /tmp/environment-setup \
-    && "${MAMBA_ROOT_PREFIX}/envs/dev/bin/python" /tmp/environment-setup/install.py --neovim-version none \
+    && "${MAMBA_ROOT_PREFIX}/envs/dev/bin/python" /tmp/environment-setup/install.py --neovim-version v0.12.6 --extract-appimage \
     && rm -rf "/root/.config/nvim" \
     && rm -rf /tmp/environment-setup \
     && echo "source /root/.bash_aliases" >> /root/.bashrc

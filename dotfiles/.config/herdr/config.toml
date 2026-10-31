@@ -1,0 +1,53 @@
+onboarding = false
+
+[ui]
+tab_bar_right = [
+  { type = "zoom" },
+  { type = "hostname" },
+  { type = "datetime", format = "%Y-%m-%d %H:%M" },
+]
+tab_bar_right_separator = " | "
+status_indicators = "symbols"
+pane_gaps = false
+pane_outer_borders = false
+
+[ui.toast]
+delivery = "terminal"
+
+[theme]
+name = "one-dark"
+auto_switch = false
+
+[keys]
+prefix = "ctrl+q"
+split_horizontal = "prefix+v"
+split_vertical = "prefix+h"
+focus_pane_left = ["alt+h", "alt+left"]
+focus_pane_down = ["alt+j", "alt+down"]
+focus_pane_up = ["alt+k", "alt+up"]
+focus_pane_right = ["alt+l", "alt+right"]
+swap_pane_left = "alt+shift+h"
+swap_pane_down = "alt+shift+j"
+swap_pane_up = "alt+shift+k"
+swap_pane_right = "alt+shift+l"
+resize_pane_left = "prefix+shift+h"
+resize_pane_down = "prefix+shift+j"
+resize_pane_up = "prefix+shift+k"
+resize_pane_right = "prefix+shift+l"
+switch_tab = "alt+1..9"
+previous_tab = "alt+["
+next_tab = "alt+]"
+move_tab_previous = "alt+shift+left"
+move_tab_next = "alt+shift+right"
+copy_mode = "alt+v"
+detach = "prefix+d"
+goto = "prefix+s"
+settings = "prefix+shift+s"
+open_notification_target = "alt+o"
+zoom = "prefix+z"
+last_pane = "alt+tab"
+previous_workspace = "alt+shift+["
+next_workspace = "alt+shift+]"
+previous_agent = "alt+p"
+next_agent = "alt+n"
+focus_agent = "alt+shift+1..9"

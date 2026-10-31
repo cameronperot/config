@@ -127,6 +127,7 @@ include:
         optional: true
       - fuzzel/fuzzel.ini
       - gammastep/config.ini
+      - herdr/config.toml
       - htop
       - i3/config
       - i3status-rust

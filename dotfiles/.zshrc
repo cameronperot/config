@@ -63,7 +63,6 @@ MODE_INDICATOR="%F{yellow}+%f"
 RPROMPT=''
 
 # http://zsh.sourceforge.net/Doc/Release/Options.html#Description-of-Options
-setopt EXTENDED_GLOB
 setopt EXTENDED_HISTORY
 setopt HIST_IGNORE_SPACE
 setopt HIST_IGNORE_DUPS
@@ -78,6 +77,7 @@ HISTORY_IGNORE="(#i)(*password*|*secret*)"
 
 # Reject matching commands from interactive history as well as the history file
 _zsh_filter_history() {
+    setopt LOCAL_OPTIONS EXTENDED_GLOB
     [[ "$1" != ${~HISTORY_IGNORE} ]]
 }
 autoload -Uz add-zsh-hook
