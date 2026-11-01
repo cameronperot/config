@@ -9,7 +9,7 @@ exclude-newer-package = { ty = false, ruff = false }
 
 [tool.ruff]
 target-version = "py314"
-extend-include = ["dotfiles/bin/agent-sandbox"]
+extend-include = ["dotfiles/bin/agent-sandbox", "dotfiles/bin/vscode-sandbox"]
 
 [tool.ruff.per-file-target-version]
 "dotfiles/bin/agent-sandbox" = "py312"

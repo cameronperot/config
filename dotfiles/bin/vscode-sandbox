@@ -1,0 +1,1623 @@
+#!/usr/bin/python3 -I
+"""
+Run VS Code's Electron binary inside pasta and Bubblewrap on Fedora with Sway.
+
+pasta owns the network namespace and Bubblewrap shares it, adding its own user, mount
+and PID namespaces, a seccomp filter and a filesystem view limited to system trees,
+toolchains, the VS Code profile and the project roots. The display is a Sway
+security-context Wayland socket.
+
+The launcher runs preflight, takes the single-instance lock in a host-only state
+directory under $XDG_RUNTIME_DIR, writes the seccomp program, creates the
+security-context listener, audits its globals and truncates code.log in the private
+store, then forks the supervisor. The supervisor leaves the session, points its own
+stdio at code.log and forks a guard, which runs
+
+    pasta <net args> -- sh -c OUTER_STAGE <code.log> <seccomp> <fifo>
+        bwrap <args> --seccomp 3 -- sh -c INNER_STAGE <command>
+
+pasta's stdio is /dev/null: on Fedora it runs in SELinux's pasta_t, which may not
+write code.log, so its own output is discarded. pasta closes every inherited
+descriptor above 2, so the outer stage, back in the user's domain, reopens stdout and
+stderr on code.log in append mode, the seccomp program on fd 3, which bwrap loads and
+closes, and the ready FIFO's write end on fd 4. The inner stage runs after bwrap's
+setup, seccomp included, writes one byte to fd 4 and closes it, so the command starts
+with only stdin (/dev/null) and stdout and stderr (code.log). Once the byte arrives
+the supervisor tells the launcher, which exits 0; the guard exiting first, or
+READY_TIMEOUT passing, makes it exit 1 instead. A launcher that exits before then,
+e.g. on Ctrl-C, makes the supervisor stop the sandbox.
+
+pasta_t may not signal the sandbox, so neither pasta nor the parent-death signals of
+its children stop bwrap or VS Code, and the exec into pasta_t clears pasta's own
+parent-death signal. The guard, never exec'd and still in the user's domain, owns
+teardown. It keeps only its stdio and the lock, and finds the outer stage (after its
+exec the outer bwrap, PID 1 of pasta's PID namespace) from the host side as pasta's
+namespace-init child. To stop the sandbox it SIGKILLs the outer bwrap through a
+pidfd, which ends that namespace, or pasta while the outer stage is not found yet. As
+a child subreaper it then kills and reaps whatever pasta leaves behind, so the lock
+keeps a new launch out until nothing of the sandbox runs. It stops the sandbox when
+pasta exits, when the supervisor dies (its parent-death signal), and when the
+supervisor forwards SIGTERM, SIGINT or SIGHUP to it or gives up on readiness. It exits
+with pasta's status.
+
+The supervisor is a child subreaper as well, so a guard that dies first, killed or
+crashed, leaves pasta and then the outer stage to the supervisor. After every guard
+exit, before or after readiness, the supervisor reaps the guard, then kills and reaps
+its own children until none remain. Only then does it close the close_fd write end,
+revoking the Wayland listener, and remove the per-launch files, and the kernel
+releases the lock. The death of both the supervisor and the guard leaves the sandbox
+running without the lock.
+"""
+
+import argparse
+import ctypes
+import errno
+import fcntl
+import functools
+import os
+import pwd
+import re
+import select
+import shlex
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import termios
+import traceback
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Literal
+
+# User configuration: always-mounted roots (relative paths are under $HOME), forwarded
+# localhost ports, extra Electron switches and extra sandbox environment variables
+ROOTS: tuple[tuple[str, Literal["ro", "rw"]], ...] = ()
+PORTS: tuple[int, ...] = ()
+CODE_ARGS = ("--disable-features=WaylandFractionalScaleV1",)
+EXTRA_ENV: Mapping[str, str] = MappingProxyType({})
+
+# Absolute paths, never looked up on PATH
+BWRAP = "/usr/bin/bwrap"
+PASTA = "/usr/bin/pasta"
+ELECTRON = "/usr/share/code/code"
+
+# Applied after CODE_ARGS; Chromium keeps the last value of a repeated switch
+ELECTRON_SWITCHES = (
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--password-store=basic",
+)
+
+READY_TIMEOUT = 30.0
+WAYLAND_TIMEOUT = 5.0
+
+# Relative to $XDG_RUNTIME_DIR; never mounted, so no root may overlap it
+STATE_DIR = "vscode-sandbox"
+# The only entry of the host-only state directory that outlives a launch
+LOCK_FILE = "lock"
+
+# Forwarded to the guard as SIGTERM by the supervisor; any of them, or the
+# supervisor's death through the guard's PR_SET_PDEATHSIG, makes the guard stop the
+# sandbox
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+PR_SET_PDEATHSIG = 1
+PR_SET_CHILD_SUBREAPER = 36
+
+# How often the guard looks for the outer stage until it has found it
+OUTER_SCAN_INTERVAL = 0.05
+
+# pasta forwards DNS sent to this address; the host's 127.0.0.53 stub is unreachable
+DNS_FORWARD = "169.254.1.1"
+RESOLV_CONF = "/etc/resolv.conf"
+
+# The only environment keys the launcher reads, besides LC_*; no variable can bypass
+# a protection
+ENV_KEYS = frozenset({"HOME", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "LANG"})
+
+# Only render nodes are exposed; primary nodes allow modesetting
+DRI_DIR = "/dev/dri"
+SYS_PATHS = ("/sys/block", "/sys/bus", "/sys/class", "/sys/dev", "/sys/devices")
+
+# pasta's stdio is /dev/null because SELinux's pasta_t may not write the log; fd 3
+# carries the seccomp program to bwrap, fd 4 the ready FIFO's write end. pasta closes
+# inherited descriptors, so the outer stage opens all of them after it
+OUTER_STAGE = 'exec >>"$1" 2>&1 3<"$2" 4>"$3"; shift 3; exec "$@"'
+# Runs after bwrap's setup, seccomp included, and keeps fd 4 from the command
+INNER_STAGE = 'printf r >&4 && exec 4>&- && exec "$@"'
+# Bound over the ~/bin/code shim inside the sandbox, so `code` in the integrated
+# terminal reaches the running window instead of starting a nested launch. The RPM's
+# CLI finds its install through $0, so /usr/bin/code itself cannot be bound there. The
+# CLI passes its arguments to a second Electron that hands off to the window; it gets
+# the wrapper-owned switches, as without --no-sandbox Chromium aborts on its setuid
+# sandbox first. CODE_ARGS is left out: the CLI warns on every call about switches it
+# does not know, and the handoff opens no window
+SANDBOX_CODE = f'#!/bin/sh\nexec /usr/bin/code {shlex.join(ELECTRON_SWITCHES)} "$@"\n'
+
+HOME_RO_PATHS = (
+    ".micromamba",
+    "bin",
+    ".local/bin",
+    ".config/nvim",
+    ".local/share/uv/python",
+    ".gitconfig",
+    ".local/share/jupyter/kernels",
+    ".local/share/fonts",
+    ".fonts",
+    ".config/fontconfig",
+    ".icons",
+    ".local/share/icons",
+    ".themes",
+    ".config/gtk-3.0",
+    ".config/gtk-4.0",
+)
+HOME_RW_PATHS = (".config/Code", ".vscode", ".vscode-shared")
+
+# Relative to $HOME; the private store is never visible as a whole inside the sandbox
+STORE = ".local/share/vscode-sandbox"
+
+SYSTEM_TREES = (
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/etc",
+    "/opt",
+    "/var",
+    "/boot",
+    "/root",
+    "/srv",
+    "/tmp",
+    "/run",
+    "/proc",
+    "/sys",
+    "/dev",
+)
+
+# A read-only constant root may not be or cover these, $HOME or a protected path
+RO_ROOT_LIMITS = ("/", "/run", "/data")
+
+# Globals Sway 1.11 advertises to security-context clients, conditional ones included;
+# any other advertised global aborts the launch
+WAYLAND_GLOBALS = frozenset(
+    {
+        "wl_compositor",
+        "wl_subcompositor",
+        "wl_shm",
+        "wl_seat",
+        "wl_output",
+        "wl_data_device_manager",
+        "xdg_wm_base",
+        "zxdg_decoration_manager_v1",
+        "org_kde_kwin_server_decoration_manager",
+        "zwp_tablet_manager_v2",
+        "zwp_relative_pointer_manager_v1",
+        "zwp_pointer_constraints_v1",
+        "zwp_pointer_gestures_v1",
+        "wp_presentation",
+        "wp_alpha_modifier_v1",
+        "zwp_text_input_manager_v3",
+        "ext_idle_notifier_v1",
+        "zwp_idle_inhibit_manager_v1",
+        "ext_output_image_capture_source_manager_v1",
+        "wp_viewporter",
+        "wp_single_pixel_buffer_manager_v1",
+        "wp_content_type_manager_v1",
+        "wp_fractional_scale_manager_v1",
+        "wp_tearing_control_manager_v1",
+        "zxdg_exporter_v1",
+        "zxdg_importer_v1",
+        "zxdg_exporter_v2",
+        "zxdg_importer_v2",
+        "xdg_activation_v1",
+        "wp_cursor_shape_manager_v1",
+        "zwp_linux_dmabuf_v1",
+        "wp_linux_drm_syncobj_manager_v1",
+        "zwp_primary_selection_device_manager_v1",
+    }
+)
+SECURITY_CONTEXT_MANAGER = "wp_security_context_manager_v1"
+
+# Flatpak 1.18.4's non-devel, no-multiarch filter; every other syscall is allowed
+SECCOMP_EPERM = (
+    "syslog",
+    "uselib",
+    "acct",
+    "quotactl",
+    "add_key",
+    "keyctl",
+    "request_key",
+    "move_pages",
+    "mbind",
+    "get_mempolicy",
+    "set_mempolicy",
+    "migrate_pages",
+    "unshare",
+    "setns",
+    "mount",
+    "umount",
+    "umount2",
+    "pivot_root",
+    "chroot",
+    "modify_ldt",
+    "perf_event_open",
+    "ptrace",
+)
+# ENOSYS rather than EPERM, so callers fall back to clone and the legacy mount API
+SECCOMP_ENOSYS = (
+    "clone3",
+    "open_tree",
+    "move_mount",
+    "fsopen",
+    "fsconfig",
+    "fsmount",
+    "fspick",
+    "mount_setattr",
+)
+# Exceeds Flatpak, which denies only CLONE_NEWUSER; CLONE_NEWTIME's bit is clone()'s
+# exit-signal field
+CLONE_NAMESPACES = (
+    os.CLONE_NEWNS,
+    os.CLONE_NEWCGROUP,
+    os.CLONE_NEWUTS,
+    os.CLONE_NEWIPC,
+    os.CLONE_NEWUSER,
+    os.CLONE_NEWPID,
+    os.CLONE_NEWNET,
+)
+# Compared on the low 32 bits, as the kernel does
+IOCTL_DENIED = (termios.TIOCSTI, termios.TIOCLINUX)
+PER_LINUX = 0
+SOCKET_FAMILIES = (
+    socket.AF_UNSPEC,
+    socket.AF_UNIX,
+    socket.AF_INET,
+    socket.AF_INET6,
+    socket.AF_NETLINK,
+)
+
+
+class SandboxError(Exception):
+    """An expected launch failure, reported without a traceback."""
+
+
+@dataclass(frozen=True)
+class Root:
+    """A host directory bound into the sandbox at its own path."""
+
+    path: Path
+    mode: Literal["ro", "rw"]
+
+
+@dataclass(frozen=True)
+class Config:
+    """Launch inputs resolved from host-owned sources only."""
+
+    home: Path
+    roots: tuple[Root, ...]
+    ports: tuple[int, ...]
+    paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class HostPaths:
+    """Host-side locations of one launch; the sandbox sees none of them as a whole."""
+
+    state_dir: Path
+    store: Path
+    display: Path
+
+
+def port(value: str) -> int:
+    """
+    Parse a TCP port number for argparse.
+
+    :param value: The command-line value.
+    :return: The port number.
+    :raises argparse.ArgumentTypeError: When the value is not an integer in 1-65535.
+    """
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid port: {value!r}") from None
+    if not 1 <= number <= 65535:
+        raise argparse.ArgumentTypeError(f"port outside 1-65535: {number}")
+    return number
+
+
+def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    """
+    Parse the launcher's command line.
+
+    :param argv: Arguments without the program name, or None for sys.argv.
+    :return: The parsed paths, ports and --only-args flag.
+    """
+    parser = argparse.ArgumentParser(
+        prog="vscode-sandbox",
+        description="Open VS Code in a pasta and Bubblewrap sandbox.",
+    )
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        help=(
+            "files or directories to open; a directory becomes a writable root, a "
+            "file is rooted at its nearest .git ancestor, else its parent"
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        action="append",
+        type=port,
+        default=[],
+        help="forward this host localhost TCP port into the sandbox (repeatable)",
+    )
+    parser.add_argument(
+        "--only-args", action="store_true", help="ignore the roots configured in ROOTS"
+    )
+    return parser.parse_intermixed_args(argv)
+
+
+def resolve_path(path: Path) -> Path:
+    """
+    Resolve an existing path to its canonical form.
+
+    :param path: An absolute path.
+    :return: The path with every symlink resolved.
+    :raises SandboxError: When the path or one of its symlink targets is missing.
+    """
+    try:
+        return path.resolve(strict=True)
+    except OSError as error:
+        raise SandboxError(f"cannot resolve {path}: {error.strerror}") from None
+
+
+def git_root(cwd: Path) -> Path | None:
+    """
+    Find the nearest directory, from cwd upwards, that holds a .git entry.
+
+    The entry is only checked for existence, never read and never passed to Git, so a
+    gitdir file or core.worktree cannot redirect the root.
+
+    :param cwd: The canonical directory the walk starts from.
+    :return: The directory holding .git, or None when no ancestor has one.
+    """
+    for directory in (cwd, *cwd.parents):
+        try:
+            (directory / ".git").lstat()
+        except FileNotFoundError:
+            continue
+        return directory
+    return None
+
+
+def arg_root(path: Path) -> Path:
+    """
+    Find the root a path argument is bound under.
+
+    :param path: A canonical path argument.
+    :return: A directory itself; for a file, its nearest ancestor holding .git, else
+        its parent.
+    """
+    if path.is_dir():
+        return path
+    root = git_root(path.parent)
+    return path.parent if root is None else root
+
+
+def protected_paths(
+    *, home: Path, script: Path, state_dir: Path, ro_roots: Iterable[Path]
+) -> tuple[Path, ...]:
+    """
+    Collect the paths no writable root may overlap.
+
+    Both the lexical and the resolved form are kept, so a symlinked toolchain is
+    protected at its target too. The profile and store bind sources are included
+    because a writable root holding their target could swap it for a symlink that a
+    later launch would bind.
+
+    :param home: The canonical home directory.
+    :param script: The running script's resolved path.
+    :param state_dir: The host-only state directory.
+    :param ro_roots: The read-only constant roots in use.
+    :return: The protected paths, sorted so a rejection names the outermost one.
+    """
+    lexical = (
+        *(home / relative for relative in HOME_RO_PATHS),
+        *(home / relative for relative in HOME_RW_PATHS),
+        home / STORE,
+        home / STORE / "cache",
+        home / STORE / "jupyter-runtime",
+        *ro_roots,
+        script,
+        home / "bin" / "vscode-sandbox",
+        home / "bin" / "code",
+        # GEM_HOME, whose bin directory is on the host PATH
+        home / "gems",
+        state_dir,
+        *map(Path, SYSTEM_TREES),
+    )
+    return tuple(sorted({*lexical, *(path.resolve() for path in lexical)}))
+
+
+def check_rw(
+    path: Path, *, lexical: Path, home: Path, protected: Iterable[Path]
+) -> None:
+    """
+    Reject a writable root that would expose or override protected host paths.
+
+    :param path: The canonical root.
+    :param lexical: The path the root was given as, absolute and normalised, not
+        resolved.
+    :param home: The canonical home directory.
+    :param protected: Paths the root may not equal, contain or lie inside.
+    :raises SandboxError: When the root is rejected.
+    """
+    if home.is_relative_to(path):
+        raise SandboxError(f"writable root {path} is $HOME or one of its ancestors")
+    for form in (lexical, path):
+        if (
+            form != home
+            and form.is_relative_to(home)
+            and form.relative_to(home).parts[0].startswith(".")
+        ):
+            raise SandboxError(f"writable root {form} is under a hidden entry of $HOME")
+    for other in protected:
+        if path.is_relative_to(other) or other.is_relative_to(path):
+            raise SandboxError(f"writable root {path} overlaps protected path {other}")
+
+
+def check_ro(
+    path: Path, *, lexical: Path, home: Path, protected: Iterable[Path]
+) -> None:
+    """
+    Reject a read-only constant root that would expose hidden host paths.
+
+    :param path: The canonical root.
+    :param lexical: The configured root joined to $HOME and normalised, not resolved.
+    :param home: The canonical home directory.
+    :param protected: Protected paths the root may not equal or contain.
+    :raises SandboxError: When the root is rejected.
+    """
+    limits = tuple(map(Path, RO_ROOT_LIMITS))
+    for other in (*limits, *(limit.resolve() for limit in limits), home, *protected):
+        if other.is_relative_to(path):
+            raise SandboxError(f"read-only root {path} is or covers {other}")
+    run = Path("/run")
+    for form in (lexical, path):
+        if form.is_relative_to(run) or form.is_relative_to(run.resolve()):
+            raise SandboxError(f"read-only root {form} is inside /run")
+        if (
+            form != home
+            and form.is_relative_to(home)
+            and form.relative_to(home).parts[0][0] == "."
+        ):
+            raise SandboxError(
+                f"read-only root {form} is under a hidden entry of $HOME"
+            )
+
+
+def resolve_config(
+    args: argparse.Namespace, *, home: Path, cwd: Path, script: Path, state_dir: Path
+) -> Config:
+    """
+    Resolve and validate the roots, ports and paths of one launch.
+
+    :param args: The parsed command line.
+    :param home: The canonical home directory.
+    :param cwd: The canonical working directory.
+    :param script: The running script's resolved path.
+    :param state_dir: The host-only state directory.
+    :return: The launch config, with roots deduplicated and parents first.
+    :raises SandboxError: When a path is missing, a port is invalid or a root is
+        rejected.
+    """
+    paths = tuple(resolve_path(cwd / arg) for arg in args.paths)
+    if paths:
+        arg_roots = tuple(map(arg_root, paths))
+        arg_lexical = tuple(Path(os.path.normpath(cwd / arg)) for arg in args.paths)
+    else:
+        root = git_root(cwd)
+        paths = arg_roots = arg_lexical = () if root is None else (root,)
+    constant = () if args.only_args else ROOTS
+    constant_roots = tuple(
+        Root(path=resolve_path(home / path), mode=mode) for path, mode in constant
+    )
+    constant_lexical = tuple(
+        Path(os.path.normpath(home / path)) for path, _ in constant
+    )
+    roots = (*constant_roots, *(Root(path=path, mode="rw") for path in arg_roots))
+
+    ro_roots = tuple(root.path for root in constant_roots if root.mode == "ro")
+    base_protected = protected_paths(
+        home=home, script=script, state_dir=state_dir, ro_roots=()
+    )
+    for (path, mode), root, form in zip(
+        constant, constant_roots, constant_lexical, strict=True
+    ):
+        if mode == "ro":
+            check_ro(root.path, lexical=form, home=home, protected=base_protected)
+        elif mode != "rw":
+            raise SandboxError(f"ROOTS entry {path!r} has mode {mode!r}, not ro or rw")
+    protected = protected_paths(
+        home=home, script=script, state_dir=state_dir, ro_roots=ro_roots
+    )
+    for root, form in zip(roots, (*constant_lexical, *arg_lexical), strict=True):
+        if root.mode == "rw":
+            check_rw(root.path, lexical=form, home=home, protected=protected)
+
+    for number in PORTS:
+        if not 1 <= number <= 65535:
+            raise SandboxError(f"port in PORTS outside 1-65535: {number}")
+
+    return Config(
+        home=home,
+        roots=tuple(sorted(set(roots), key=lambda root: root.path.parts)),
+        ports=tuple(sorted({*PORTS, *args.port})),
+        paths=paths,
+    )
+
+
+def host_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """
+    Keep only the environment entries the launcher may read.
+
+    :param environ: The launcher's environment.
+    :return: The ENV_KEYS and LC_* entries.
+    """
+    return {
+        key: value
+        for key, value in environ.items()
+        if key in ENV_KEYS or key.startswith("LC_")
+    }
+
+
+def sandbox_env(env: Mapping[str, str], *, home: Path) -> dict[str, str]:
+    """
+    Build the environment of the sandboxed command.
+
+    :param env: The filtered host environment, from host_env.
+    :param home: The canonical home directory.
+    :return: The wrapper-set variables, the host locale, then EXTRA_ENV.
+    :raises SandboxError: When EXTRA_ENV sets a wrapper-set variable.
+    """
+    user = pwd.getpwuid(os.getuid()).pw_name
+    wrapper_env = {
+        "HOME": str(home),
+        "USER": user,
+        "LOGNAME": user,
+        "PATH": f"{home}/bin:{home}/.local/bin:/usr/local/bin:/usr/bin",
+        "SHELL": "/bin/bash",
+        "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+        "WAYLAND_DISPLAY": "wayland-0",
+        "XDG_SESSION_TYPE": "wayland",
+    }
+    collisions = sorted(wrapper_env.keys() & EXTRA_ENV.keys())
+    if collisions:
+        raise SandboxError(f"EXTRA_ENV must not set {', '.join(collisions)}")
+    locale = {
+        key: value
+        for key, value in env.items()
+        if key == "LANG" or key.startswith("LC_")
+    }
+    return {**wrapper_env, **locale, **EXTRA_ENV}
+
+
+def resolv_args(source: Path, target: Path) -> tuple[str, ...]:
+    """
+    Bind the sandbox resolv.conf where the host's /etc/resolv.conf resolves to.
+
+    :param source: The host-only resolv.conf naming DNS_FORWARD.
+    :param target: The canonical path of the host's /etc/resolv.conf.
+    :return: bwrap arguments creating missing parents under /run, then the bind.
+    """
+    parents = (
+        parent
+        for parent in reversed(target.parents)
+        if parent.is_relative_to("/run") and parent != Path("/run")
+    )
+    return (
+        *(arg for parent in parents for arg in ("--dir", str(parent))),
+        "--ro-bind",
+        str(source),
+        str(target),
+    )
+
+
+def bwrap_args(
+    config: Config,
+    *,
+    wayland_socket: Path,
+    resolv_conf: Path,
+    sandbox_code: Path,
+    env: Mapping[str, str],
+    command: Sequence[str],
+) -> tuple[str, ...]:
+    """
+    Build the bwrap command line, ending with the inner stage running the command.
+
+    :param config: The resolved launch config.
+    :param wayland_socket: The host security-context socket, bound as wayland-0.
+    :param resolv_conf: The host-only resolv.conf.
+    :param sandbox_code: The host-only SANDBOX_CODE script, bound over the shim.
+    :param env: The sandbox environment, from sandbox_env.
+    :param command: The command the inner stage execs.
+    :return: The bwrap argv, executable first.
+    """
+    home = config.home
+    store = home / STORE
+    run_user = f"/run/user/{os.getuid()}"
+    args = [
+        BWRAP,
+        "--unshare-all",
+        "--share-net",
+        "--unshare-user",
+        "--uid",
+        str(os.getuid()),
+        "--gid",
+        str(os.getgid()),
+        "--disable-userns",
+        "--assert-userns-disabled",
+        "--cap-drop",
+        "ALL",
+        "--die-with-parent",
+        "--new-session",
+        "--clearenv",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/etc",
+        "/etc",
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/sbin",
+        "/sbin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/dev/shm",
+    ]
+    for node in sorted(Path(DRI_DIR).glob("renderD*")):
+        args += ("--dev-bind", str(node), f"/dev/dri/{node.name}")
+    for path in SYS_PATHS:
+        args += ("--ro-bind", path, path)
+    args += ("--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", str(home))
+
+    # Roots go first so the wrapper's binds below always win over a covering ro root
+    for root in config.roots:
+        option = "--bind" if root.mode == "rw" else "--ro-bind"
+        args += (option, str(root.path), str(root.path))
+    for relative in HOME_RO_PATHS:
+        args += ("--ro-bind-try", str(home / relative), str(home / relative))
+    # bwrap cannot create a mount point inside the read-only ~/bin bind
+    shim = home / "bin" / "code"
+    if shim.exists():
+        args += ("--ro-bind", str(sandbox_code), str(shim))
+    for relative in HOME_RW_PATHS:
+        args += ("--bind", str(home / relative), str(home / relative))
+    args += (
+        "--bind",
+        str(store / "cache"),
+        str(home / ".cache"),
+        "--bind",
+        str(store / "jupyter-runtime"),
+        str(home / ".local/share/jupyter/runtime"),
+        "--dir",
+        run_user,
+        "--ro-bind",
+        str(wayland_socket),
+        f"{run_user}/wayland-0",
+        *resolv_args(resolv_conf, Path(RESOLV_CONF).resolve()),
+    )
+
+    for key, value in env.items():
+        args += ("--setenv", key, value)
+    return (*args, "--seccomp", "3", "--", *inner_stage(command))
+
+
+def pasta_args(ports: Sequence[int]) -> tuple[str, ...]:
+    """
+    Build the pasta command line up to its command separator.
+
+    :param ports: Host localhost TCP ports forwarded into the sandbox.
+    :return: The pasta argv, executable first and "--" last.
+    """
+    return (
+        PASTA,
+        "--config-net",
+        "-t",
+        "none",
+        "-u",
+        "none",
+        "-T",
+        ",".join(map(str, ports)) or "none",
+        "-U",
+        "none",
+        "--no-map-gw",
+        "--dns-forward",
+        DNS_FORWARD,
+        "--",
+    )
+
+
+def outer_stage(
+    log_path: Path, seccomp_path: Path, ready_path: Path
+) -> tuple[str, ...]:
+    """
+    Build the shell stage between pasta and bwrap.
+
+    :param log_path: The log, reopened in append mode as stdout and stderr.
+    :param seccomp_path: The host-only seccomp program, opened on fd 3.
+    :param ready_path: The host-only ready FIFO, opened for writing on fd 4.
+    :return: The stage's argv; the bwrap argv follows it.
+    """
+    return (
+        "/bin/sh",
+        "-c",
+        OUTER_STAGE,
+        "sh",
+        str(log_path),
+        str(seccomp_path),
+        str(ready_path),
+    )
+
+
+def inner_stage(command: Sequence[str]) -> tuple[str, ...]:
+    """
+    Build the shell stage that signals readiness and execs the sandboxed command.
+
+    :param command: The command to exec.
+    :return: The stage's argv, command included.
+    """
+    return ("/bin/sh", "-c", INNER_STAGE, "sh", *command)
+
+
+def electron_args(paths: Sequence[Path]) -> tuple[str, ...]:
+    """
+    Build the Electron command line.
+
+    :param paths: The paths to open: the path arguments, or the .git-walk root.
+    :return: The Electron argv, wrapper-owned switches after CODE_ARGS.
+    """
+    return (ELECTRON, *CODE_ARGS, *ELECTRON_SWITCHES, *map(str, paths))
+
+
+def tool_version(path: str) -> str:
+    """
+    Run a tool's --version.
+
+    :param path: The tool's absolute path.
+    :return: The tool's standard output.
+    :raises SandboxError: When the tool cannot run, times out or exits non-zero.
+    """
+    try:
+        result = subprocess.run(
+            (path, "--version"),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SandboxError(f"cannot run {path} --version: {error}") from None
+    return result.stdout
+
+
+def bwrap_version(output: str) -> tuple[int, ...]:
+    """
+    Parse bwrap --version output, e.g. "bubblewrap 0.12.0".
+
+    :param output: The tool's standard output.
+    :return: The version as integers.
+    :raises SandboxError: When the output has no version.
+    """
+    match = re.match(r"bubblewrap (\d+)\.(\d+)\.(\d+)\b", output)
+    if match is None:
+        raise SandboxError(f"cannot parse {BWRAP} --version: {output.strip()!r}")
+    return tuple(int(part) for part in match.groups())
+
+
+def pasta_date(output: str) -> int:
+    """
+    Parse the release date from pasta --version output.
+
+    Upstream prints "pasta 2025_04_15.2340bbf"; Fedora prints its RPM version, e.g.
+    "pasta 0^20261002.gcba3570-1.fc44.x86_64".
+
+    :param output: The tool's standard output.
+    :return: The date as YYYYMMDD.
+    :raises SandboxError: When the output has no date.
+    """
+    match = re.match(r"pasta (?:0\^(\d{8})|(\d{4})_(\d{2})_(\d{2}))\.", output)
+    if match is None:
+        raise SandboxError(f"cannot parse {PASTA} --version: {output.strip()!r}")
+    return int("".join(part for part in match.groups() if part is not None))
+
+
+def preflight(env: Mapping[str, str], *, home: Path) -> HostPaths:
+    """
+    Check every launch prerequisite, then create the host-side directories.
+
+    :param env: The filtered host environment, from host_env.
+    :param home: The canonical home directory.
+    :return: The host-only state directory, the private store and the display socket.
+    :raises SandboxError: When a variable, binary or version is missing or too old, or
+        a directory cannot be created.
+    """
+    runtime_dir = Path(env.get("XDG_RUNTIME_DIR", ""))
+    if not runtime_dir.is_absolute():
+        raise SandboxError("XDG_RUNTIME_DIR must be set to an absolute path")
+    display = env.get("WAYLAND_DISPLAY", "")
+    if not display:
+        raise SandboxError("WAYLAND_DISPLAY must be set")
+    for path in (BWRAP, PASTA, ELECTRON):
+        if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+            raise SandboxError(f"{path} is missing or not executable")
+
+    version = bwrap_version(tool_version(BWRAP))
+    if version < (0, 12, 0):
+        found = ".".join(map(str, version))
+        raise SandboxError(f"bubblewrap >= 0.12.0 required, found {found}")
+    date = pasta_date(tool_version(PASTA))
+    if date < 20250415:
+        raise SandboxError(f"pasta >= 2025_04_15 required, found {date}")
+
+    state_dir = runtime_dir / STATE_DIR
+    store = home / STORE
+    try:
+        state_dir.mkdir(mode=0o700, exist_ok=True)
+        store.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for directory in (
+            store / "cache",
+            store / "jupyter-runtime",
+            *(home / relative for relative in HOME_RW_PATHS),
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise SandboxError(
+            f"cannot create {error.filename}: {error.strerror}"
+        ) from None
+    return HostPaths(state_dir=state_dir, store=store, display=runtime_dir / display)
+
+
+def build_seccomp(path: Path) -> None:
+    """
+    Write the sandbox's seccomp program as BPF for bwrap's --seccomp.
+
+    The filter adds no architecture, so syscalls from a non-native ABI are killed.
+
+    :param path: The host-only file the program is written to.
+    :raises SandboxError: When the seccomp bindings are missing or the filter cannot be
+        built or written.
+    """
+    try:
+        import seccomp
+    except ImportError as error:
+        raise SandboxError(
+            f"cannot import seccomp (install libseccomp-python): {error}"
+        ) from None
+
+    eperm = seccomp.ERRNO(errno.EPERM)
+    try:
+        bpf = seccomp.SyscallFilter(seccomp.ALLOW)
+        # Non-exact rules, so a syscall absent on this architecture (umount) is skipped
+        for name in SECCOMP_EPERM:
+            bpf.add_rule(eperm, name)
+        for name in SECCOMP_ENOSYS:
+            bpf.add_rule(seccomp.ERRNO(errno.ENOSYS), name)
+        for flag in CLONE_NAMESPACES:
+            bpf.add_rule(eperm, "clone", seccomp.Arg(0, seccomp.MASKED_EQ, flag, flag))
+        for request in IOCTL_DENIED:
+            bpf.add_rule(
+                eperm, "ioctl", seccomp.Arg(1, seccomp.MASKED_EQ, 0xFFFFFFFF, request)
+            )
+        bpf.add_rule(eperm, "personality", seccomp.Arg(0, seccomp.NE, PER_LINUX))
+
+        eafnosupport = seccomp.ERRNO(errno.EAFNOSUPPORT)
+        highest = max(SOCKET_FAMILIES)
+        for family in range(highest):
+            if family not in SOCKET_FAMILIES:
+                bpf.add_rule_exactly(
+                    eafnosupport, "socket", seccomp.Arg(0, seccomp.EQ, family)
+                )
+        bpf.add_rule_exactly(
+            eafnosupport, "socket", seccomp.Arg(0, seccomp.GE, highest + 1)
+        )
+
+        with path.open("wb") as file:
+            bpf.export_bpf(file)
+    except (RuntimeError, OSError) as error:
+        raise SandboxError(f"cannot build the seccomp filter: {error}") from None
+
+
+def wl_message(object_id: int, opcode: int, *args: int | str) -> bytes:
+    """
+    Encode one Wayland request in native byte order.
+
+    :param object_id: The object the request is sent to.
+    :param opcode: The request's opcode.
+    :param args: uint, new_id or string arguments; fds travel separately.
+    :return: The message, header first.
+    """
+    body = b""
+    for arg in args:
+        if isinstance(arg, str):
+            data = arg.encode() + b"\0"
+            body += struct.pack("=I", len(data)) + data + b"\0" * (-len(data) % 4)
+        else:
+            body += struct.pack("=I", arg)
+    return struct.pack("=II", object_id, (8 + len(body)) << 16 | opcode) + body
+
+
+def wl_string(body: bytes, offset: int) -> tuple[str, int]:
+    """
+    Decode a Wayland string argument.
+
+    :param body: The message body.
+    :param offset: The offset of the string's length field.
+    :return: The string and the offset of the next argument.
+    """
+    (length,) = struct.unpack_from("=I", body, offset)
+    start = offset + 4
+    value = body[start : start + length - 1].decode()
+    return value, start + length + (-length % 4)
+
+
+class Wayland:
+    """A minimal client on one connected Wayland socket."""
+
+    DISPLAY = 1
+
+    def __init__(self, sock: socket.socket) -> None:
+        """
+        Wrap a connected socket.
+
+        :param sock: The connection, with WAYLAND_TIMEOUT set.
+        """
+        self.sock = sock
+        self.buffer = b""
+        self.last_id = self.DISPLAY
+        self.registry = 0
+
+    def new_id(self) -> int:
+        """
+        Allocate a client object ID.
+
+        :return: The next unused ID.
+        """
+        self.last_id += 1
+        return self.last_id
+
+    def request(
+        self, object_id: int, opcode: int, *args: int | str, fds: Sequence[int] = ()
+    ) -> None:
+        """
+        Send one request.
+
+        :param object_id: The object the request is sent to.
+        :param opcode: The request's opcode.
+        :param args: The request's arguments, fds excluded.
+        :param fds: Descriptors sent with the request via SCM_RIGHTS, in argument
+            order.
+        """
+        message = wl_message(object_id, opcode, *args)
+        if fds:
+            socket.send_fds(self.sock, [message], fds)
+        else:
+            self.sock.sendall(message)
+
+    def event(self) -> tuple[int, int, bytes]:
+        """
+        Receive one event.
+
+        :return: The sending object, the opcode and the body.
+        :raises SandboxError: When the compositor closes the connection.
+        """
+        while True:
+            if len(self.buffer) >= 8:
+                object_id, header = struct.unpack_from("=II", self.buffer)
+                size = header >> 16
+                if len(self.buffer) >= size:
+                    body = self.buffer[8:size]
+                    self.buffer = self.buffer[size:]
+                    return object_id, header & 0xFFFF, body
+            data = self.sock.recv(4096)
+            if not data:
+                raise SandboxError("the Wayland compositor closed the connection")
+            self.buffer += data
+
+    def roundtrip(self) -> list[tuple[int, int, bytes]]:
+        """
+        Send wl_display.sync and collect the events received before its reply.
+
+        :return: The events, sync reply and wl_display events excluded.
+        :raises SandboxError: When the compositor sends wl_display.error.
+        """
+        callback = self.new_id()
+        self.request(self.DISPLAY, 0, callback)
+        events = []
+        while True:
+            object_id, opcode, body = self.event()
+            if object_id == self.DISPLAY and opcode == 0:
+                failed, code = struct.unpack_from("=II", body)
+                message, _ = wl_string(body, 8)
+                raise SandboxError(
+                    f"Wayland error {code} on object {failed}: {message}"
+                )
+            if object_id == callback and opcode == 0:
+                return events
+            if object_id != self.DISPLAY:
+                events.append((object_id, opcode, body))
+
+    def globals(self) -> dict[str, int]:
+        """
+        Bind the registry and collect the advertised globals.
+
+        :return: The global name of each advertised interface.
+        """
+        self.registry = self.new_id()
+        self.request(self.DISPLAY, 1, self.registry)
+        advertised = {}
+        for object_id, opcode, body in self.roundtrip():
+            if object_id == self.registry and opcode == 0:
+                (name,) = struct.unpack_from("=I", body)
+                interface, _ = wl_string(body, 4)
+                advertised[interface] = name
+        return advertised
+
+
+@contextmanager
+def wayland_connection(path: Path) -> Iterator[Wayland]:
+    """
+    Connect to a Wayland socket, every operation bounded by WAYLAND_TIMEOUT.
+
+    :param path: The socket to connect to.
+    :return: A context manager yielding the client.
+    :raises SandboxError: When the connection fails or times out.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(WAYLAND_TIMEOUT)
+            sock.connect(str(path))
+            yield Wayland(sock)
+    except TimeoutError:
+        raise SandboxError(
+            f"no reply from the Wayland compositor at {path} within {WAYLAND_TIMEOUT} s"
+        ) from None
+    except OSError as error:
+        raise SandboxError(f"Wayland setup through {path} failed: {error}") from None
+
+
+def create_security_context(display_path: Path, socket_path: Path) -> int:
+    """
+    Create a Sway security-context listener for the sandbox's Wayland clients.
+
+    The compositor keeps accepting on the listener after this connection closes,
+    until every copy of the returned descriptor is closed.
+
+    :param display_path: The session's Wayland socket.
+    :param socket_path: The host-only path the listener is bound to.
+    :return: The close_fd write end; closing it revokes the listener.
+    :raises SandboxError: When the manager is missing, the compositor reports an error
+        or the setup fails.
+    """
+    with (
+        wayland_connection(display_path) as wayland,
+        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener,
+    ):
+        manager_name = wayland.globals().get(SECURITY_CONTEXT_MANAGER)
+        if manager_name is None:
+            raise SandboxError(f"the compositor offers no {SECURITY_CONTEXT_MANAGER}")
+        listener.bind(str(socket_path))
+        listener.listen()
+        close_read, close_write = os.pipe()
+        try:
+            manager = wayland.new_id()
+            wayland.request(
+                wayland.registry, 0, manager_name, SECURITY_CONTEXT_MANAGER, 1, manager
+            )
+            context = wayland.new_id()
+            wayland.request(manager, 1, context, fds=(listener.fileno(), close_read))
+            wayland.request(context, 4)
+            wayland.roundtrip()
+        except BaseException:
+            os.close(close_write)
+            raise
+        finally:
+            os.close(close_read)
+    return close_write
+
+
+def audit_globals(socket_path: Path) -> None:
+    """
+    Check that the security-context listener advertises only allowlisted globals.
+
+    :param socket_path: The security-context listener.
+    :raises SandboxError: When a global outside WAYLAND_GLOBALS is advertised or the
+        connection fails.
+    """
+    with wayland_connection(socket_path) as wayland:
+        advertised = wayland.globals()
+    extra = sorted(advertised.keys() - WAYLAND_GLOBALS)
+    if extra:
+        raise SandboxError(
+            f"the Wayland listener advertises globals outside WAYLAND_GLOBALS: "
+            f"{', '.join(extra)}"
+        )
+
+
+def acquire_lock(state_dir: Path) -> int:
+    """
+    Take the single-instance lock in the host-only state directory.
+
+    The flock belongs to the open file description, so it is held until the last copy
+    of the returned descriptor closes, including copies inherited across fork.
+
+    :param state_dir: The host-only state directory.
+    :return: The descriptor holding the lock.
+    :raises SandboxError: When another launch holds the lock.
+    """
+    fd = os.open(state_dir / LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise SandboxError(
+            "vscode-sandbox is already running; open the path from the running "
+            "window, or close it and relaunch"
+        ) from None
+    return fd
+
+
+def remove_launch_files(state_dir: Path) -> None:
+    """
+    Remove every per-launch file from the host-only state directory.
+
+    Only the lock holder calls this, so no file left there belongs to a live launch.
+
+    :param state_dir: The host-only state directory.
+    """
+    for path in state_dir.iterdir():
+        if path.name != LOCK_FILE:
+            path.unlink()
+
+
+def die_with_parent(parent: int) -> None:
+    """
+    Make pasta receive SIGTERM when the guard dies; runs in pasta before exec.
+
+    Exits instead when the guard has already died, as the signal would never come. An
+    SELinux transition on exec, into pasta_t on Fedora, clears the signal.
+
+    :param parent: The guard's pid.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM) != 0 or os.getppid() != parent:
+        os._exit(1)
+
+
+def find_outer(pasta: int, pasta_fd: int) -> int | None:
+    """
+    Find the outer stage: pasta's child that is PID 1 of its own PID namespace.
+
+    pasta may also have namespace helpers as children, and a pid read from /proc may
+    be reused before its pidfd is open, so a candidate is kept only if, with its pidfd
+    open, its parent is pasta, it is a namespace init, and neither it nor pasta has
+    exited.
+
+    :param pasta: pasta's pid.
+    :param pasta_fd: pasta's pidfd.
+    :return: The outer stage's pidfd, or None while pasta has no such child.
+    """
+    for child in Path(f"/proc/{pasta}/task/{pasta}/children").read_text().split():
+        try:
+            pidfd = os.pidfd_open(int(child))
+        except ProcessLookupError:
+            continue
+        try:
+            status = Path(f"/proc/{child}/status").read_text()
+        except FileNotFoundError, ProcessLookupError:
+            os.close(pidfd)
+            continue
+        fields = dict(line.split(":", 1) for line in status.splitlines())
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN)
+        poller.register(pasta_fd, select.POLLIN)
+        if (
+            int(fields["PPid"]) == pasta
+            and fields["NSpid"].split()[-1] == "1"
+            and not poller.poll(0)
+        ):
+            return pidfd
+        os.close(pidfd)
+    return None
+
+
+def kill_orphans() -> None:
+    """
+    Kill and reap every remaining child of this subreaper, including those it adopts
+    meanwhile: what pasta, or the guard, left behind.
+
+    A child keeps its pid until it is reaped, so signalling it by pid is safe.
+    """
+    pid = os.getpid()
+    while True:
+        for child in Path(f"/proc/{pid}/task/{pid}/children").read_text().split():
+            os.kill(int(child), signal.SIGKILL)
+        try:
+            os.waitpid(-1, 0)
+        except ChildProcessError:
+            return
+
+
+def guard_sandbox(argv: Sequence[str], *, lock: int, parent: int) -> int:
+    """
+    Run pasta and stop the sandbox; runs in a forked child of the supervisor.
+
+    The sandbox is stopped when pasta exits, on STOP_SIGNALS and when the supervisor
+    dies. This process is not exec'd, so its parent-death signal holds, and it keeps
+    only its stdio and the lock, so it holds no pipe or FIFO end open and keeps a new
+    launch out until the sandbox is gone.
+
+    :param argv: The pasta command line.
+    :param lock: The descriptor holding the single-instance lock.
+    :param parent: The supervisor's pid.
+    :return: pasta's exit status, or 128 plus the signal number that ended it; 1 when
+        the supervisor died or a stop signal arrived before pasta started, or pasta
+        could not start.
+    """
+    os.closerange(3, lock)
+    os.closerange(lock + 1, os.sysconf("SC_OPEN_MAX"))
+    wake_read, wake_write = os.pipe()
+    os.set_blocking(wake_write, False)
+    signal.set_wakeup_fd(wake_write)
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, lambda signum, frame: None)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_CHILD_SUBREAPER, 1) != 0:
+        raise OSError(ctypes.get_errno(), "cannot become a child subreaper")
+    poller = select.poll()
+    poller.register(wake_read, select.POLLIN)
+    # A stop signal or the supervisor's death so far cancels the launch
+    if (
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM) != 0
+        or os.getppid() != parent
+        or poller.poll(0)
+    ):
+        return 1
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            preexec_fn=functools.partial(die_with_parent, os.getpid()),
+        )
+    except OSError as error:
+        print(
+            f"vscode-sandbox: error: cannot start {argv[0]}: {error}", file=sys.stderr
+        )
+        return 1
+    outer = None
+    try:
+        # A stop signal that arrived during Popen is still pending on wake_read
+        pasta = os.pidfd_open(process.pid)
+        poller.register(pasta, select.POLLIN)
+        while outer is None and not poller.poll(OUTER_SCAN_INTERVAL * 1000):
+            outer = find_outer(process.pid, pasta)
+        poller.poll()
+    finally:
+        if outer is not None:
+            # Killing PID 1 of pasta's PID namespace kills the whole namespace
+            with suppress(ProcessLookupError):
+                signal.pidfd_send_signal(outer, signal.SIGKILL)
+        else:
+            # An outer stage pasta started since the last look is reparented to this
+            # subreaper, and kill_orphans kills it
+            process.kill()
+        status = process.wait()
+        kill_orphans()
+    return status if status >= 0 else 128 - status
+
+
+def start_guard(argv: Sequence[str], *, lock: int) -> int:
+    """
+    Fork the guard, which runs pasta and owns the sandbox's teardown.
+
+    :param argv: The pasta command line.
+    :param lock: The descriptor holding the single-instance lock.
+    :return: The guard's pid.
+    """
+    parent = os.getpid()
+    guard = os.fork()
+    if guard == 0:
+        status = 1
+        try:
+            status = guard_sandbox(argv, lock=lock, parent=parent)
+        except BaseException:
+            traceback.print_exc()
+        finally:
+            os._exit(status)
+    return guard
+
+
+def wait_ready(ready_fd: int, guard_fd: int) -> None:
+    """
+    Wait for the inner stage's readiness byte.
+
+    :param ready_fd: The ready FIFO's non-blocking read end.
+    :param guard_fd: The guard's pidfd; the guard exits once pasta has.
+    :raises SandboxError: When the guard exits, the FIFO closes or READY_TIMEOUT
+        passes before the byte arrives.
+    """
+    poller = select.poll()
+    poller.register(ready_fd, select.POLLIN)
+    poller.register(guard_fd, select.POLLIN)
+    events = dict(poller.poll(READY_TIMEOUT * 1000))
+    # The byte wins over the guard's exit, which may follow it at once
+    if ready_fd in events:
+        if os.read(ready_fd, 1) == b"r":
+            return
+        raise SandboxError("the sandbox exited before it was ready")
+    if events:
+        raise SandboxError(
+            "the sandbox stopped before it was ready (pasta's output is not logged)"
+        )
+    raise SandboxError(f"the sandbox was not ready within {READY_TIMEOUT} s")
+
+
+def supervise(
+    argv: Sequence[str],
+    *,
+    ready: Path,
+    log: Path,
+    lock: int,
+    on_ready: Callable[[], None],
+) -> int:
+    """
+    Run pasta under the guard, wait for the sandbox to be ready, then for it to end.
+
+    SIGTERM, SIGINT and SIGHUP are forwarded to the guard as SIGTERM meanwhile, and
+    the guard stops the sandbox if this process dies. This process is a child
+    subreaper, so if the guard dies first, pasta and then the outer stage become its
+    children: after every guard exit it kills and reaps all of its children before
+    returning, so it must own no other children.
+
+    :param argv: The pasta command line, outer stage, bwrap and inner stage included.
+    :param ready: The ready FIFO the outer stage opens on fd 4.
+    :param log: The log the outer stage writes to, named in errors.
+    :param lock: The descriptor holding the single-instance lock, kept by the guard.
+    :param on_ready: Called once the readiness byte arrives.
+    :return: The guard's exit status: pasta's, or 128 plus the signal number that
+        ended pasta, when the guard ran to the end; 1 when it stopped the launch
+        before pasta started or could not start pasta; 128 plus the signal number
+        that ended the guard otherwise.
+    :raises SandboxError: When this process cannot become a child subreaper, the
+        guard cannot start, the sandbox is not ready or on_ready fails; the sandbox
+        is stopped first.
+    """
+    ready_fd = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(PR_SET_CHILD_SUBREAPER, 1) != 0:
+            raise SandboxError(
+                f"cannot become a child subreaper: {os.strerror(ctypes.get_errno())}"
+            )
+        try:
+            guard = start_guard(argv, lock=lock)
+        except OSError as error:
+            raise SandboxError(f"cannot start the pasta guard: {error}") from None
+        guard_fd = os.pidfd_open(guard)
+
+        def stop(signum: int, frame: object) -> None:
+            # The guard has already exited and been reaped
+            with suppress(ProcessLookupError):
+                signal.pidfd_send_signal(guard_fd, signal.SIGTERM)
+
+        previous = {signum: signal.signal(signum, stop) for signum in STOP_SIGNALS}
+        try:
+            try:
+                try:
+                    wait_ready(ready_fd, guard_fd)
+                except SandboxError as error:
+                    raise SandboxError(f"{error}; see {log}") from None
+                on_ready()
+            except SandboxError:
+                stop(signal.SIGTERM, None)
+                raise
+        finally:
+            # The guard's status first, so the sweep cannot reap it
+            _, status = os.waitpid(guard, 0)
+            # Whatever a dead guard left running was adopted by this process; the
+            # stop handlers stay installed, so a stop signal cannot cut this short
+            kill_orphans()
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+            os.close(guard_fd)
+    finally:
+        os.close(ready_fd)
+    status = os.waitstatus_to_exitcode(status)
+    return status if status >= 0 else 128 - status
+
+
+def detached_supervise(
+    argv: Sequence[str], *, ready: Path, log: Path, lock: int, notify: int
+) -> int:
+    """
+    Leave the launcher's session and terminal, then supervise pasta.
+
+    The launcher reads "ready" or the launch error from notify. After an error notify
+    stays open, so the launcher sees EOF only once this process has cleaned up and
+    exited. A launcher that has already exited stops the sandbox, and the error goes
+    to the log instead.
+
+    :param argv: The pasta command line, as for supervise.
+    :param ready: The ready FIFO.
+    :param log: The log, reopened in append mode as this process's stdout and stderr.
+    :param lock: The descriptor holding the single-instance lock.
+    :param notify: The write end of the pipe the launcher reads.
+    :return: The status from supervise, or 1 when the sandbox was not ready.
+    """
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+    log_fd = os.open(log, os.O_WRONLY | os.O_APPEND)
+    os.dup2(log_fd, 1)
+    os.dup2(log_fd, 2)
+    os.close(log_fd)
+
+    def report_ready() -> None:
+        try:
+            os.write(notify, b"ready")
+        except BrokenPipeError:
+            raise SandboxError(
+                "the launcher exited before the sandbox was ready"
+            ) from None
+        os.close(notify)
+
+    try:
+        return supervise(argv, ready=ready, log=log, lock=lock, on_ready=report_ready)
+    except SandboxError as error:
+        try:
+            os.write(notify, str(error).encode())
+        except BrokenPipeError:
+            print(f"vscode-sandbox: error: {error}", file=sys.stderr)
+        return 1
+
+
+def run_sandbox(
+    config: Config, command: Sequence[str], *, env: Mapping[str, str], detach: bool
+) -> int:
+    """
+    Run a command in the sandbox and supervise it until pasta exits.
+
+    With detach, the launcher forks once the lock, seccomp program, security-context
+    listener and audit are in place, and this function returns in both processes:
+    in the launcher once the sandbox is ready, in the supervisor once pasta exits.
+    Without it, this process supervises and, as in supervise, kills all of its
+    children when the sandbox ends, so it must own nothing else.
+
+    :param config: The resolved launch config.
+    :param command: The sandboxed command, e.g. from electron_args.
+    :param env: The filtered host environment, from host_env.
+    :param detach: Supervise from a forked child that outlives the launcher.
+    :return: 0 in a detached launcher; otherwise the status from supervise, or 1 in
+        a detached supervisor whose sandbox was not ready.
+    :raises SandboxError: When a prerequisite or protection is missing, another
+        launch holds the lock, or the sandbox is not ready.
+    """
+    host = preflight(env, home=config.home)
+    inner_env = sandbox_env(env, home=config.home)
+    log_path = host.store / "code.log"
+    lock = acquire_lock(host.state_dir)
+    close_fd = None
+    supervisor = True
+    try:
+        remove_launch_files(host.state_dir)
+        pid = os.getpid()
+        wayland = host.state_dir / f"wayland-{pid}"
+        seccomp = host.state_dir / f"seccomp-{pid}.bpf"
+        ready = host.state_dir / f"ready-{pid}.fifo"
+        resolv = host.state_dir / f"resolv-{pid}.conf"
+        code = host.state_dir / f"code-{pid}"
+
+        build_seccomp(seccomp)
+        close_fd = create_security_context(host.display, wayland)
+        audit_globals(wayland)
+        os.mkfifo(ready, mode=0o600)
+        resolv.write_text(f"nameserver {DNS_FORWARD}\n")
+        code.write_text(SANDBOX_CODE)
+        code.chmod(0o700)
+        argv = (
+            *pasta_args(config.ports),
+            *outer_stage(log_path, seccomp, ready),
+            *bwrap_args(
+                config,
+                wayland_socket=wayland,
+                resolv_conf=resolv,
+                sandbox_code=code,
+                env=inner_env,
+                command=command,
+            ),
+        )
+
+        log_path.write_bytes(b"")
+        if not detach:
+            return supervise(
+                argv, ready=ready, log=log_path, lock=lock, on_ready=lambda: None
+            )
+        read_end, write_end = os.pipe()
+        if os.fork() == 0:
+            os.close(read_end)
+            return detached_supervise(
+                argv, ready=ready, log=log_path, lock=lock, notify=write_end
+            )
+        supervisor = False
+        os.close(write_end)
+        with os.fdopen(read_end, "rb") as pipe:
+            message = pipe.read().decode()
+    finally:
+        if close_fd is not None:
+            os.close(close_fd)
+        if supervisor:
+            remove_launch_files(host.state_dir)
+        os.close(lock)
+    if message != "ready":
+        raise SandboxError(
+            message
+            or f"the supervisor exited before the sandbox was ready; see {log_path}"
+        )
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """
+    Run the launcher.
+
+    :param argv: Arguments without the program name, or None for sys.argv.
+    :return: The process exit code.
+    """
+    args = parse_args(argv)
+    try:
+        env = host_env(os.environ)
+        home = Path(env.get("HOME", ""))
+        if not home.is_absolute():
+            raise SandboxError("HOME must be set to an absolute path")
+        runtime_dir = Path(env.get("XDG_RUNTIME_DIR", ""))
+        if not runtime_dir.is_absolute():
+            raise SandboxError("XDG_RUNTIME_DIR must be set to an absolute path")
+        config = resolve_config(
+            args,
+            home=resolve_path(home),
+            cwd=Path.cwd(),
+            script=Path(__file__).resolve(),
+            state_dir=runtime_dir / STATE_DIR,
+        )
+        return run_sandbox(config, electron_args(config.paths), env=env, detach=True)
+    except SandboxError as error:
+        print(f"vscode-sandbox: error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("vscode-sandbox: error: interrupted", file=sys.stderr)
+        return 128 + signal.SIGINT
+
+
+if __name__ == "__main__":
+    sys.exit(main())

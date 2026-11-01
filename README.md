@@ -10,6 +10,7 @@ Configuration and setup scripts for a Linux development environment built around
 | `dotfiles/` | Tracked dotfiles |
 | `dotfiles/bin/` | User scripts deployed to `~/bin` |
 | `dotfiles/bin/agent-sandbox` | Python 3.12+ wrapper for `unshare`/bubblewrap isolation |
+| `dotfiles/bin/vscode-sandbox` | Fedora host wrapper running VS Code under pasta and bubblewrap; `code` launches it |
 | `dotfiles.yaml` | Manifest for `sync_dotfiles.py`: what to sync, exclude and watch |
 | `sync_dotfiles.py` | Copies dotfiles from `$HOME` back into `dotfiles/` |
 | `environment.yml` | Micromamba environment `dev` (Python and core tooling) |
@@ -17,7 +18,7 @@ Configuration and setup scripts for a Linux development environment built around
 | `julia/julia-setup.jl` | Installs the default Julia package set |
 | `dev-container/` | Dev container image, compose file, and entrypoint |
 | `dev-vm/` | KVM + QEMU + libvirt VM instructions |
-| `tests/` | Pytest coverage for installation, dotfile sync, container tools, and `agent-sandbox` |
+| `tests/` | Pytest coverage for installation, dotfile sync, container tools, `agent-sandbox`, and `vscode-sandbox` (plus its host-only probes) |
 | `pyproject.toml` | Pytest and coverage configuration (the repo is not a Python package) |
 | `Makefile` | Shortcuts for the commands below (`make help`) |
 
@@ -57,6 +58,7 @@ The installer preserves existing `~/.gitconfig`, `~/.config/sway`, `~/.config/wa
 | [Git and worktrees](docs/git.md) | Identity, signing, delta, and the git-bareify layout |
 | [Dotfiles](docs/dotfiles.md) | Sync commands, manifest rules, and safety checks |
 | [Agent sandbox](docs/agent-sandbox.md) | Filesystem access, persistent state, signing, and isolation limits |
+| [VS Code sandbox](docs/vscode-sandbox.md) | Launch paths, filesystem view, network, Wayland allowlist, supervision, and host verification for `vscode-sandbox` |
 | [Pi configuration](dotfiles/.pi/agent/README.md) | Models, modes, guards, subagents, and extensions |
 | [Dev container](dev-container/README.md) | Container build, isolation, and Git signing |
 | [Dev VM](dev-vm/README.md) | KVM, QEMU, and libvirt setup |

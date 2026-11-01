@@ -3,6 +3,11 @@
 The checked-in [settings](../dotfiles/.config/Code/User/settings.json) and [key bindings](../dotfiles/.config/Code/User/keybindings.json) deploy to `~/.config/Code/User/` only when `~/.config/Code` is missing.
 The settings use JSON with comments and configure Neovim integration, Python/Ruff, Jupyter notebooks, Julia, and terminal profiles.
 
+## Sandboxed launch
+
+On the Fedora host, launch VS Code only with `code` or [`vscode-sandbox`](vscode-sandbox.md), which confines it with pasta and Bubblewrap and reuses this profile read-write.
+The RPM's application menu entry, file-manager "Open with" and `vscode://` links start VS Code unsandboxed, with full user authority, and it loads whatever the sandbox wrote to `~/.vscode` and `~/.config/Code`.
+
 ## Setup
 
 Install the extensions corresponding to the features you use. Explicit extension identifiers in the settings include `asvetliakov.vscode-neovim` and `charliermarsh.ruff`; the configuration also contains Python, Jupyter, Julia, spelling, docstring, and Markdown-preview preferences. The theme is One Dark Pro Darker and the editor font is JetBrainsMono Nerd Font.
