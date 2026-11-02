@@ -7,11 +7,14 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import types
 from collections.abc import Callable, Iterator
 from importlib.machinery import SourceFileLoader
@@ -972,7 +975,7 @@ def test_main_dry_run_missing_socket_warns(
     assert "llm-agent.sock" not in read.out
     assert "SSH_AUTH_SOCK" not in read.out
     assert (
-        f"c: warning: {empty / 'llm-agent.sock'}: signing agent socket not found; "
+        f"c: warning: {empty / 'llm-agent.sock'}: signing agent not available; "
         "running without ssh-agent\n" in read.err
     )
 
@@ -1868,4 +1871,441 @@ def test_secret_transport_contract_path_diagnostics(agent_config, monkeypatch, c
     captured = capsys.readouterr()
     assert secret not in captured.out + captured.err
     assert "would create private state" in captured.err
-    assert "signing agent socket not found" in captured.err
+    assert "signing agent not available" in captured.err
+
+
+# --- signing agent unlock
+
+
+def signing_sock(runtime: Path) -> Path:
+    """Return the signing agent socket ``c`` derives from ``runtime``.
+
+    Args:
+        runtime: The ``XDG_RUNTIME_DIR`` value.
+
+    Returns:
+        The socket path.
+    """
+    return runtime / "llm-agent.sock"
+
+
+def generate_key(path: Path) -> None:
+    """Generate an unencrypted ed25519 key at ``path``.
+
+    Args:
+        path: Private key path; the public key lands at ``path.pub``.
+    """
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "test", "-f", str(path)],
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+
+def fingerprint(path: Path) -> str:
+    """Return the SHA256 fingerprint of the key at ``path``.
+
+    Args:
+        path: Private or public key path.
+
+    Returns:
+        The fingerprint field of ``ssh-keygen -lf``.
+    """
+    result = subprocess.run(
+        ["ssh-keygen", "-lf", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return result.stdout.split()[1]
+
+
+def list_agent(runtime: Path) -> tuple[int, str]:
+    """List the identities of the agent under ``runtime``.
+
+    Args:
+        runtime: Directory holding the agent socket.
+
+    Returns:
+        The exit code and stdout of ``ssh-add -l``.
+    """
+    result = subprocess.run(
+        ["ssh-add", "-l"],
+        env={**os.environ, "SSH_AUTH_SOCK": str(signing_sock(runtime))},
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return result.returncode, result.stdout
+
+
+@pytest.fixture
+def signing_runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """A throwaway empty ssh-agent, with ``XDG_RUNTIME_DIR`` pointing at it.
+
+    The directory lives directly under /tmp because pytest's ``tmp_path`` can
+    exceed the unix socket path limit.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Yields:
+        The directory holding ``llm-agent.sock``.
+    """
+    runtime = Path(tempfile.mkdtemp(prefix="c-agent-", dir="/tmp"))
+    sock = signing_sock(runtime)
+    agent = None
+    try:
+        agent = subprocess.Popen(
+            ["ssh-agent", "-D", "-a", str(sock)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 5
+        while not sock.is_socket():
+            if agent.poll() is not None or time.monotonic() > deadline:
+                pytest.fail("throwaway ssh-agent socket did not appear")
+            time.sleep(0.01)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+        yield runtime
+    finally:
+        if agent is not None:
+            agent.terminate()
+            agent.wait(timeout=5)
+        shutil.rmtree(runtime)
+
+
+@pytest.fixture
+def signing_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A temporary ``HOME`` holding a generated unencrypted signing key.
+
+    Args:
+        tmp_path: Pytest temporary directory root.
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        The home directory.
+    """
+    home = tmp_path.resolve() / "home"
+    (home / ".ssh").mkdir(parents=True, mode=0o700)
+    generate_key(home / c.SIGNING_KEY)
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+def as_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Report stdin and stdout as terminals.
+
+    Call it from the test body: during fixture setup ``sys.stdout`` is still
+    pytest's global capture stream, not the one the test runs with.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+
+
+@pytest.fixture
+def launch(
+    plain_repo: Path, signing_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> Callable[..., list[str]]:
+    """Run ``c.main`` as a real launch with ``os.execvp`` stubbed.
+
+    Args:
+        plain_repo: Repository the launch runs from.
+        signing_home: Home directory holding the signing key.
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        A function taking ``c``'s arguments and returning the exec'd argv.
+    """
+    monkeypatch.chdir(plain_repo)
+    monkeypatch.delenv("AGENT_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("GIT_SIGNING_DISABLED", raising=False)
+
+    def run_main(*argv: str) -> list[str]:
+        captured: list[str] = []
+        monkeypatch.setattr(os, "execvp", lambda file, args: captured.extend(args))
+        c.main(list(argv))
+        return captured
+
+    return run_main
+
+
+def socket_mount(runtime: Path) -> str:
+    """Return the ``-v`` value mounting the signing socket from ``runtime``.
+
+    Args:
+        runtime: Directory holding the agent socket.
+
+    Returns:
+        The bind mount specification.
+    """
+    return f"{signing_sock(runtime)}:{c.CONTAINER_SSH_SOCK}"
+
+
+def test_launch_unlocks_empty_agent_on_terminal(
+    signing_runtime: Path,
+    signing_home: Path,
+    launch: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    as_terminal(monkeypatch)
+
+    argv = launch("--no-plannotator-port", "bash")
+
+    status, listed = list_agent(signing_runtime)
+    assert status == 0
+    assert fingerprint(signing_home / c.SIGNING_KEY) in listed
+    assert socket_mount(signing_runtime) in argv
+    assert "warning" not in capsys.readouterr().err
+
+
+def test_launch_leaves_loaded_agent_alone(
+    signing_runtime: Path,
+    signing_home: Path,
+    tmp_path: Path,
+    launch: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    as_terminal(monkeypatch)
+    other = tmp_path / "other_ed25519"
+    generate_key(other)
+    subprocess.run(
+        ["ssh-add", str(other)],
+        env={**os.environ, "SSH_AUTH_SOCK": str(signing_sock(signing_runtime))},
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    argv = launch("--no-plannotator-port", "bash")
+
+    status, listed = list_agent(signing_runtime)
+    assert status == 0
+    assert len(listed.splitlines()) == 1
+    assert fingerprint(other) in listed
+    assert socket_mount(signing_runtime) in argv
+    assert "warning" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "stdin_tty, stdout_tty", [(False, False), (True, False), (False, True)]
+)
+def test_launch_without_terminal_warns_and_mounts(
+    signing_runtime: Path,
+    signing_home: Path,
+    launch: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    stdin_tty: bool,
+    stdout_tty: bool,
+) -> None:
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: stdin_tty)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: stdout_tty)
+
+    argv = launch("--no-plannotator-port", "bash")
+
+    assert (
+        f"c: warning: {signing_sock(signing_runtime)}: signing agent is empty and no "
+        f"terminal is available to unlock {signing_home / c.SIGNING_KEY}; "
+        "commits will fail to sign\n" in capsys.readouterr().err
+    )
+    assert list_agent(signing_runtime)[0] == 1
+    assert socket_mount(signing_runtime) in argv
+
+
+def test_launch_failed_unlock_warns_and_mounts(
+    signing_runtime: Path,
+    signing_home: Path,
+    launch: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    as_terminal(monkeypatch)
+    (signing_home / c.SIGNING_KEY).unlink()
+
+    argv = launch("--no-plannotator-port", "bash")
+
+    assert (
+        f"c: warning: {signing_sock(signing_runtime)}: could not load "
+        f"{signing_home / c.SIGNING_KEY}; commits will fail to sign\n"
+        in capsys.readouterr().err
+    )
+    assert list_agent(signing_runtime)[0] == 1
+    assert socket_mount(signing_runtime) in argv
+
+
+def test_launch_interrupted_unlock_warns_and_mounts(
+    signing_runtime: Path,
+    signing_home: Path,
+    launch: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    real_run = subprocess.run
+
+    def interrupt_unlock(argv, *args, **kwargs):
+        if argv[0] == "ssh-add" and list(argv) != ["ssh-add", "-l"]:
+            raise KeyboardInterrupt
+        return real_run(argv, *args, **kwargs)
+
+    as_terminal(monkeypatch)
+    monkeypatch.setattr(c.subprocess, "run", interrupt_unlock)
+
+    argv = launch("--no-plannotator-port", "bash")
+
+    err = capsys.readouterr().err
+    assert (
+        f"c: warning: {signing_sock(signing_runtime)}: could not load "
+        f"{signing_home / c.SIGNING_KEY}; commits will fail to sign\n" in err
+    )
+    assert "Traceback" not in err
+    assert socket_mount(signing_runtime) in argv
+
+
+def test_launch_unreachable_agent_drops_socket(
+    tmp_sock_dir: Path,
+    launch: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    as_terminal(monkeypatch)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_sock_dir))
+
+    argv = launch("--no-plannotator-port", "bash")
+
+    assert (
+        f"c: warning: {signing_sock(tmp_sock_dir)}: signing agent not available; "
+        "running without ssh-agent\n" in capsys.readouterr().err
+    )
+    assert argv
+    assert not any("llm-agent.sock" in word for word in argv)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [subprocess.TimeoutExpired(["ssh-add", "-l"], 5), FileNotFoundError("ssh-add")],
+    ids=["timeout", "missing-ssh-add"],
+)
+def test_launch_failed_query_drops_socket(
+    signing_runtime: Path,
+    launch: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+) -> None:
+    real_run = subprocess.run
+
+    def fail_query(argv, *args, **kwargs):
+        if list(argv) == ["ssh-add", "-l"]:
+            assert kwargs.get("timeout") == c.AGENT_QUERY_TIMEOUT
+            raise error
+        return real_run(argv, *args, **kwargs)
+
+    as_terminal(monkeypatch)
+    monkeypatch.setattr(c.subprocess, "run", fail_query)
+
+    argv = launch("--no-plannotator-port", "bash")
+
+    err = capsys.readouterr().err
+    assert (
+        f"c: warning: {signing_sock(signing_runtime)}: signing agent not available; "
+        "running without ssh-agent\n" in err
+    )
+    assert "Traceback" not in err
+    assert argv
+    assert not any("llm-agent.sock" in word for word in argv)
+
+
+def test_krun_unreachable_agent_only_warns_about_probe(
+    tmp_sock_dir: Path,
+    launch: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    as_terminal(monkeypatch)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_sock_dir))
+    monkeypatch.setattr(c, "probe_tcp_signer", lambda *args, **kwargs: False)
+
+    launch("-k", "--no-plannotator-port", "bash")
+
+    warnings = [
+        line for line in capsys.readouterr().err.splitlines() if "warning" in line
+    ]
+    assert warnings == [
+        f"c: warning: {c.SSH_PROBE_HOST}:{c.KRUN_SSH_PORT}: "
+        "no signer responded; bridge remains configured"
+    ]
+
+
+def test_dry_run_never_unlocks(
+    signing_runtime: Path,
+    launch: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*args, **kwargs):
+        pytest.fail("prepare_signer must not be called")
+
+    as_terminal(monkeypatch)
+    monkeypatch.setattr(c, "prepare_signer", fail)
+
+    launch("--dry-run", "--no-plannotator-port", "bash")
+
+    assert list_agent(signing_runtime)[0] == 1
+
+
+@pytest.mark.parametrize(
+    "argv, disabled_env",
+    [
+        (("--no-git-signing", "--no-plannotator-port", "bash"), None),
+        (("--no-plannotator-port", "bash"), "1"),
+        (("-r", "bash"), None),
+    ],
+    ids=["no-git-signing", "GIT_SIGNING_DISABLED", "running"],
+)
+def test_signing_disabled_or_running_never_queries_agent(
+    plain_repo: Path,
+    launch: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    argv: tuple[str, ...],
+    disabled_env: str | None,
+) -> None:
+    def fail(*args, **kwargs):
+        pytest.fail("prepare_signer must not be called")
+
+    monkeypatch.setattr(c, "prepare_signer", fail)
+    monkeypatch.setattr(
+        c,
+        "running_containers",
+        lambda: (c.Container("id", "dev", (c.Mount(plain_repo, plain_repo),)),),
+    )
+    if disabled_env is not None:
+        monkeypatch.setenv("GIT_SIGNING_DISABLED", disabled_env)
+
+    assert launch(*argv)
+
+
+def test_krun_unlocks_before_probe(
+    signing_runtime: Path,
+    launch: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statuses: list[int] = []
+
+    def probe(host: str, port: int, timeout: float = 1.0) -> bool:
+        statuses.append(list_agent(signing_runtime)[0])
+        return True
+
+    as_terminal(monkeypatch)
+    monkeypatch.setattr(c, "probe_tcp_signer", probe)
+
+    launch("-k", "--no-plannotator-port", "bash")
+
+    assert statuses == [0]

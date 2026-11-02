@@ -7,11 +7,18 @@ links stay valid inside, the container starts in the current directory, and it
 gets the agent dotfiles from $AGENT_CONFIG_DIR when set (otherwise using the
 image's bundled dotfiles), plus the host's isolated
 ssh-agent (a socket bind mount, or under -k a pasta TCP bridge that the image
-entrypoint connects to SSH_AUTH_SOCK). If the signing socket does not exist,
-`c` warns and starts the container without it; ssh signing then fails at
-commit time. Under -k, before booting, `c` probes the host's bridge port with
-an ssh-agent identity request and warns when no signer answers. With
---no-git-signing (or a true GIT_SIGNING_DISABLED), both checks are
+entrypoint connects to SSH_AUTH_SOCK). The agent starts empty, and the signing
+key ~/.ssh/llm_agent_ed25519 is passphrase-protected: on a real launch `c`
+first queries the agent with `ssh-add -l`, and when it is empty and stdin and
+stdout are terminals, runs `ssh-add` on the key, which prompts for the
+passphrase on the terminal, so it is entered once per boot. Without a terminal,
+or when loading fails or is cancelled, `c` warns and starts the container
+anyway; commits then fail to sign until the key is loaded. When the agent
+cannot be queried, a plain launch warns and starts the container without the
+socket; a dry run only checks that the socket exists. Under -k, after that query and
+before booting, `c` probes the host's bridge port with an ssh-agent identity
+request and warns when no signer answers. With
+--no-git-signing (or a true GIT_SIGNING_DISABLED), these checks are
 skipped, no agent socket is mounted or bridged, and commit.gpgsign=false is injected via
 GIT_CONFIG_* so commits succeed unsigned; GIT_SIGNING_DISABLED=1 is passed
 into the container so agent-sandbox preserves unsigned commits after clearing
@@ -45,8 +52,9 @@ pre-commit cache persists in both modes. Personal HOME credentials are not copie
 
 GIT_SIGNING_DISABLED accepts 1/true/yes/on or 0/false/no/off case-insensitively;
 unset/empty is false, other values are usage errors. Dry-run never executes the
-command or prepares state. Diagnostics mask known API keys, proxy URL user info,
-and literal -a environment assignments; unknown command secrets cannot be detected.
+command, prepares state, or prompts for the signing key. Diagnostics mask known
+API keys, proxy URL user info, and literal -a environment assignments; unknown
+command secrets cannot be detected.
 Missing executables return 127; other exec failures return 126 without tracebacks.
 """
 
@@ -74,6 +82,10 @@ CONTAINER_SSH_SOCK = "/tmp/ssh-agent.sock"
 KRUN_SSH_PORT = 7777
 # host loopback address the krun TCP signer check probes
 SSH_PROBE_HOST = "127.0.0.1"
+# relative to the host home directory
+SIGNING_KEY = Path(".ssh/llm_agent_ed25519")
+# seconds the `ssh-add -l` agent query may take
+AGENT_QUERY_TIMEOUT = 5
 KRUN_CPUS = 4
 KRUN_RAM_MIB = 8192
 # (path under AGENT_CONFIG_DIR, path under CONTAINER_HOME), parents before children.
@@ -324,6 +336,63 @@ def probe_tcp_signer(host: str, port: int, timeout: float = 1.0) -> bool:
             return keys >= 1
     except OSError:
         return False
+
+
+def prepare_signer(sock: Path, *, extra_args: Sequence[str]) -> bool:
+    """Query the host signing agent and unlock the signing key when it is empty.
+
+    An empty agent is unlocked with an interactive ``ssh-add`` only when stdin
+    and stdout are terminals; ``ssh-add`` reads the passphrase from the terminal
+    itself and its I/O is inherited, never captured. When the key stays
+    unloaded a warning is printed and the launch continues, since the key can
+    still be loaded into the agent while the container runs.
+
+    Args:
+        sock: Host ssh-agent socket.
+        extra_args: Extra engine arguments, for redacting warnings.
+
+    Returns:
+        False when the agent cannot be queried: ``ssh-add -l`` exits with
+            neither 0 nor 1, times out, or cannot be executed. True otherwise,
+            including when the key could not be loaded.
+    """
+    env = {**os.environ, "SSH_AUTH_SOCK": str(sock)}
+    # separate except clauses keep `c` parseable by a host python3 older than 3.14
+    try:
+        status = subprocess.run(
+            ["ssh-add", "-l"],
+            env=env,
+            capture_output=True,
+            timeout=AGENT_QUERY_TIMEOUT,
+            check=False,
+        ).returncode
+    except OSError:
+        return False
+    except subprocess.TimeoutExpired:
+        return False
+    if status not in (0, 1):
+        return False
+    if status == 1:
+        key = Path.home() / SIGNING_KEY
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                loaded = subprocess.run(["ssh-add", str(key)], env=env).returncode == 0
+            except KeyboardInterrupt:
+                loaded = False
+            warning = None if loaded else f"could not load {key}"
+        else:
+            warning = (
+                f"signing agent is empty and no terminal is available to unlock {key}"
+            )
+        if warning is not None:
+            print(
+                redact_text(
+                    f"c: warning: {sock}: {warning}; commits will fail to sign",
+                    extra_args,
+                ),
+                file=sys.stderr,
+            )
+    return True
 
 
 def check_mount_allowed(path: Path) -> None:
@@ -806,9 +875,12 @@ def new_container(
         tty: Whether to allocate a terminal.
 
     Returns:
-        The argv and the banner printed before exec. Without an existing
-            signing socket, and not under ``krun``, a warning is printed to
-            stderr and no ssh-agent socket is mounted.
+        The argv and the banner printed before exec. When signing is enabled,
+            a real launch first queries the signing agent and unlocks an empty
+            one on a terminal (see ``prepare_signer``); a dry run only checks
+            that the socket exists. When the agent is not available, and not
+            under ``krun``, a warning is printed to stderr and no ssh-agent
+            socket is mounted.
 
     Raises:
         Error: When a mount is refused or no free plannotator port can be found.
@@ -825,6 +897,12 @@ def new_container(
     xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     signing_disabled = args.no_git_signing or env_bool("GIT_SIGNING_DISABLED")
     ssh_sock = Path(xdg_runtime_dir) / "llm-agent.sock"
+    if signing_disabled:
+        signer_ready = False
+    elif args.dry_run:
+        signer_ready = ssh_sock.is_socket()
+    else:
+        signer_ready = prepare_signer(ssh_sock, extra_args=args.arg)
     if args.krun:
         if not signing_disabled and not probe_tcp_signer(SSH_PROBE_HOST, KRUN_SSH_PORT):
             print(
@@ -837,10 +915,10 @@ def new_container(
             )
     elif signing_disabled:
         ssh_sock = None
-    elif not ssh_sock.is_socket():
+    elif not signer_ready:
         print(
             redact_text(
-                f"c: warning: {ssh_sock}: signing agent socket not found; "
+                f"c: warning: {ssh_sock}: signing agent not available; "
                 "running without ssh-agent",
                 args.arg,
             ),

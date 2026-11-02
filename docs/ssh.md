@@ -34,7 +34,7 @@ After running the installer, reconnect with forwarding and source `~/.config/zsh
 
 ## Container signing agent
 
-`llm-ssh-agent.service` listens on `$XDG_RUNTIME_DIR/llm-agent.sock` and loads only `~/.ssh/llm_agent_ed25519`. The key must not have a passphrase because the service starts unattended.
+`llm-ssh-agent.service` listens on `$XDG_RUNTIME_DIR/llm-agent.sock` and starts the agent empty. The first `c` launch per boot loads `~/.ssh/llm_agent_ed25519` into it, prompting for the key's passphrase on the terminal; nothing stores the passphrase. [Commit Signing](../dev-container/README.md#commit-signing) covers the manual unlock for plain podman or Compose and rotating a key that was stored without a passphrase.
 
 `llm-ssh-agent-tcp.socket` exposes the signing agent on `127.0.0.1:7777` for `c -k`. Enable the agent, plus the TCP listener when using `c -k`:
 

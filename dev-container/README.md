@@ -37,7 +37,7 @@ GIT_SIGNING_KEY="$(cat ~/.ssh/llm_agent_ed25519.pub)" ./dev-container/build.sh  
 | `--no-git-signing`, `--ngs` | Disable commit signing |
 | `--no-git-root`, `--ngr` | Mount only the current directory |
 | `-a=ARG` | Add a `podman run` argument |
-| `--dry-run` | Print the redacted command and describe missing state directories without creating them or running the command |
+| `--dry-run` | Print the redacted command and describe missing state directories without creating them, running the command, or prompting for the signing key |
 | `--interactive`, `--no-interactive` | Attach stdin by default, or explicitly disable it; valid for run and exec |
 | `--tty`, `--no-tty` | Override terminal allocation; by default both stdin and stdout must be terminals |
 
@@ -112,25 +112,28 @@ SSH signing uses a dedicated private key held by an isolated agent on the host. 
 
 ### 1. Generate the key (host)
 ```zsh
-ssh-keygen -t ed25519 -f ~/.ssh/llm_agent_ed25519 -C "llm-agent" -N ""
+ssh-keygen -t ed25519 -f ~/.ssh/llm_agent_ed25519 -C "llm-agent"
 ```
+`ssh-keygen` prompts for a passphrase; set one. Nothing stores it: it is entered once per boot when `c` unlocks the key (step 3).
+
+**Existing unencrypted key.** Rotate a key that was ever stored without a passphrase: generate a new key as above, register it on GitHub as a Signing Key, rebuild the image with the new `GIT_SIGNING_KEY`, run `systemctl --user restart llm-ssh-agent.service` so the agent drops the old key (`c` treats any loaded key as ready and would not prompt), then delete the old key on GitHub. Adding a passphrase in place with `ssh-keygen -p -f ~/.ssh/llm_agent_ed25519` (it prompts) is enough only when the unencrypted file was never exposed; any process or container that could read the host's `~/.ssh` counts as exposure.
 
 ### 2. Register it on GitHub (host)
 1. `cat ~/.ssh/llm_agent_ed25519.pub`
 2. GitHub → Settings → SSH and GPG keys → New SSH key, **Key type: Signing Key**, paste.
 
 ### 3. Run an isolated ssh-agent (host)
-Install the dotfiles on the host first; they include [llm-ssh-agent.service](../dotfiles/.config/systemd/user/llm-ssh-agent.service). The service owns `$XDG_RUNTIME_DIR/llm-agent.sock`, waits for the socket, and loads only `~/.ssh/llm_agent_ed25519`. The signing key must have no passphrase for unattended startup; failure to load it fails service startup.
+Install the dotfiles on the host first; they include [llm-ssh-agent.service](../dotfiles/.config/systemd/user/llm-ssh-agent.service). The service owns `$XDG_RUNTIME_DIR/llm-agent.sock`, waits for the socket, and starts the agent empty; it fails startup only when the socket does not appear. The first `c` launch per boot finds the agent empty and runs `ssh-add ~/.ssh/llm_agent_ed25519`, which prompts for the passphrase on the terminal; later launches find the key loaded and do not prompt. The agent empties whenever the service stops, so a service restart, or a full logout without lingering, prompts again. Without a terminal on stdin and stdout, or after a failed or cancelled unlock, `c` warns and starts the container anyway, and commits then fail to sign until the key is loaded. `--dry-run` never prompts.
 
 ```zsh
 systemctl --user daemon-reload
 systemctl --user enable --now llm-ssh-agent.service
 ```
 
-If replacing an already-running unit, also run `systemctl --user restart llm-ssh-agent.service`. Verify the host agent with `SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/llm-agent.sock" ssh-add -l`. The personal agent is separate and is never selected by `c`; see [SSH](../docs/ssh.md) for its setup. The image sets `container=oci` so Zsh preserves the supplied socket without starting an agent or loading private keys.
+If replacing an already-running unit, also run `systemctl --user restart llm-ssh-agent.service`. Verify the host agent with `SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/llm-agent.sock" ssh-add -l`; it lists the key only after unlocking and prints "The agent has no identities." before. The personal agent is separate and is never selected by `c`; see [SSH](../docs/ssh.md) for its setup. The image sets `container=oci` so Zsh preserves the supplied socket without starting an agent or loading private keys.
 
 ### 4. Build and run with the key
-Build with `GIT_SIGNING_KEY` as in [Build](#build). `c` mounts the socket automatically; `c -k` uses the [TCP bridge](#signing-under-c--k-pasta-bridge). For plain `podman run`, add these arguments; for Compose, set the equivalent volume and environment entries:
+Build with `GIT_SIGNING_KEY` as in [Build](#build). `c` mounts the socket automatically; `c -k` uses the [TCP bridge](#signing-under-c--k-pasta-bridge). Plain `podman run` and Compose do not unlock the key; unlock it first on the host with `SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/llm-agent.sock" ssh-add ~/.ssh/llm_agent_ed25519`, which prompts for the passphrase (never put it on a command line). For plain `podman run`, add these arguments; for Compose, set the equivalent volume and environment entries:
 ```zsh
 -v "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/llm-agent.sock:/tmp/ssh-agent.sock" \
 -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock \
@@ -148,7 +151,7 @@ git log --show-signature -1
 Expected: `Good "git" signature for <your GitHub email> with ED25519 key SHA256:...`
 
 ### Signing under `c -k` (pasta bridge)
-When signing is enabled, `c -k` adds `--network=pasta:-T,7777`; the image entrypoint bridges `127.0.0.1:7777` to `SSH_AUTH_SOCK` inside the microVM, with the socket owned by the container user so `agent-sandbox` accepts it. Before booting, `c -k` probes that host port with one total one-second deadline across connect, send, and receive. A failed probe warns that no signer responded while the bridge remains configured. This is a transport diagnostic; the sandbox separately checks the configured signing identity. The bridge is unauthenticated: any local host user can request signatures while it runs. Use it only on a single-user machine.
+When signing is enabled, `c -k` adds `--network=pasta:-T,7777`; the image entrypoint bridges `127.0.0.1:7777` to `SSH_AUTH_SOCK` inside the microVM, with the socket owned by the container user so `agent-sandbox` accepts it. Before booting, `c -k` unlocks an empty agent on the host as above, then probes that host port with one total one-second deadline across connect, send, and receive. A failed probe warns that no signer responded while the bridge remains configured. This is a transport diagnostic; the sandbox separately checks the configured signing identity. The bridge is unauthenticated: any local host user can request signatures while it runs. Use it only on a single-user machine.
 
 The dotfiles include [llm-ssh-agent-tcp.socket](../dotfiles/.config/systemd/user/llm-ssh-agent-tcp.socket), which listens on host loopback port 7777 and activates [llm-ssh-agent-tcp.service](../dotfiles/.config/systemd/user/llm-ssh-agent-tcp.service), a `systemd-socket-proxyd` bridge to `$XDG_RUNTIME_DIR/llm-agent.sock`. For a fresh installation, enable the listener:
 
