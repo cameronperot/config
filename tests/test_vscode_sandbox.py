@@ -65,6 +65,8 @@ def test_parse_args_defaults():
 
     assert args.paths == []
     assert args.port == []
+    assert args.ro == []
+    assert args.rw == []
     assert args.only_args is False
 
 
@@ -104,6 +106,16 @@ def test_parse_args_accepts_port_bounds(value):
     assert sandbox.parse_args(["--port", value]).port == [int(value)]
 
 
+def test_parse_args_collects_repeated_ro_and_rw_intermixed_with_paths():
+    args = sandbox.parse_args(
+        ["a", "--ro", "r1", "b", "--rw", "w1", "--ro=r2", "c", "--rw", "w2"]
+    )
+
+    assert args.paths == ["a", "b", "c"]
+    assert args.ro == ["r1", "r2"]
+    assert args.rw == ["w1", "w2"]
+
+
 # Root and port resolution
 
 
@@ -112,8 +124,9 @@ def tmp(tmp_path, monkeypatch):
     """
     Provide a canonical temp tree with empty user constants.
 
-    System trees enclosing the temp tree (e.g. /tmp) are dropped so the other rules can
-    be tested; test_rejects_root_under_system_tree uses the real constant.
+    System trees and read-only excluded trees enclosing the temp tree (e.g. /tmp) are
+    dropped so the other rules can be tested; the tests of those rules use the real
+    constants.
     """
     tmp = tmp_path.resolve()
     monkeypatch.setattr(sandbox, "ROOTS", ())
@@ -123,11 +136,17 @@ def tmp(tmp_path, monkeypatch):
         "SYSTEM_TREES",
         tuple(tree for tree in SYSTEM_TREES if not tmp.is_relative_to(tree)),
     )
+    monkeypatch.setattr(
+        sandbox,
+        "RO_ROOT_EXCLUDED_TREES",
+        tuple(tree for tree in RO_ROOT_EXCLUDED_TREES if not tmp.is_relative_to(tree)),
+    )
     (tmp / "home").mkdir()
     return tmp
 
 
 SYSTEM_TREES = sandbox.SYSTEM_TREES
+RO_ROOT_EXCLUDED_TREES = sandbox.RO_ROOT_EXCLUDED_TREES
 
 
 def resolve(argv, *, tmp, cwd=None, script=None):
@@ -437,6 +456,55 @@ def test_rejects_ro_root_inside_run(tmp, path, lexical):
         )
 
 
+@pytest.mark.parametrize("tree", ["/tmp", "/dev", "/proc", "/sys"])
+@pytest.mark.parametrize("inside", ["path", "lexical"])
+def test_rejects_ro_root_inside_tmp_dev_proc_or_sys(tmp, monkeypatch, tree, inside):
+    monkeypatch.setattr(sandbox, "RO_ROOT_EXCLUDED_TREES", RO_ROOT_EXCLUDED_TREES)
+    path, lexical = Path(f"{tree}/x"), Path("/srv/link")
+    if inside == "lexical":
+        path, lexical = lexical, path
+
+    with pytest.raises(
+        sandbox.SandboxError, match=f"read-only root {tree}/x is inside {tree}$"
+    ):
+        sandbox.check_ro(path, lexical=lexical, home=tmp / "home", protected=())
+
+
+@pytest.fixture(params=["/tmp", "/dev/shm", "/proc/sys", "/sys/class"])
+def excluded_tree_dir(request):
+    """Yield an existing directory inside /tmp, /dev, /proc or /sys."""
+    if request.param != "/tmp":
+        yield Path(request.param)
+        return
+    with tempfile.TemporaryDirectory(dir="/tmp") as path:
+        yield Path(path)
+
+
+@pytest.mark.parametrize("given", ["--ro", "constant"])
+@pytest.mark.parametrize("through_symlink", [False, True])
+def test_rejects_ro_dir_or_constant_root_inside_tmp_dev_proc_or_sys(
+    tmp, monkeypatch, excluded_tree_dir, given, through_symlink
+):
+    tree = Path("/", excluded_tree_dir.parts[1])
+    if tree == Path("/tmp"):
+        # The tmp fixture drops /tmp when the temp tree lies inside it
+        monkeypatch.setattr(sandbox, "RO_ROOT_EXCLUDED_TREES", RO_ROOT_EXCLUDED_TREES)
+    argument = excluded_tree_dir
+    if through_symlink:
+        argument = tmp / "home" / "link"
+        argument.symlink_to(excluded_tree_dir)
+    argv = ["--ro", str(argument)] if given == "--ro" else []
+    if given == "constant":
+        monkeypatch.setattr(sandbox, "ROOTS", ((str(argument), "ro"),))
+    # The lexical form is checked first, and the temp tree may itself lie inside /tmp
+    form = argument if argument.is_relative_to(tree) else excluded_tree_dir.resolve()
+
+    with pytest.raises(
+        sandbox.SandboxError, match=f"^read-only root {form} is inside {tree}$"
+    ):
+        resolve(argv, tmp=tmp)
+
+
 @pytest.mark.parametrize(
     "relative", ["projects/reference", "projects/.cache", "../shared"]
 )
@@ -571,6 +639,174 @@ def test_only_args_ignores_constant_roots(tmp, monkeypatch):
     config = resolve(["--only-args", str(project)], tmp=tmp)
 
     assert config.roots == (rw(project),)
+
+
+def ro(path):
+    return sandbox.Root(path=path, mode="ro")
+
+
+def test_option_dirs_resolve_against_cwd_with_their_modes(tmp):
+    reference = mkdir(tmp / "reference")
+    work = mkdir(tmp / "work")
+    project = mkdir(tmp / "project")
+
+    config = resolve(
+        ["--ro", "reference", "project", "--rw", "work/../work"], tmp=tmp, cwd=tmp
+    )
+
+    assert config.roots == (rw(project), ro(reference), rw(work))
+    assert config.paths == (project,)
+
+
+def test_option_dirs_are_not_opened(tmp):
+    project = mkdir(tmp / "project")
+    reference = mkdir(tmp / "reference")
+    work = mkdir(tmp / "work")
+
+    config = resolve(["--ro", str(reference), str(project), "--rw", str(work)], tmp=tmp)
+
+    assert sandbox.electron_args(config.paths)[-1] == str(project)
+    assert not {str(reference), str(work)} & set(sandbox.electron_args(config.paths))
+
+
+def test_option_dirs_do_not_replace_git_walk(tmp):
+    mkdir(tmp / "project" / ".git")
+    work = mkdir(tmp / "work")
+
+    config = resolve(["--rw", str(work)], tmp=tmp, cwd=tmp / "project")
+
+    assert config.roots == (rw(tmp / "project"), rw(work))
+    assert config.paths == (tmp / "project",)
+
+
+def test_ro_dir_inside_rw_dir_is_allowed_after_it(tmp):
+    inner = mkdir(tmp / "outer" / "inner")
+
+    config = resolve(["--ro", str(inner), "--rw", str(tmp / "outer")], tmp=tmp)
+
+    assert config.roots == (rw(tmp / "outer"), ro(inner))
+
+
+def test_only_args_keeps_option_dirs(tmp, monkeypatch):
+    reference = mkdir(tmp / "reference")
+    work = mkdir(tmp / "work")
+    monkeypatch.setattr(sandbox, "ROOTS", ((str(mkdir(tmp / "constant")), "ro"),))
+
+    config = resolve(
+        ["--only-args", "--ro", str(reference), "--rw", str(work)], tmp=tmp
+    )
+
+    assert config.roots == (ro(reference), rw(work))
+
+
+@pytest.mark.parametrize("option", ["--ro", "--rw"])
+def test_rejects_missing_option_dir(tmp, option):
+    with pytest.raises(sandbox.SandboxError, match=r"cannot resolve .*/missing"):
+        resolve([option, str(tmp / "missing")], tmp=tmp)
+
+
+@pytest.mark.parametrize("option", ["--ro", "--rw"])
+def test_rejects_option_file(tmp, option):
+    file = mkdir(tmp / "project") / "notebook.ipynb"
+    file.touch()
+
+    with pytest.raises(
+        sandbox.SandboxError, match=f"^{option} {file} is not a directory$"
+    ):
+        resolve([option, str(file)], tmp=tmp)
+
+
+@pytest.mark.parametrize(
+    ("relative", "message"),
+    [
+        ("home", "is $HOME or one of its ancestors"),
+        (".", "is $HOME or one of its ancestors"),
+        ("/", "is $HOME or one of its ancestors"),
+        ("home/.config/x", "is under a hidden entry of $HOME"),
+        ("home/bin", "overlaps protected path"),
+        ("/run", "overlaps protected path /run"),
+        ("/usr", "overlaps protected path /usr"),
+    ],
+)
+def test_rejects_rw_dir(tmp, relative, message):
+    mkdir(tmp / "home" / "bin")
+    path = tmp / relative
+    path.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(sandbox.SandboxError, match=re.escape(message)):
+        resolve(["--rw", str(path)], tmp=tmp)
+
+
+@pytest.mark.parametrize(
+    ("relative", "message"),
+    [
+        ("home", "home is or covers"),
+        ("/", "/ is or covers /"),
+        ("data", "data is or covers"),
+        ("home/.config/x", "is under a hidden entry of $HOME"),
+        ("home/bin", "home/bin is or covers"),
+        ("/run", "/run is or covers /run"),
+        ("/usr", "/usr is or covers /usr"),
+    ],
+)
+def test_rejects_ro_dir(tmp, monkeypatch, relative, message):
+    # The real /data need not exist where the tests run
+    monkeypatch.setattr(sandbox, "RO_ROOT_LIMITS", ("/", "/run", str(tmp / "data")))
+    mkdir(tmp / "home" / "bin")
+    path = tmp / relative
+    path.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(sandbox.SandboxError, match=re.escape(message)):
+        resolve(["--ro", str(path)], tmp=tmp)
+
+
+@pytest.mark.parametrize("option", ["--ro", "--rw"])
+@pytest.mark.parametrize(
+    ("argument", "form"), [(".ssh", ".ssh"), ("link", ".config/x")]
+)
+@pytest.mark.usefixtures("symlinked_hidden_entries")
+def test_rejects_option_dir_through_symlinked_hidden_home_entry(
+    tmp, option, argument, form
+):
+    # .ssh is hidden as given and resolves to a plain folder; link resolves into .config
+    (tmp / "home" / "link").symlink_to(mkdir(tmp / "home" / ".config" / "x"))
+
+    with pytest.raises(
+        sandbox.SandboxError,
+        match=f"root {tmp}/home/{form} is under a hidden entry of",
+    ):
+        resolve([option, argument], tmp=tmp)
+
+
+@pytest.mark.parametrize("given", ["--rw", "positional", "constant"])
+@pytest.mark.parametrize("relative", ["reference", "reference/sub"])
+def test_rejects_rw_root_equal_to_or_inside_ro_dir(tmp, monkeypatch, given, relative):
+    reference = mkdir(tmp / "reference")
+    mkdir(reference / "sub")
+    path = tmp / relative
+    argv = ["--ro", str(reference)]
+    if given == "--rw":
+        argv += ["--rw", str(path)]
+    elif given == "positional":
+        argv.append(str(path))
+    else:
+        monkeypatch.setattr(sandbox, "ROOTS", ((str(path), "rw"),))
+
+    with pytest.raises(
+        sandbox.SandboxError,
+        match=f"^writable root {path} is or lies inside read-only root {reference}$",
+    ):
+        resolve(argv, tmp=tmp)
+
+
+def test_rejects_rw_dir_inside_ro_constant_root(tmp, monkeypatch):
+    sub = mkdir(tmp / "reference" / "sub")
+    monkeypatch.setattr(sandbox, "ROOTS", ((str(tmp / "reference"), "ro"),))
+
+    with pytest.raises(
+        sandbox.SandboxError, match=f"overlaps protected path {tmp}/reference$"
+    ):
+        resolve(["--rw", str(sub)], tmp=tmp)
 
 
 def test_missing_constant_root_is_an_error(tmp, monkeypatch):
@@ -899,6 +1135,31 @@ def test_bwrap_mounts_fresh_tmpfs_before_roots(built):
     assert tmpfs == ["/dev/shm", "/tmp", "/run", str(config.home)]
     assert args.index(str(config.home)) < first_root
     assert first_root < args.index("--ro-bind-try")
+
+
+def test_bwrap_binds_option_dirs_by_mode_parents_first(tmp):
+    work = mkdir(tmp / "work")
+    reference = mkdir(work / "reference")
+    config = resolve(["--ro", str(reference), "--rw", str(work)], tmp=tmp)
+
+    args = sandbox.bwrap_args(
+        config,
+        wayland_socket=tmp / "wayland-1",
+        resolv_conf=tmp / "resolv-1.conf",
+        sandbox_code=tmp / "code-1",
+        env={"HOME": str(config.home)},
+        command=("/usr/bin/true",),
+    )
+
+    work_bind = args.index("--bind")
+    assert args[work_bind : work_bind + 3] == ("--bind", str(work), str(work))
+    assert args[work_bind + 3 : work_bind + 6] == (
+        "--ro-bind",
+        str(reference),
+        str(reference),
+    )
+    assert (str(work),) * 2 not in options(args, "--ro-bind")
+    assert (str(reference),) * 2 not in options(args, "--bind")
 
 
 def test_bwrap_sets_only_the_given_environment(built, tmp):

@@ -181,6 +181,9 @@ SYSTEM_TREES = (
 # A read-only constant root may not be or cover these, $HOME or a protected path
 RO_ROOT_LIMITS = ("/", "/run", "/data")
 
+# A read-only root may not lie inside these: a read-only bind still exposes sockets
+RO_ROOT_EXCLUDED_TREES = ("/run", "/tmp", "/dev", "/proc", "/sys")
+
 # Globals Sway 1.11 advertises to security-context clients, conditional ones included;
 # any other advertised global aborts the launch
 WAYLAND_GLOBALS = frozenset(
@@ -334,7 +337,7 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     Parse the launcher's command line.
 
     :param argv: Arguments without the program name, or None for sys.argv.
-    :return: The parsed paths, ports and --only-args flag.
+    :return: The parsed paths, ports, --ro and --rw directories and --only-args flag.
     """
     parser = argparse.ArgumentParser(
         prog="vscode-sandbox",
@@ -354,6 +357,20 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         type=port,
         default=[],
         help="forward this host localhost TCP port into the sandbox (repeatable)",
+    )
+    parser.add_argument(
+        "--ro",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="also mount this directory read-only, without opening it (repeatable)",
+    )
+    parser.add_argument(
+        "--rw",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="also mount this directory writable, without opening it (repeatable)",
     )
     parser.add_argument(
         "--only-args", action="store_true", help="ignore the roots configured in ROOTS"
@@ -474,10 +491,11 @@ def check_ro(
     path: Path, *, lexical: Path, home: Path, protected: Iterable[Path]
 ) -> None:
     """
-    Reject a read-only constant root that would expose hidden host paths.
+    Reject a read-only constant or --ro root that would expose hidden host paths.
 
     :param path: The canonical root.
-    :param lexical: The configured root joined to $HOME and normalised, not resolved.
+    :param lexical: The root as given, joined to $HOME (a constant) or the cwd (--ro)
+        and normalised, not resolved.
     :param home: The canonical home directory.
     :param protected: Protected paths the root may not equal or contain.
     :raises SandboxError: When the root is rejected.
@@ -486,10 +504,11 @@ def check_ro(
     for other in (*limits, *(limit.resolve() for limit in limits), home, *protected):
         if other.is_relative_to(path):
             raise SandboxError(f"read-only root {path} is or covers {other}")
-    run = Path("/run")
+    trees = tuple(map(Path, RO_ROOT_EXCLUDED_TREES))
     for form in (lexical, path):
-        if form.is_relative_to(run) or form.is_relative_to(run.resolve()):
-            raise SandboxError(f"read-only root {form} is inside /run")
+        for tree in trees:
+            if form.is_relative_to(tree) or form.is_relative_to(tree.resolve()):
+                raise SandboxError(f"read-only root {form} is inside {tree}")
         if (
             form != home
             and form.is_relative_to(home)
@@ -512,8 +531,8 @@ def resolve_config(
     :param script: The running script's resolved path.
     :param state_dir: The host-only state directory.
     :return: The launch config, with roots deduplicated and parents first.
-    :raises SandboxError: When a path is missing, a port is invalid or a root is
-        rejected.
+    :raises SandboxError: When a path is missing, a --ro or --rw path is not a
+        directory, a port is invalid or a root is rejected.
     """
     paths = tuple(resolve_path(cwd / arg) for arg in args.paths)
     if paths:
@@ -529,7 +548,20 @@ def resolve_config(
     constant_lexical = tuple(
         Path(os.path.normpath(home / path)) for path, _ in constant
     )
-    roots = (*constant_roots, *(Root(path=path, mode="rw") for path in arg_roots))
+    # --ro and --rw directories are mounted but not opened, so they stay out of paths
+    option_dirs = (*((arg, "ro") for arg in args.ro), *((arg, "rw") for arg in args.rw))
+    option_roots = tuple(
+        Root(path=resolve_path(cwd / arg), mode=mode) for arg, mode in option_dirs
+    )
+    option_lexical = tuple(Path(os.path.normpath(cwd / arg)) for arg, _ in option_dirs)
+    for root in option_roots:
+        if not root.path.is_dir():
+            raise SandboxError(f"--{root.mode} {root.path} is not a directory")
+    roots = (
+        *constant_roots,
+        *option_roots,
+        *(Root(path=path, mode="rw") for path in arg_roots),
+    )
 
     ro_roots = tuple(root.path for root in constant_roots if root.mode == "ro")
     base_protected = protected_paths(
@@ -542,12 +574,24 @@ def resolve_config(
             check_ro(root.path, lexical=form, home=home, protected=base_protected)
         elif mode != "rw":
             raise SandboxError(f"ROOTS entry {path!r} has mode {mode!r}, not ro or rw")
+    for root, form in zip(option_roots, option_lexical, strict=True):
+        if root.mode == "ro":
+            check_ro(root.path, lexical=form, home=home, protected=base_protected)
     protected = protected_paths(
         home=home, script=script, state_dir=state_dir, ro_roots=ro_roots
     )
-    for root, form in zip(roots, (*constant_lexical, *arg_lexical), strict=True):
+    # Unlike a ro constant root, a --ro directory may lie inside a writable root
+    option_ro = tuple(root.path for root in option_roots if root.mode == "ro")
+    lexical = (*constant_lexical, *option_lexical, *arg_lexical)
+    for root, form in zip(roots, lexical, strict=True):
         if root.mode == "rw":
             check_rw(root.path, lexical=form, home=home, protected=protected)
+            for other in option_ro:
+                if root.path.is_relative_to(other):
+                    raise SandboxError(
+                        f"writable root {root.path} is or lies inside read-only "
+                        f"root {other}"
+                    )
 
     for number in PORTS:
         if not 1 <= number <= 65535:

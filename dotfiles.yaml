@@ -128,6 +128,8 @@ include:
       - fuzzel/fuzzel.ini
       - gammastep/config.ini
       - herdr/config.toml
+      - herdr-app/keys.json
+      - herdr-app/settings.json
       - htop
       - i3/config
       - i3status-rust

@@ -20,7 +20,7 @@ Preflight checks that all three are executable, parses `bwrap --version` and the
 ## Usage
 
 ```bash
-vscode-sandbox [--port PORT]... [--only-args] [PATH]...
+vscode-sandbox [--port PORT]... [--ro DIR]... [--rw DIR]... [--only-args] [PATH]...
 ```
 
 | Argument | Effect |
@@ -28,10 +28,15 @@ vscode-sandbox [--port PORT]... [--only-args] [PATH]...
 | `PATH` | A directory becomes a writable root; a file is rooted at its nearest ancestor holding a `.git` entry, else at its parent. VS Code opens the paths given. |
 | no `PATH` | The root is the nearest ancestor of the working directory holding a `.git` entry, and VS Code opens it; with no such ancestor (e.g. a launch from `$HOME`) there is no root and Electron gets no path. |
 | `--port PORT` | Forward host `localhost` TCP port `PORT` into the sandbox (repeatable, 1–65535). |
-| `--only-args` | Ignore the roots configured in `ROOTS`. |
+| `--ro DIR` | Also mount directory `DIR` read-only at its own path, without opening it (repeatable). |
+| `--rw DIR` | Also mount directory `DIR` writable at its own path, without opening it (repeatable). |
+| `--only-args` | Ignore the roots configured in `ROOTS`; `--ro` and `--rw` directories are kept. |
 
 The `.git` walk only checks that the entry exists (`lstat`); it never runs Git or reads `gitdir` or `core.worktree`, so external Git directories are never mounted.
 Paths are resolved with every symlink followed, and a missing path or unknown option is an error.
+`--ro` and `--rw` paths are resolved against the working directory and must be directories.
+They are mounted but not opened: Electron gets only the `PATH` arguments, or the walk root.
+The opened folder (a `PATH` argument or the walk root) is always writable, and a `--ro` that covers it is an error.
 
 The launcher returns once VS Code is up: exit 0 when the sandbox is ready, 1 with `vscode-sandbox: error: ...` on a launch failure, 2 on a usage error (unknown option, invalid `--port`), 130 when interrupted.
 
@@ -41,7 +46,7 @@ The launcher returns once VS Code is up: exit 0 when the sandbox is ready, 1 wit
 | :--- | :--- |
 | `vscode-sandbox` | The wrapper itself, deployed to `~/bin`. |
 | `code` | [`dotfiles/bin/code`](../dotfiles/bin/code) runs `exec "$HOME/bin/vscode-sandbox" "$@"`. |
-| `code` in the integrated terminal | Inside the sandbox, `~/bin/code` is a script running the RPM's `/usr/bin/code` with the wrapper-owned Electron switches (`--no-sandbox`, `--ozone-platform=wayland`, `--password-store=basic`), so the file opens in the running window instead of starting a nested launch. The CLI hands off through a second Electron, which without `--no-sandbox` aborts on Chromium's setuid sandbox. `CODE_ARGS` is not passed, because the CLI warns about switches it does not know on every call and the handoff opens no window. |
+| `code` in the integrated terminal | Inside the sandbox, `~/bin/code` is a script running the RPM's `/usr/bin/code` with the wrapper-owned Electron switches (`--no-sandbox`, `--ozone-platform=wayland`, `--password-store=basic`), so the file opens in the running window instead of starting a nested launch. The CLI hands off through a second Electron, which without `--no-sandbox` aborts on Chromium's setuid sandbox. `CODE_ARGS` is not passed, because the CLI warns about switches it does not know on every call and the handoff opens no window. It is VS Code's own CLI, so it does not take `--ro` or `--rw`; a running sandbox cannot gain a mount, so close it and relaunch. |
 
 Launch VS Code only through `code` or `vscode-sandbox`.
 The RPM's own application-menu entry, file-manager "Open with" and `vscode://` links start VS Code unsandboxed, outside every guarantee on this page.
@@ -79,7 +84,7 @@ The switches the sandbox depends on, `--no-sandbox --ozone-platform=wayland --pa
 | `/proc`, `/dev`, `/dev/shm` | Fresh mounts |
 | `/dev/dri/renderD*` | Device binds; no primary DRM nodes |
 | `/sys/block`, `/sys/bus`, `/sys/class`, `/sys/dev`, `/sys/devices` | Read-only binds (Flatpak's set) |
-| Roots | `ro` or `rw` per `ROOTS`; path arguments `rw` |
+| Roots | `ro` or `rw` per `ROOTS`; path arguments and `--rw` directories `rw`; `--ro` directories `ro` |
 | `~/.config/Code`, `~/.vscode`, `~/.vscode-shared` | Read-write, created on the host when missing: the host profile is reused; `~/.vscode-shared` is VS Code 1.144's shared application storage, which holds workspace trust and the recently opened list |
 | `~/.micromamba`, `~/bin`, `~/.local/bin`, `~/.config/nvim`, `~/.local/share/uv/python`, `~/.gitconfig`, `~/.local/share/jupyter/kernels`, fonts (including `~/.fonts`), icons, themes, GTK settings | Read-only when present on the host |
 | `~/.cache`, `~/.local/share/jupyter/runtime` | Read-write, from the private store `~/.local/share/vscode-sandbox/` |
@@ -90,9 +95,11 @@ The switches the sandbox depends on, `--no-sandbox --ozone-platform=wayland --pa
 Everything else, including `~/.ssh`, `~/.config/gh`, the keyring, other projects, `/data`, the session bus and the Podman socket, is absent.
 Roots are mounted before the home and store binds, so the wrapper's binds win over a covering read-only root.
 
-A writable root is rejected when it is `/` or `$HOME` or one of its ancestors, lies under a top-level hidden entry of `$HOME` as given or as resolved, or overlaps a protected path in either direction (equal to it, covering it, or inside it).
-Protected paths are the read-only home binds and read-only roots, the running script, `~/bin/vscode-sandbox`, `~/bin/code`, `~/gems` (the host `GEM_HOME`), the profile and store bind sources, the host-only state directory `$XDG_RUNTIME_DIR/vscode-sandbox`, and the system trees `/usr /bin /sbin /lib /lib64 /etc /opt /var /boot /root /srv /tmp /run /proc /sys /dev`, each in its lexical and resolved form.
-A read-only root in `ROOTS` is rejected when it is or covers `/`, `$HOME`, `/run`, `/data` or a protected path other than another read-only root, and when it lies inside `/run` or under a top-level hidden entry of `$HOME`.
+A writable root (a path argument, a `--rw` directory or a `rw` entry in `ROOTS`) is rejected when it is `/` or `$HOME` or one of its ancestors, lies under a top-level hidden entry of `$HOME` as given or as resolved, overlaps a protected path in either direction (equal to it, covering it, or inside it), or is or lies inside a `--ro` directory.
+Protected paths are the read-only home binds and read-only `ROOTS` entries, the running script, `~/bin/vscode-sandbox`, `~/bin/code`, `~/gems` (the host `GEM_HOME`), the profile and store bind sources, the host-only state directory `$XDG_RUNTIME_DIR/vscode-sandbox`, and the system trees `/usr /bin /sbin /lib /lib64 /etc /opt /var /boot /root /srv /tmp /run /proc /sys /dev`, each in its lexical and resolved form.
+A read-only root in `ROOTS` or a `--ro` directory is rejected when it is or covers `/`, `$HOME`, `/run`, `/data` or a protected path other than a read-only `ROOTS` entry, and when it lies inside one of `/run`, `/tmp`, `/dev`, `/proc` and `/sys`, or under a top-level hidden entry of `$HOME`, as given or as resolved.
+Unlike a read-only `ROOTS` entry, a `--ro` directory may lie inside a writable root; it is mounted after it.
+Such a directory protects its files for the session only: sandboxed code can rename an ancestor between the writable root and the directory and plant content at the original path, while the original data survives at the renamed path.
 
 ## Network
 
@@ -206,7 +213,8 @@ Launch errors before readiness are printed by the launcher with the log's path.
 - Kernel 0-days and denial of service.
 - Simultaneous death of the supervisor and its guard (e.g. both SIGKILLed): VS Code keeps running until closed, without the lock.
 - When only the guard dies abnormally, teardown completes but SELinux logs one expected `pasta_t` `sigkill` AVC: pasta's denied parent-death signal to the outer `bwrap`, which the supervisor's sweep then kills.
-- A protected path that resolves through an intermediate symlink inside a writable root: sandboxed code can repoint that symlink. Only the lexical and final resolved forms are protected.
+- Paths that resolve through a writable root may have been redirected by an earlier session. A protected path reached through an intermediate symlink inside a writable root is protected only in its lexical and final resolved forms. A path argument, `--ro` or `--rw` directory that resolves through a writable root may have been redirected the same way, by a repointed symlink or a replaced directory, and the checks bound its target only to non-protected paths.
+- A `--ro` directory inside a writable root protects its files for the session only: sandboxed code can rename an ancestor between the writable root and the directory and plant content at the original path, while the original data survives at the renamed path.
 
 ## Host verification
 
@@ -242,3 +250,4 @@ Any VS Code started outside the sandbox loads whatever sandboxed code planted in
 6. With one instance running, a second `code ~/<project>` exits non-zero with the lock message; afterwards every `/usr/share/code/code` process is still in the sandbox and `pgrep -c -u "$USER" '^pasta'` prints `1`. Negative control: `/usr/share/code/code --user-data-dir "$(mktemp -d)" --extensions-dir "$(mktemp -d)"`, launched by hand with no folder, must make the same check fail (two namespaces); close it afterwards.
 7. Note the per-launch files `ls "$XDG_RUNTIME_DIR/vscode-sandbox"` lists; `kill -9 <supervisor pid>` then ends VS Code, the next launch succeeds (no stale lock), and afterwards none of the noted files is listed (they carry the launcher's pid, not the supervisor's).
 8. Closing the last window leaves no `pasta`, `bwrap` or `vscode-sandbox` process.
+9. From a closed state, `code ~/<project> --ro <dir1> --rw <dir2>` opens only the project. In the integrated terminal, `touch <dir1>/x` fails with `Read-only file system`, and `touch <dir2>/x` creates the file on the host.

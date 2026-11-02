@@ -109,7 +109,9 @@ sandbox.start_guard = recording_start_guard
 env = sandbox.host_env(os.environ)
 root = Path(spec["root"])
 config = sandbox.resolve_config(
-    sandbox.parse_args([str(root), *(f"--port={port}" for port in spec["ports"])]),
+    sandbox.parse_args(
+        [str(root), *(f"--port={port}" for port in spec["ports"]), *spec["options"]]
+    ),
     home=sandbox.resolve_path(Path(env["HOME"])),
     cwd=root,
     script=script.resolve(),
@@ -486,6 +488,7 @@ def start(
     args: Mapping[str, Any] | None = None,
     *,
     ports: Sequence[int] = (),
+    options: Sequence[str] = (),
     constants: Mapping[str, str] | None = None,
     omit_globals: Sequence[str] = (),
     spawn: bool = True,
@@ -499,6 +502,7 @@ def start(
     :param check: The probe check to run.
     :param args: The check's keyword arguments, written to args.json.
     :param ports: Host localhost ports passed as --port.
+    :param options: Further command-line arguments, e.g. --ro and --rw directories.
     :param constants: Script constants the driver replaces before the launch.
     :param omit_globals: Wayland globals the driver removes from WAYLAND_GLOBALS.
     :param spawn: Let the launch reach start_guard; otherwise it fails there.
@@ -512,6 +516,7 @@ def start(
     spec = {
         "root": str(root),
         "ports": list(ports),
+        "options": list(options),
         "command": [HOST_PYTHON, "-I", str(root / "probe.py"), check],
         "constants": dict(constants or {}),
         "omit_globals": list(omit_globals),
@@ -720,11 +725,12 @@ def host_submounts(source: str, target: str) -> list[str]:
     ]
 
 
-def expected_mounts(root: Path) -> list[str]:
+def expected_mounts(root: Path, option_dirs: Sequence[Path] = ()) -> list[str]:
     """
     Build the mount points the sandbox must have, one entry per mount.
 
     :param root: The test's read-write root.
+    :param option_dirs: The directories passed as --ro or --rw.
     :return: The mount points, sorted, repeated where mounts stack.
     """
     binds = [
@@ -732,6 +738,7 @@ def expected_mounts(root: Path) -> list[str]:
         # The driver's only path argument; a ROOTS entry in the script would be an extra
         # mount here, because the driver does not pass --only-args
         (str(root), str(root)),
+        *((str(path), str(path)) for path in option_dirs),
         *(
             (str(HOME / relative), str(HOME / relative))
             for relative in EXPECTED_HOME_RO_BINDS
@@ -829,6 +836,18 @@ def sibling() -> Iterator[Path]:
     shutil.rmtree(path)
 
 
+@pytest.fixture
+def option_dirs() -> Iterator[tuple[Path, Path]]:
+    """Provide a --ro and a --rw directory under $HOME, outside the root."""
+    paths = tuple(
+        Path(tempfile.mkdtemp(dir=Path.home(), prefix=f"vscode-sandbox-{mode}-"))
+        for mode in ("ro", "rw")
+    )
+    yield paths[0].resolve(), paths[1].resolve()
+    for path in paths:
+        shutil.rmtree(path)
+
+
 # AC2: filesystem view
 
 
@@ -895,6 +914,57 @@ def test_ac2_mounts_match_access_table(root):
     expected = expected_mounts(root)
 
     found = [unescape(field) for field in probe(root, "mounts")]
+
+    assert mount_difference(found, expected) == {"extra": [], "missing": []}
+
+
+def test_ac2_ro_dir_rejects_writes(root, option_dirs):
+    ro, rw = option_dirs
+
+    written = probe(
+        root, "write", {"path": str(ro)}, options=("--ro", str(ro), "--rw", str(rw))
+    )
+
+    assert written == "EROFS"
+
+
+def test_ac2_rw_dir_writable(root, option_dirs):
+    ro, rw = option_dirs
+    name = f"vscode-sandbox-probe-{uuid.uuid4().hex}"
+
+    created = probe(
+        root,
+        "create",
+        {"path": str(rw / name), "content": name},
+        options=("--ro", str(ro), "--rw", str(rw)),
+    )
+
+    assert created == "ok"
+    assert (rw / name).read_text() == name
+
+
+def test_ac2_ro_dir_inside_root_rejects_writes_while_root_stays_writable(root):
+    sub = root / "sub"
+    sub.mkdir()
+    name = f"vscode-sandbox-probe-{uuid.uuid4().hex}"
+    options = ("--ro", str(sub))
+
+    written = probe(root, "write", {"path": str(sub)}, options=options)
+    created = probe(
+        root, "create", {"path": str(root / name), "content": name}, options=options
+    )
+
+    assert written == "EROFS"
+    assert created == "ok"
+    assert (root / name).read_text() == name
+
+
+def test_ac2_mounts_match_access_table_with_option_dirs(root, option_dirs):
+    ro, rw = option_dirs
+    expected = expected_mounts(root, option_dirs)
+
+    mounts = probe(root, "mounts", options=("--ro", str(ro), "--rw", str(rw)))
+    found = [unescape(field) for field in mounts]
 
     assert mount_difference(found, expected) == {"extra": [], "missing": []}
 
