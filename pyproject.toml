@@ -12,7 +12,8 @@ target-version = "py314"
 extend-include = ["dotfiles/bin/agent-sandbox", "dotfiles/bin/vscode-sandbox"]
 
 [tool.ruff.per-file-target-version]
-"dotfiles/bin/agent-sandbox" = "py312"
+"dotfiles/bin/agent-sandbox" = "py313"
+"dotfiles/.agent/skills/bwrap-sandbox/**" = "py313"
 
 [tool.ruff.lint.per-file-ignores]
 "dev-container/jupyter_server_config.py" = ["F821"]  # traitlets injects `c` into config-file namespace
