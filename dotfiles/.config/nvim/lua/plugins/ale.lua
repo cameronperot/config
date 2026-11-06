@@ -45,7 +45,7 @@ local M = {
         vim.g.ale_fix_on_save = 1
         vim.g.ale_lint_on_insert_leave = 1
         vim.g.ale_pattern_options = {
-            ["lsq/ccxt"] = { ale_fix_on_save = 0 },
+            ["ccxt"] = { ale_fix_on_save = 0 },
         }
         vim.g.ale_python_auto_uv = 1
         vim.g.ale_python_ty_auto_uv = 1

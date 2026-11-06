@@ -203,7 +203,7 @@ ALE runs the explicitly configured linters and fixes on save. `<Leader>af` runs 
 
 The explicit linter/fixer tables have a `cpp` entry but no `c` entry, despite ALE's C filetype load trigger. The C++ clang-format settings use LLVM style, four-space indentation, and a 100-column limit. Ruff's lint/fix integration receives `--line-length=98`; the separate `ruff_format` integration has no line-length override here and uses Ruff's project configuration or default. StyLua uses width 96 and four spaces; shfmt uses four spaces; luacheck uses Lua 5.4 rules and ignores unused arguments. These widths differ from the editor's 88-column marker.
 
-ALE's Python uv options are enabled for Ruff and ty. Paths matching `lsq/ccxt` disable automatic ALE fixing, but manual `:ALEFix` and the core save-time whitespace cleanup still apply. Use `:ALEInfo` to inspect selected executables, configuration, and command output when linting or fixing fails.
+ALE's Python uv options are enabled for Ruff and ty. Use `:ALEInfo` to inspect selected executables, configuration, and command output when linting or fixing fails.
 
 ## Python environments and running code
 

@@ -722,7 +722,7 @@ def test_parse_args_requires_an_agent(home: Path) -> None:
 @needs_tiocsti
 def test_dry_run_smoke_prints_the_sandbox_argv(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     proc = run_dry(home, repo)
 
@@ -742,7 +742,7 @@ def test_dry_run_smoke_prints_the_sandbox_argv(scratch: Path) -> None:
 @needs_tiocsti
 def test_home_canonical_refuses_a_symlinked_home(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     link = scratch / "link"
     link.symlink_to(home)
 
@@ -789,15 +789,18 @@ def test_resolve_workspace_includes_external_bare_worktree(
 @needs_tiocsti
 def test_parent_chain_under_home_is_tmpfs_remounted_read_only(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
-    lsq = str(home / "lsq")
+    repo = make_repo(home / "projects" / "proj")
+    projects = str(home / "projects")
 
     argv = argv_of(run_dry(home, repo))
 
     assert_ordered(
-        argv, ("--tmpfs", lsq), ("--bind", str(repo), str(repo)), ("--remount-ro", lsq)
+        argv,
+        ("--tmpfs", projects),
+        ("--bind", str(repo), str(repo)),
+        ("--remount-ro", projects),
     )
-    assert seq_index(argv, "--dir", lsq) is None
+    assert seq_index(argv, "--dir", projects) is None
 
 
 @needs_tiocsti
@@ -825,7 +828,7 @@ def test_parent_chain_home_ancestors_are_tmpfs_before_the_home_tmpfs(
 @needs_tiocsti
 def test_parent_chain_remounts_are_the_last_mount_ops(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     argv = argv_of(run_dry(home, repo))
 
@@ -843,7 +846,7 @@ def test_allowlist_binds_every_shared_read_only_home_path(
     scratch: Path, relative_path: str
 ) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     argv = argv_of(run_dry(home, repo))
 
@@ -857,7 +860,7 @@ def test_allowlist_does_not_bind_whole_shared_home_directories(
     scratch: Path, relative_path: str
 ) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     argv = argv_of(run_dry(home, repo))
 
@@ -871,7 +874,7 @@ def test_allowlist_binds_every_agent_state_directory_read_write(
     scratch: Path, agent: str, relative_path: str
 ) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     argv = argv_of(run_dry(home, repo, agent=agent))
 
@@ -887,7 +890,7 @@ def test_allowlist_places_every_state_pin_after_its_writable_bind(
     scratch: Path, agent: str, relative_path: str, state_path: str
 ) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     argv = argv_of(run_dry(home, repo, agent=agent))
 
@@ -901,7 +904,7 @@ def test_allowlist_places_every_state_pin_after_its_writable_bind(
 @needs_tiocsti
 def test_opencode_config_is_not_mounted(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     config = str(home / ".config" / "opencode")
     Path(config).mkdir(parents=True)
 
@@ -916,7 +919,7 @@ def test_opencode_config_is_not_mounted(scratch: Path) -> None:
 @needs_tiocsti
 def test_npmrc_with_credentials_is_not_bound(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     (home / ".npmrc").write_text("//registry.npmjs.org/:_authToken=x\n")
 
     proc = run_dry(home, repo)
@@ -929,7 +932,7 @@ def test_npmrc_with_credentials_is_not_bound(scratch: Path) -> None:
 @needs_tiocsti
 def test_npmrc_without_credentials_is_bound(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     (home / ".npmrc").write_text("ignore-scripts=true\n")
     npmrc = str(home / ".npmrc")
 
@@ -946,7 +949,7 @@ def test_exe_visible_refuses_an_executable_the_sandbox_does_not_expose(
     scratch: Path,
 ) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     hidden_sh = scratch / "sh"
     shutil.copy("/bin/sh", hidden_sh)
     hidden_sh.chmod(0o755)
@@ -960,7 +963,7 @@ def test_exe_visible_refuses_an_executable_the_sandbox_does_not_expose(
 @needs_tiocsti
 def test_exe_visible_accepts_a_system_executable(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     proc = run_dry(home, repo)
 
@@ -1167,7 +1170,7 @@ def test_forward_vars_pass_every_nonempty_allowlisted_value(
     scratch: Path, variable: str, value: str
 ) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     argv = argv_of(run_dry(home, repo, env_extra={variable: value}))
 
@@ -1180,7 +1183,7 @@ def test_forward_vars_omit_every_empty_allowlisted_value(
     scratch: Path, variable: str
 ) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     argv = argv_of(run_dry(home, repo, env_extra={variable: ""}))
 
@@ -1193,7 +1196,7 @@ def test_api_key_vars_forward_and_redact_every_allowlisted_key(
     scratch: Path, variable: str
 ) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     proc = run_dry(home, repo, env_extra={variable: "fixture-secret"})
 
@@ -1206,7 +1209,7 @@ def test_api_key_vars_forward_and_redact_every_allowlisted_key(
 @needs_tiocsti
 def test_forward_path_vars_pass_a_file_the_sandbox_exposes(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     argv = argv_of(run_dry(home, repo, env_extra={"SSL_CERT_FILE": str(CA_BUNDLE)}))
 
@@ -1261,7 +1264,7 @@ def test_forward_path_vars_drop_symlink_to_unavailable_target(
 @needs_tiocsti
 def test_forward_path_vars_drop_a_file_outside_the_sandbox(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     ca = scratch / "ca.pem"
     ca.write_text("")
 
@@ -1295,7 +1298,7 @@ def test_resolv_conf_target_under_run_is_bound(scratch: Path) -> None:
     if not target.startswith("/run/"):
         pytest.skip("resolv.conf not under /run")
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     argv = argv_of(run_dry(home, repo))
 
@@ -1421,7 +1424,7 @@ def test_ensure_state_dirs_seeds_pinned_instruction_files(
 @needs_tiocsti
 def test_bunfig_without_credentials_is_bound(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     (home / ".bunfig.toml").write_text("[install]\nminimumReleaseAge = 1728000\n")
     bunfig = str(home / ".bunfig.toml")
 
@@ -1433,7 +1436,7 @@ def test_bunfig_without_credentials_is_bound(scratch: Path) -> None:
 @needs_tiocsti
 def test_bunfig_with_a_token_is_not_bound(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     (home / ".bunfig.toml").write_text('[install.scopes]\nacme = { token = "x" }\n')
 
     proc = run_dry(home, repo)
@@ -1449,7 +1452,7 @@ def test_bunfig_with_a_token_is_not_bound(scratch: Path) -> None:
 @needs_tiocsti
 def test_allowlist_exposes_git_config_by_file_not_directory(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     git_dir = str(home / ".config" / "git")
     git_config = str(home / ".config" / "git" / "config")
 
@@ -1465,7 +1468,7 @@ def test_allowlist_exposes_git_config_by_file_not_directory(scratch: Path) -> No
 @needs_tiocsti
 def test_exe_visible_accepts_an_executable_inside_the_workspace(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     (repo / "dist").mkdir()
     workspace_sh = repo / "dist" / "sh"
     shutil.copy("/bin/sh", workspace_sh)
@@ -1480,7 +1483,7 @@ def test_exe_visible_accepts_an_executable_inside_the_workspace(scratch: Path) -
 @needs_tiocsti
 def test_forward_path_vars_pass_a_file_inside_the_workspace(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     ca = repo / "ca.pem"
     ca.write_text("")
 
@@ -1495,7 +1498,7 @@ def test_forward_path_vars_pass_a_file_inside_the_workspace(scratch: Path) -> No
 @needs_tiocsti
 def test_forward_path_vars_warn_when_the_file_does_not_exist(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     proc = run_dry(
         home, repo, env_extra={"NODE_EXTRA_CA_CERTS": str(scratch / "missing.pem")}
@@ -1669,7 +1672,7 @@ def test_signing_key_file_with_extra_content_is_not_exposed(home: Path, capsys) 
 @needs_tiocsti
 def test_bunfig_with_registry_url_credentials_is_not_bound(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     (home / ".bunfig.toml").write_text(
         '[install]\nregistry = "https://alice:s3cr3t@registry.example.com/"\n'
     )
@@ -1684,7 +1687,7 @@ def test_bunfig_with_registry_url_credentials_is_not_bound(scratch: Path) -> Non
 @needs_tiocsti
 def test_npmrc_scoped_registry_line_is_bound(scratch: Path) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
     (home / ".npmrc").write_text("@acme:registry=https://registry.example.com/@acme/\n")
     npmrc = str(home / ".npmrc")
 
@@ -1827,7 +1830,7 @@ def test_debug_dry_run_redacts_all_api_keys_and_does_not_seed_any_state_director
     scratch: Path, agent: str, state_path: str
 ) -> None:
     home = scratch / "home"
-    repo = make_repo(home / "lsq" / "proj")
+    repo = make_repo(home / "projects" / "proj")
 
     proc = subprocess.run(
         [str(SCRIPT), "--debug", "--dry-run", agent, "", "two words"],
