@@ -79,7 +79,7 @@ def test_startup_incomplete_antidote_preserves_existing_files(shell_env):
     assert "incomplete or differs from the pinned commit" in result.stderr
 
 
-def test_startup_clone_failure_continues_and_cleans_temporary_directory(shell_env):
+def test_startup_clone_failure_continues_with_empty_antidote_dir(shell_env):
     shell_env["CLONE_FAIL"] = "1"
 
     result = run_shell(env=shell_env, script='print -r -- "$LOCAL_EXPORT_LOADED"')
@@ -87,17 +87,20 @@ def test_startup_clone_failure_continues_and_cleans_temporary_directory(shell_en
     assert result.stdout.strip() == "yes"
     assert "plugins unavailable" in result.stderr
     assert list(Path(shell_env["HOME"]).glob(".antidote-bootstrap.*")) == []
-    assert not (Path(shell_env["HOME"]) / ".antidote").exists()
+    antidote = Path(shell_env["HOME"]) / ".antidote"
+    assert antidote.is_dir()
+    assert list(antidote.iterdir()) == []
 
 
-def test_startup_wrong_download_pin_is_not_installed(shell_env):
+def test_startup_wrong_download_pin_is_not_sourced(shell_env):
     shell_env["ANTIDOTE_PIN"] = "wrong"
 
     result = run_shell(env=shell_env, script='print -r -- "$LOCAL_EXPORT_LOADED"')
 
     assert result.stdout.strip() == "yes"
-    assert "downloaded antidote does not match" in result.stderr
-    assert not (Path(shell_env["HOME"]) / ".antidote").exists()
+    assert "incomplete or differs from the pinned commit" in result.stderr
+    assert "plugins unavailable" in result.stderr
+    assert (Path(shell_env["HOME"]) / ".antidote/antidote.zsh").is_file()
 
 
 def test_startup_valid_download_is_installed(shell_env):

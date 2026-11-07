@@ -525,6 +525,8 @@ EXPECTED_HEAD = [
         "keep-id",
         "--security-opt",
         "label=disable",
+        "--hostname",
+        "dev_container",
     ),
     *("-w", "/srv/proj/sub", "-v", "/srv/proj:/srv/proj"),
     *("-v", "/cfg/.agent:/home/user/.agent"),
