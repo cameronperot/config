@@ -31,7 +31,7 @@
   "branchSummary": {
     "skipPrompt": true
   },
-  "tuiMode": "regular",
+  "tuiMode": "fullscreen",
   "hideThinkingBlock": false,
   "externalEditor": "nvim",
   "lastChangelogVersion": "1.4.0"
