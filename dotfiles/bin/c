@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """c — run a command in a dev:latest container.
 
-By default a throwaway container is created with `podman run --rm`: the
+By default a throwaway container is created with `podman run --rm --init`: the
 repository root is bind-mounted at its host path so git's absolute worktree
 links stay valid inside, the container starts in the current directory, and it
 gets the agent dotfiles from $AGENT_CONFIG_DIR when set (otherwise using the
@@ -524,6 +524,7 @@ def run_argv(
         ENGINE,
         "run",
         "--rm",
+        "--init",
         "--userns",
         "keep-id",
         "--security-opt",

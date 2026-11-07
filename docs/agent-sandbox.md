@@ -133,7 +133,7 @@ The sandbox shares the network and the invoking environment's kernel. It isolate
 | State ownership or symlink error | Correct the named host state path; pinned symlinks must stay within the selected state trees |
 | Writing a pinned configuration file fails | Edit the named pinned file from the host |
 | SSH agent not forwarded | Check global signing configuration, socket ownership, and the socket's identity list |
-| `bwrap: open /proc/2/ns/ns failed: No such file or directory` in the dev container | Use `c -a=--init CMD` so Podman supplies an init process |
+| `bwrap: open /proc/2/ns/ns failed: No such file or directory` in the dev container | Start the container with `podman run --init` (`c` does this by default) so Podman supplies an init process |
 
 Help and successful dry runs return `0`; wrapper validation and filesystem errors normally return `1`. Process replacement failures return `127` for a missing executable or `126` for other execution errors. After successful replacement, the launched process determines the exit status.
 

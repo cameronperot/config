@@ -105,8 +105,6 @@ By default, `c` mounts the repository, agent configuration, and signing socket. 
 | `AGENT_SANDBOX_BIN=<path> pi …` | Use a different agent executable |
 | Absolute path to the agent binary | Bypass the wrapper |
 
-If the agent fails with an error like `bwrap: open /proc/2/ns/ns failed: No such file or directory`, bubblewrap cannot handle the container process being PID 1: pass `c -a=--init CMD` so podman injects an init process instead.
-
 ## Commit Signing
 SSH signing uses a dedicated private key held by an isolated agent on the host. Containers receive its socket, or a TCP connection under `c -k`. `dotfiles/.gitconfig` enables SSH signing; the image build sets `user.signingkey` and `~/.ssh/allowed_signers` from the public key in `GIT_SIGNING_KEY`.
 

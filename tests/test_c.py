@@ -521,6 +521,7 @@ EXPECTED_HEAD = [
         "podman",
         "run",
         "--rm",
+        "--init",
         "--userns",
         "keep-id",
         "--security-opt",
@@ -892,7 +893,7 @@ def test_main_dry_run_prints_run_argv(
 
     read = capsys.readouterr()
     assert read.out.startswith(
-        "podman run --rm --userns keep-id --security-opt label=disable "
+        "podman run --rm --init --userns keep-id --security-opt label=disable "
     )
     words = shlex.split(read.out)
     assert words[words.index("-w") + 1] == str(plain_repo / "sub")
