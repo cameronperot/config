@@ -526,6 +526,8 @@ def run_argv(
         "keep-id",
         "--security-opt",
         "label=disable",
+        "--hostname",
+        PREFERRED_CONTAINER,
     ]
     argv += ["-w", str(cwd)]
     for mount in mounts:

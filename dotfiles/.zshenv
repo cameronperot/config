@@ -1,7 +1,7 @@
 # Path
 # Precedence: ~/bin > ~/.local/bin > ~/.cargo/bin > ~/.juliaup/bin > inherited PATH > ~/gems/bin
 typeset -U path
-for d in "$HOME/.juliaup/bin" "$HOME/.cargo/bin" "$HOME/.local/bin" "$HOME/bin"; do
+for d in "$HOME/.bun/bin" "$HOME/.juliaup/bin" "$HOME/.cargo/bin" "$HOME/.local/bin" "$HOME/bin"; do
     if [ -d "$d" ]; then
         path=("$d" $path)
     fi

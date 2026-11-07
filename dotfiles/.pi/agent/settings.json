@@ -34,5 +34,5 @@
   "tuiMode": "fullscreen",
   "hideThinkingBlock": false,
   "externalEditor": "nvim",
-  "lastChangelogVersion": "1.4.0"
+  "lastChangelogVersion": "1.5.0"
 }
