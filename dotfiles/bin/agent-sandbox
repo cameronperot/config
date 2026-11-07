@@ -1019,6 +1019,10 @@ def unshare_args(runtime: Runtime) -> tuple[str, ...]:
     Returns:
         Argument prefix ending at the Bubblewrap executable.
     """
+    # TODO: Without --mount-proc here or bwrap --unshare-pid, bwrap's --proc binds the
+    # invoking /proc, exposing outside processes' cmdlines to the agent and causing the
+    # /proc/2/ns error. --mount-proc fixes both but fails with EPERM under Podman's
+    # default /proc masks, so it needs --security-opt unmask=/proc/* on the container.
     return (
         "unshare",
         "--user",
