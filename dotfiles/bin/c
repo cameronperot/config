@@ -498,7 +498,9 @@ def run_argv(
             the image's bundled dotfiles without config bind mounts.
         ssh_sock: Host ssh-agent socket, bind-mounted unless ``krun``; None
             mounts no socket and sets no ``SSH_AUTH_SOCK``.
-        krun: Boot a libkrun microVM and bridge the ssh-agent over TCP instead.
+        krun: Boot a libkrun microVM and bridge the ssh-agent over TCP instead;
+            the entrypoint starts as guest root and drops to the invoker's
+            UID/GID, passed as ``DEV_UID``/``DEV_GID``.
         cpus: Under ``krun`` the vCPU count (must be set); otherwise the
             ``--cpus`` limit, omitted when None.
         ram_mib: Under ``krun`` the VM RAM in MiB (must be set); otherwise the
@@ -553,6 +555,14 @@ def run_argv(
             f"krun.cpus={cpus}",
             "--annotation",
             f"krun.ram_mib={ram_mib}",
+            # The guest applies process.user before the entrypoint, so start it as
+            # guest root to initialize the VM, then drop to DEV_UID/DEV_GID
+            "--user",
+            "0:0",
+            "-e",
+            f"DEV_UID={os.getuid()}",
+            "-e",
+            f"DEV_GID={os.getgid()}",
         ]
     else:
         if not signing_disabled and ssh_sock is not None:

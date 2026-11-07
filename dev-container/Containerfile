@@ -118,6 +118,7 @@ RUN groupadd -g "${NEW_GID}" "${NEW_USER}" \
 RUN mkdir -p \
     "${MAMBA_ROOT_PREFIX}" \
     /work \
+    "${HOME_DIR}/.cache/pre-commit" \
     "${HOME_DIR}/.local/state" \
     "${HOME_DIR}/.ssh" \
     && chmod 700 "${HOME_DIR}/.ssh" \
@@ -195,7 +196,7 @@ RUN chown -R root:root /tmp/environment-setup \
     && echo "source /root/.bash_aliases" >> /root/.bashrc
 USER "${NEW_USER}"
 
-# Custom entry point to drop from guest root to the OCI user under krun
+# Custom entry point to initialize the guest as root under krun, then drop to the invoking user
 COPY --chmod=0755 dev-container/entrypoint.sh /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash"]

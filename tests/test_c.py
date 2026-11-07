@@ -548,6 +548,10 @@ EXPECTED_HEAD = [
 ]
 SSH_ENV = ["-e", "SSH_AUTH_SOCK=/tmp/ssh-agent.sock"]
 SOCKET_MOUNT = ["-v", "/run/user/7/llm-agent.sock:/tmp/ssh-agent.sock"]
+KRUN_ROOT_START = [
+    *("--user", "0:0"),
+    *("-e", f"DEV_UID={os.getuid()}", "-e", f"DEV_GID={os.getgid()}"),
+]
 SIGNING_OFF_ENV = [
     "-e",
     "GIT_CONFIG_COUNT=1",
@@ -621,6 +625,7 @@ def test_run_argv_krun_uses_annotations_and_tcp_bridge() -> None:
         *SSH_ENV,
         *("--runtime=krun", "--network", "pasta:-T,7777"),
         *("--annotation", "krun.cpus=4", "--annotation", "krun.ram_mib=8192"),
+        *KRUN_ROOT_START,
         "-i",
         "dev:latest",
         "bash",
@@ -669,6 +674,7 @@ def test_run_argv_publishes_plannotator_port_on_both_networks() -> None:
         *SSH_ENV,
         *("--runtime=krun", "--network", "pasta:-T,7777"),
         *("--annotation", "krun.cpus=4", "--annotation", "krun.ram_mib=8192"),
+        *KRUN_ROOT_START,
         *publish,
         "-i",
         "dev:latest",
@@ -700,6 +706,7 @@ def test_run_argv_signing_disabled_under_krun() -> None:
     assert argv[len(EXPECTED_HEAD) :] == [
         *("--runtime=krun", "--network", "pasta"),
         *("--annotation", "krun.cpus=4", "--annotation", "krun.ram_mib=8192"),
+        *KRUN_ROOT_START,
         *SIGNING_OFF_ENV,
         "-i",
         "dev:latest",

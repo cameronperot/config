@@ -7,7 +7,7 @@
 | `Containerfile` | Image: Debian 13, user `user` (`/home/user`), micromamba env `dev`, uv, the coding agents, dotfiles via `install.py` |
 | `build.sh` | Builds the image from the repository root with the builder's UID/GID and `GIT_SIGNING_KEY`; extra arguments go to `podman build` |
 | `compose.yml` | Long-running JupyterLab container `dev_container` |
-| `entrypoint.sh` | Execs the command; under `--runtime=krun` first drops from guest root to the image user, disables TIOCSTI and, when signing is enabled, bridges the TCP signer to `SSH_AUTH_SOCK` |
+| `entrypoint.sh` | Execs the command; under `--runtime=krun`, where `c -k` starts it as guest root, first disables TIOCSTI and, when signing is enabled, bridges the TCP signer to `SSH_AUTH_SOCK`, then drops to the invoking user passed as `DEV_UID`/`DEV_GID`; it aborts the launch if any step before the drop fails |
 | `jupyter_server_config.py` | JupyterLab settings baked into the image (root `/work`, token `dev`) |
 
 ## Build
@@ -94,7 +94,7 @@ By default, `c` mounts the repository, agent configuration, and signing socket. 
 - **Limits:** credentials in the exposed config files remain readable, the package-config screen has known gaps, and the network stays shared because bubblewrap cannot filter it.
 
 ### microVM
-`c -k` boots the container on a separate guest kernel through libkrun. The host signing agent is reached through a TCP bridge because Unix-domain sockets cannot cross the shared filesystem. See [Signing under `c -k`](#signing-under-c--k-pasta-bridge) for setup and access limits.
+`c -k` boots the container on a separate guest kernel through libkrun. The guest applies the container user before the entrypoint runs, so `c -k` starts it as guest root (`--user 0:0`) with the invoker's IDs in `DEV_UID`/`DEV_GID`; the entrypoint disables TIOCSTI in the guest kernel, which defaults it on, then drops to that user with its image groups, `HOME`, `USER` and `LOGNAME`. Replacing the entrypoint with `-a=--entrypoint=…` skips this initialization. The host signing agent is reached through a TCP bridge because Unix-domain sockets cannot cross the shared filesystem. See [Signing under `c -k`](#signing-under-c--k-pasta-bridge) for setup and access limits.
 
 ## Agents
 `pi`, `omp` and `opencode` resolve to wrappers in `~/bin` that launch the real binary through `agent-sandbox`. This applies through `c`, `c -r`, Zsh and Bash.
