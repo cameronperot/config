@@ -100,6 +100,7 @@ EXPECTED_HOME_RO_PATHS = (
     ".local/share/claude",
     ".local/share/pnpm",
     ".local/share/uv",
+    ".bun",
 )
 EXPECTED_AGENT_STATE_DIRS = {
     "pi": (".agent", ".cache/pre-commit", ".plannotator", ".pi"),
@@ -2510,11 +2511,8 @@ def test_opencode_installation_protection_rejects_symlink(home, target):
 
 def test_opencode_installation_protection_image_layout(home):
     containerfile = (REPO_ROOT / "dev-container/Containerfile").read_text()
-    assert (
-        'mv "${HOME_DIR}/.opencode/bin/opencode" '
-        '"${HOME_DIR}/.local/lib/opencode/opencode"' in containerfile
-    )
-    binary = home / ".local/lib/opencode/opencode"
+    assert 'BUN_INSTALL_BIN="${HOME_DIR}/.local/bin" bun install -g' in containerfile
+    binary = home / ".bun/install/global/node_modules/opencode-ai/bin/opencode"
     binary.parent.mkdir(parents=True)
     binary.write_text("#!/bin/sh\nprintf fixture-opencode\n")
     binary.chmod(0o755)
@@ -2533,9 +2531,7 @@ def test_opencode_installation_protection_image_layout(home):
         sandbox.home_args(home=home, policy=sandbox.POLICIES["opencode"], rc_files=())
     )
     assert (
-        seq_index(
-            words, "--ro-bind-try", str(home / ".local/lib"), str(home / ".local/lib")
-        )
+        seq_index(words, "--ro-bind-try", str(home / ".bun"), str(home / ".bun"))
         is not None
     )
 

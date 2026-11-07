@@ -9,6 +9,9 @@ ARG HOME_DIR=/home/${NEW_USER}
 ARG GIT_SIGNING_KEY=""
 ARG MP_SKILLS_REPO_REF=4ae2317ddb22b046e26455e4f9c9b3aaaf62212d
 ARG HERDR_VERSION=v0.9.5
+ARG OPENCODE_VERSION=1.19.5
+ARG PI_VERSION=1.5.0
+ARG OMP_VERSION=18.18.0
 ARG DEBIAN_FRONTEND=noninteractive
 
 # Env vars
@@ -23,7 +26,7 @@ ENV COLORTERM=truecolor \
     TERM=xterm-kitty \
     TZ="${TZ}" \
     VISUAL=nvim
-ENV PATH="${HOME_DIR}/bin:${HOME_DIR}/.local/bin:${MAMBA_ROOT_PREFIX}/envs/dev/bin:${MAMBA_ROOT_PREFIX}/bin:${PATH}"
+ENV PATH="${HOME_DIR}/bin:${HOME_DIR}/.local/bin:${HOME_DIR}/.bun/bin:${MAMBA_ROOT_PREFIX}/envs/dev/bin:${MAMBA_ROOT_PREFIX}/bin:${PATH}"
 
 # Debian packages
 RUN apt-get update \
@@ -129,14 +132,14 @@ COPY --chown="${NEW_USER}:${NEW_USER}" environment.yml /tmp/environment-setup/en
 RUN micromamba env create -f /tmp/environment-setup/environment.yml \
     && micromamba clean --all --yes
 
-# Install coding agents
-RUN curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path \
-    && mkdir -p "${HOME_DIR}/.local/lib/opencode" \
-    && mv "${HOME_DIR}/.opencode/bin/opencode" "${HOME_DIR}/.local/lib/opencode/opencode" \
-    && ln -s "${HOME_DIR}/.local/lib/opencode/opencode" "${HOME_DIR}/.local/bin/opencode"
-RUN npm install -g --ignore-scripts --min-release-age=0 --no-fund --no-audit \
-    --prefix "${HOME_DIR}/.local" @earendil-works/pi-coding-agent
-RUN curl -fsSL https://omp.sh/install | sh
+# Install bun
+RUN curl -fsSL https://bun.com/install | bash
+
+# Install coding agents with bun at pinned versions
+RUN BUN_INSTALL_BIN="${HOME_DIR}/.local/bin" bun install -g \
+    "opencode-ai@${OPENCODE_VERSION}" \
+    "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+    "@oh-my-pi/pi-coding-agent@${OMP_VERSION}"
 
 # Install Herdr from a pinned GitHub release
 RUN case "$(dpkg --print-architecture)" in \

@@ -53,7 +53,7 @@ The following home paths are exposed read-only when present:
 
 - `.config/git/config`, `.config/git/ignore`, `.config/git/attributes`.
 - `.config/pip`, `.config/pnpm`, `.config/uv`.
-- `.local/bin`, `.local/lib`, `.local/share/claude`, `.local/share/pnpm`, `.local/share/uv`.
+- `.local/bin`, `.local/lib`, `.local/share/claude`, `.local/share/pnpm`, `.local/share/uv`, `.bun`.
 - `.ssh/allowed_signers`, plus an accepted SSH signing public-key file.
 - `.npmrc` and `.bunfig.toml`, only after credential screening.
 
@@ -72,7 +72,7 @@ All paths in this table are relative to `$HOME`. Each agent also receives writab
 
 Before a real launch, the wrapper creates missing state directories on the host and verifies that they are owned by the invoking user and have no symlinked components. Pinned symlinks must resolve within the selected agent's state directories. Missing pinned JSON files are seeded with `{}` (`{"providers": {}}` for Pi's `models.json`), and missing pinned directory paths are created. Missing pinned `AGENTS.md` files are created empty. Instruction-file seeds use exclusive creation and preserve existing content. Prepared configuration pins use required read-only binds, so disappearance fails launch. The optional `.opencode/bin` installation pin is only added when present and is never seeded. A symlink at `.opencode/bin` is rejected, including dangling links and links into the state tree, before generating mount arguments on real launches and dry-runs.
 
-When invoked through `c`, these paths survive container replacement only when included in the dedicated `AGENT_CONFIG_DIR` store described in the [container persistence table](../dev-container/README.md#persistent-agent-state). Without that store, agent state is ephemeral; the named pre-commit cache still persists. The image keeps OpenCode’s executable in `.local/lib/opencode/opencode`, outside the writable `.opencode` store.
+When invoked through `c`, these paths survive container replacement only when included in the dedicated `AGENT_CONFIG_DIR` store described in the [container persistence table](../dev-container/README.md#persistent-agent-state). Without that store, agent state is ephemeral; the named pre-commit cache still persists. The image installs OpenCode, Pi, and OMP with bun into `.local/bin`, outside the writable `.opencode` store.
 
 Pi's `settings.json` and `trust.json`, OMP's `config.yml`, and Claude's `settings.json` remain writable within their state directories and are not seeded by the wrapper. OMP's alternate configuration files do not require normalization. Host `.config/opencode` is neither seeded nor mounted into the sandbox; that location is ephemeral inside the sandbox. Sessions, credentials and other unpinned state also remain accessible inside the sandbox. Model/provider configuration and global worktree setup commands must be edited from the host.
 

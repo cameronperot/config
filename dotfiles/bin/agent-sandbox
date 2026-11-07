@@ -34,6 +34,7 @@ HOME_RO_PATHS = (
     ".local/share/claude",
     ".local/share/pnpm",
     ".local/share/uv",
+    ".bun",
 )
 
 PACKAGE_RC_FILES = (
@@ -171,7 +172,8 @@ Notes:
   Pi/Claude settings.json and OMP config.yml remain writable and are not seeded.
   Host ~/.config/opencode is not mounted; that sandbox location is ephemeral.
   Configuration binds are required after preparation. Existing .opencode/bin
-  is pinned read-only but never seeded. The image binary lives in .local/lib.
+  is pinned read-only but never seeded. Image agent binaries live in
+  .local/bin, backed by bun's global store in .bun.
   Edit pinned files on the host.
   Through c, configured AGENT_CONFIG_DIR state persists across container
   replacement; without it, agent state is ephemeral. The named pre-commit
@@ -1159,6 +1161,7 @@ def env_args(
     """
     sandbox_path = (
         f"/opt/mamba/envs/dev/bin:{runtime.home}/.local/bin:"
+        f"{runtime.home}/.bun/bin:"
         "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
     )
     values = [
