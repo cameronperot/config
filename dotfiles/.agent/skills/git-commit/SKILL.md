@@ -1,7 +1,6 @@
 ---
 name: git-commit
 description: Creates atomic git commits with Conventional Commit messages, splitting unrelated changes. Use only when explicitly asked to commit changes, write a commit message, or modify a commit. Do not invoke proactively after completing a code change.
-disable-model-invocation: true
 ---
 
 # git-commit
