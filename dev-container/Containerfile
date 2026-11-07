@@ -7,6 +7,8 @@ ARG NEW_UID=1000
 ARG NEW_GID=1000
 ARG HOME_DIR=/home/${NEW_USER}
 ARG GIT_SIGNING_KEY=""
+ARG MP_SKILLS_REPO_REF=4ae2317ddb22b046e26455e4f9c9b3aaaf62212d
+ARG HERDR_VERSION=v0.9.5
 ARG DEBIAN_FRONTEND=noninteractive
 
 # Env vars
@@ -82,27 +84,12 @@ RUN apt-get update \
     yq \
     zip \
     zsh \
-    # Chromium/Playwright
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libpango-1.0-0 \
-    libcairo2 \
-    libxkbcommon0 \
-    libcups2 \
-    libdrm2 \
-    libxshmfence1 \
     && apt-get clean all \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/fdfind /usr/bin/fd
 
 # Install gh from the official GitHub CLI repository
-# https://github.com/cli/cli/blob/trunk/docs/install_linux.md
 RUN mkdir -p -m 755 /etc/apt/keyrings /etc/apt/sources.list.d \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
@@ -151,6 +138,17 @@ RUN npm install -g --ignore-scripts --min-release-age=0 --no-fund --no-audit \
     --prefix "${HOME_DIR}/.local" @earendil-works/pi-coding-agent
 RUN curl -fsSL https://omp.sh/install | sh
 
+# Install Herdr from a pinned GitHub release
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) herdr_arch=x86_64 ;; \
+        arm64) herdr_arch=aarch64 ;; \
+        *) echo "unsupported architecture for Herdr" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/herdrdev/herdr/releases/download/${HERDR_VERSION}/herdr-linux-${herdr_arch}" \
+        -o "${HOME_DIR}/.local/bin/herdr" \
+    && chmod 755 "${HOME_DIR}/.local/bin/herdr" \
+    && "${HOME_DIR}/.local/bin/herdr" --version
+
 COPY --chown="${NEW_USER}:${NEW_USER}" . /tmp/environment-setup/
 
 # Configure dev environment
@@ -161,6 +159,16 @@ RUN test -n "${GIT_SIGNING_KEY}" || { echo "GIT_SIGNING_KEY build arg is require
     && cp /tmp/environment-setup/dev-container/jupyter_server_config.py "${HOME_DIR}/.jupyter/jupyter_server_config.py" \
     && git config --global user.signingkey "${GIT_SIGNING_KEY}" \
     && echo "$(git config user.email) $(git config user.signingkey)" >> "${HOME_DIR}/.ssh/allowed_signers"
+
+# Install shared skills from mattpocock/skills at a pinned commit
+RUN git clone --quiet https://github.com/mattpocock/skills.git /tmp/mattpocock-skills \
+    && git -C /tmp/mattpocock-skills checkout --quiet "${MP_SKILLS_REPO_REF}" \
+    && mkdir -p "${HOME_DIR}/.agent/skills" \
+    && cp -r \
+        /tmp/mattpocock-skills/skills/productivity/grill-me \
+        /tmp/mattpocock-skills/skills/productivity/grilling \
+        "${HOME_DIR}/.agent/skills/" \
+    && rm -rf /tmp/mattpocock-skills
 
 # Configure agents
 RUN rm -rf "${HOME_DIR}/.pi/agent/prompts" "${HOME_DIR}/.pi/agent/skills" "${HOME_DIR}/.omp/agent/prompts" "${HOME_DIR}/.omp/agent/skills" \
