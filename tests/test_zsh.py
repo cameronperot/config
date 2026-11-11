@@ -112,6 +112,14 @@ def test_startup_valid_download_is_installed(shell_env):
     assert list(Path(shell_env["HOME"]).glob(".antidote-bootstrap.*")) == []
 
 
+def test_ctrl_g_edits_command_line_in_both_vi_keymaps(shell_env):
+    result = run_shell(
+        env=shell_env, script='bindkey -M viins "^G"; bindkey -M vicmd "^G"'
+    )
+
+    assert result.stdout.splitlines() == ['"^G" edit-command-line'] * 2
+
+
 def terminal_session(*, env: dict[str, str], script: str, input_bytes: bytes) -> str:
     """Run a shell in a terminal, feeding input once its setup is complete."""
     pid, master = pty.fork()

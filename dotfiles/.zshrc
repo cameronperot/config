@@ -116,6 +116,10 @@ else
     bindkey -M viins "^h" history-incremental-search-backward
 fi
 bindkey -M viins "^n" _zsh_open_nvim
+autoload -Uz edit-command-line
+zle -N edit-command-line
+bindkey -M viins "^g" edit-command-line
+bindkey -M vicmd "^g" edit-command-line
 KEYTIMEOUT=1 # for esc in zsh vim mode
 
 # Fuzzy completion groups, colors, and directory previews

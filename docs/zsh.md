@@ -34,6 +34,7 @@ Shell shortcuts below apply in vi insert mode unless stated otherwise. Fuzzy sel
 | `Ctrl+T` | Select files or directories to insert; preview file contents with bat |
 | `Alt+C` | Find and enter a directory; preview its contents with lsd |
 | `Ctrl+N` | Open Neovim, then return to the unchanged command line and cursor |
+| `Ctrl+G` | Edit the command line in `$VISUAL` (Neovim); also bound in vi command mode, where `KEYTIMEOUT=1` leaves too little time for the plugin's `vv` |
 | `Ctrl+H` | Search history with fzf; insert the selected command for editing. Falls back to incremental history search if the fzf widget is unavailable |
 | `Tab` | Fuzzy completion with descriptions and filename colors; directory previews for `cd` |
 | `<` / `>` in completion | Switch completion groups |
