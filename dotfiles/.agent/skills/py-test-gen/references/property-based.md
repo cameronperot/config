@@ -55,17 +55,17 @@ Invariant plus idempotence:
 
 ```python
 @given(st.text())
-def test_normalize_symbol_is_idempotent(s):
-    once = normalize_symbol(s)
+def test_normalize_whitespace_is_idempotent(s):
+    once = normalize_whitespace(s)
 
-    assert normalize_symbol(once) == once
+    assert normalize_whitespace(once) == once
 ```
 
 ## Strategy craft
 
-- Build domain objects with `st.builds(Order, qty=st.decimals(min_value=0, ...))` or `@st.composite` when fields are interdependent.
+- Build domain objects with `st.builds(User, age=st.integers(min_value=0, max_value=150))` or `@st.composite` when fields are interdependent.
 - Constrain generation instead of filtering: `st.integers(min_value=1)` beats `assume(x > 0)`. Use `assume` only for rare, hard-to-express exclusions — heavy filtering slows generation and triggers health-check errors.
-- `st.text()` generates surrogates, control characters, and combining marks by default. That is usually the point — but constrain the alphabet (`st.text(alphabet=st.characters(codec="utf-8"))`) when the contract genuinely excludes such input, and say why in the test.
+- `st.text()` generates control characters, combining marks, and other unusual code points by default (not surrogates, which it excludes). That is usually the point — but constrain the alphabet (e.g. `st.text(alphabet=st.characters(codec="ascii"))`) when the contract genuinely excludes such input, and say why in the test.
 - Bound sizes (`max_size=`) for expensive operations so runs stay fast.
 
 ## Shrinking and regression pinning
@@ -76,8 +76,8 @@ def test_normalize_symbol_is_idempotent(s):
 ```python
 @example("")
 @given(st.text())
-def test_normalize_symbol_never_raises(s):
-    normalize_symbol(s)
+def test_normalize_whitespace_never_raises(s):
+    normalize_whitespace(s)
 ```
 
 ## Determinism in CI
@@ -90,7 +90,7 @@ from hypothesis import settings
 settings.register_profile("ci", derandomize=True, max_examples=200)
 ```
 
-Activate it with `settings.load_profile("ci")` or the `HYPOTHESIS_PROFILE=ci` environment variable. Don't suppress health-check errors (`suppress_health_check=`) to make a flaky strategy pass — fix the strategy.
+Activate it with `settings.load_profile("ci")` in `conftest.py`, or pass `--hypothesis-profile=ci` to pytest. Hypothesis does not read a profile name from the environment by itself; to select one by variable, load it explicitly: `settings.load_profile(os.getenv("HYPOTHESIS_PROFILE", "default"))`. Don't suppress health-check errors (`suppress_health_check=`) to make a flaky strategy pass — fix the strategy.
 
 ## Anti-patterns
 
@@ -101,4 +101,4 @@ Activate it with `settings.load_profile("ci")` or the `HYPOTHESIS_PROFILE=ci` en
 
 ## Validation
 
-The SKILL.md validation loop applies unchanged, with one substitution: the vacuity check weakens the property once (e.g. flip an equality to `!=` or drop a conjunct), confirms Hypothesis finds a counterexample, then reverts.
+The SKILL.md validation loop applies unchanged, including its detection check: break the production code the property covers (e.g. drop a normalization step or flip a sign), confirm Hypothesis finds a counterexample, then restore. Never weaken the property itself; a weaker property is easier to satisfy, so it proves nothing.

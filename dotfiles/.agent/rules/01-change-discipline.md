@@ -4,7 +4,7 @@ Every change must serve the given task — nothing more.
 ## Scope
 - Change only what the request requires. Do not refactor, reformat, or "improve" adjacent code, even where it is clearly better.
 - Match the patterns of the surrounding code and the nearest existing module, even where you would choose differently in new code.
-- Create files only where the task requires them; no unrequested docs, READMEs, examples, or scripts.
+- Create files only where the task requires them (tests for the code the task changes count); no unrequested docs, READMEs, examples, or scripts.
 - Introduce no new dependencies without asking.
 - Clean up only the dead code and orphaned imports your own changes created.
 - Mention anything worth fixing outside the request, but only fix it if instructed to.

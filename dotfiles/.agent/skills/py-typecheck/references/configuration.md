@@ -44,7 +44,7 @@ respect-ignore-files = true  # honors .gitignore (default)
 ```toml
 [tool.ty.terminal]
 output-format = "concise"  # full (default) | concise | github | gitlab | junit
-error-on-warning = true    # exit 1 when only warnings are found
+error-on-warning = false   # unset: warnings exit 1 (ty 0.0.89); false: only errors fail the run
 ```
 
 ## Per-path overrides
@@ -62,10 +62,14 @@ possibly-missing-attribute = "ignore"
 
 ## Gradual adoption
 
+Only when the user has asked to adopt ty or relax its gate; ordinary fixing keeps the existing gate.
+
 1. Run `uv run ty check --output-format concise` and tally diagnostics per rule.
-2. Demote the noisiest rules to `warn` in `[tool.ty.rules]`; leave the rest at `error`.
-3. Fix all errors; land CI at that bar.
-4. Ratchet: promote one demoted rule back to `error`, fix its diagnostics, repeat until the table is empty.
+2. Demote the noisiest error-level rules to `warn` in `[tool.ty.rules]`; leave every other rule at its default level (some rules already default to `warn`, others to `ignore`).
+3. Set `error-on-warning = false` in `[tool.ty.terminal]`: warnings exit 1 by default, so without it the demoted rules still fail CI. The warnings stay visible in the output.
+4. Fix all errors; land CI at that bar.
+5. Ratchet: promote one demoted rule back to `error`, fix its diagnostics, repeat until the table is empty.
+6. Fix the remaining warnings, including those from rules that warn by default, then remove `error-on-warning = false`; until they are fixed, removing it fails CI.
 
 ## CI
 

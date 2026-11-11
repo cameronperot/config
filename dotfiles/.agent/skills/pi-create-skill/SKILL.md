@@ -54,7 +54,7 @@ Every skill also registers as `/skill:name`; arguments after the command are app
 
 Stick to spec fields for portability: Pi ignores unknown fields, but claude.ai upload hard-fails on non-spec ones.
 Name collisions across locations keep the first skill found and warn — use distinct names.
-Never gate a skill with `disable-model-invocation`; it kills triggering on explicit conversational asks, and the gated lead phrase below is the mechanism instead.
+Do not gate a skill with `disable-model-invocation`; it kills triggering on explicit conversational asks, and the gated lead phrase below is the mechanism instead. Two exceptions: a skill that only a subagent consumes, by reading its SKILL.md directly (py-lint-fix, py-typecheck and py-debug, read by the linter and debugger subagents), and a deliberately command-only skill for a rare, explicitly requested workflow (py-project-init).
 
 ## Description
 
@@ -63,9 +63,9 @@ Every description contains exactly one trigger sentence — the first sentence b
 
 | Tier | Lead phrase | When | Extra sentence |
 |---|---|---|---|
-| Gated | `Use only when explicitly asked to …` | An ambient trigger path exists — the skill follows naturally after ordinary coding work (commits, tests, changelogs, debugging) | Required: `Do not invoke proactively <ambient scenario>.` |
+| Gated | `Use only when explicitly asked to …` | An ambient trigger path exists — the skill follows naturally after ordinary coding work (commits, changelogs, debugging) | Required: `Do not invoke proactively <ambient scenario>.` |
 | Open | `Use when explicitly asked to …` | The request is inherently explicit; no ambient path | — |
-| Broad | `Use when asked to …` / `Use whenever <topic> comes up: …` | House-standard tool that should fire even on indirect mentions; never contains "explicitly" | — |
+| Broad | `Use when asked to …` / `Use whenever <topic> comes up: …` | House-standard tool that should fire even on indirect mentions, or a house-standard step that should fire unprompted after ordinary work (py-test-gen); never contains "explicitly" | — |
 
 Template, in order:
 

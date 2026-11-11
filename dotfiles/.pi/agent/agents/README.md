@@ -35,7 +35,7 @@ Consequences for the agent files:
 | engineer | read, grep, find, ls, bash, edit, write | Yes | Implements a plan/task: writes code, runs tests |
 | linter | read, grep, find, ls, bash, edit | Yes (existing files only; check-only supported) | Python lint/format/type fixes using py-lint-fix and py-typecheck |
 | test-runner | read, grep, find, ls, bash | No | Existing tests/builds, results and failure triage |
-| debugger | read, grep, find, ls, bash, edit | Yes (existing files only) | Reproduce → isolate → fix one bug |
+| debugger | read, grep, find, ls, bash, edit | Yes (existing files only) | Reproduce → isolate → fix one bug using py-debug |
 | reviewer | read, grep, find, ls, bash | No | Independent severity-ranked review |
 | security-auditor | read, grep, find, ls, bash | No | Vulnerability audit with attack scenarios |
 | pr-summarizer | read, grep, find, ls, bash | No | PR/commit summary from git diff |

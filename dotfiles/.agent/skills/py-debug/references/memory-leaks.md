@@ -4,18 +4,21 @@ Contents: [Confirm growth](#confirm-growth) · [tracemalloc](#tracemalloc) · [g
 
 ## Confirm growth
 
-Cheap RSS observation before any tooling; a flat line means no leak and the investigation ends here.
+Cheap RSS observation before any tooling. A flat line means no growth was observed under that workload in that window, not that there is no leak: run the suspected activity throughout, and observe long enough to cover its cycle (a minute is too short for an hourly cache or reconnect).
 Get `$pypid` by backgrounding the process and resolving the interpreter PID as shown in `references/hangs-crashes-async.md` (Confirm the hang).
 
 ```bash
 for i in $(seq 12); do ps -o rss= -p "$pypid"; sleep 5; done
 ```
 
-In-process equivalent (peak RSS in KiB on Linux, printed from a loop the program already has):
+In-process, printed from a loop the program already has: current RSS, then peak RSS (Linux; both in KiB):
 
 ```python
+print(open("/proc/self/status").read().split("VmRSS:")[1].split()[0])
 print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 ```
+
+Peak RSS is a high-water mark: it never falls, so it cannot show memory being released. RSS also counts native allocations (C extensions, numpy buffers) that tracemalloc below does not see; growth in RSS without growth in traced allocations points at native memory.
 
 ## tracemalloc
 

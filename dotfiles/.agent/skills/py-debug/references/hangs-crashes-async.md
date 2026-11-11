@@ -12,41 +12,48 @@ timeout 60 uv run python script.py </dev/null; echo "exit=$?"
 
 - Exit 124 means `timeout` killed it: a real hang or something much slower than expected.
 - Use `timeout -k 5 60` when the process ignores SIGTERM.
-- To probe a hang while it is happening, background the process and find the interpreter PID; `$!` can be uv's wrapper process rather than python itself, so resolve it with pgrep:
+- To probe a hang while it is happening, start the reproducer yourself in the background and take the interpreter PID from its own launcher: `$!` is uv's wrapper process and python runs as its child. Never pick a PID by matching command lines (`pgrep -f`); that can select another checkout's process or a running service.
+- Launch, probe, and clean up in one shell command; background jobs and shell variables do not survive between tool calls:
 
 ```bash
-uv run python -X faulthandler script.py </dev/null &
+uv run python -X faulthandler script.py </dev/null >/tmp/repro.log 2>&1 &
+launcher=$!
 sleep 5
-pypid=$(pgrep -nf script.py)
+pypid=$(pgrep -P "$launcher")
+ps -o pid,ppid,args -p "$pypid"   # confirm it is your reproducer before signalling
+# ... probe here (see below) ...
+kill "$pypid"; timeout 10 tail --pid="$pypid" -f /dev/null || kill -KILL "$pypid"; wait "$launcher"
 ```
+
+The cleanup line escalates to SIGKILL after 10 seconds, because a hung process may ignore SIGTERM, and a bare `wait` would then hang the shell.
 
 ## Dump a live process
 
-Two routes; pick by whether the process must survive.
+Only for a process this task started and verified as above. Prefer the routes that keep it alive.
 
 **py-spy (process survives).**
 
 ```bash
-py-spy --version || uv tool install py-spy
-py-spy dump --pid "$pypid"
+py-spy --version && py-spy dump --pid "$pypid"
 ```
 
-- `--locals` adds local variables per frame; `--native` adds C-extension frames.
-- On hardened kernels ptrace may be restricted (yama); retry with `sudo py-spy dump --pid "$pypid"`, and if that is unavailable use the faulthandler route below.
+- `--locals` adds local variables per frame (mind secrets); `--native` adds C-extension frames.
+- Never install py-spy unasked: give the user `uv tool install py-spy` and use a faulthandler route.
+- Whether ptrace is permitted inside the agent sandbox is unknown, and there is no sudo; if the dump is refused, use a faulthandler route.
 
-**Stdlib faulthandler (process dies, which is fine for diagnosis).**
-Works only if the process was started with `-X faulthandler` (or `PYTHONFAULTHANDLER=1`); SIGABRT then prints every thread's stack before dying:
+**faulthandler on demand (process survives, needs a code edit).**
+Add `faulthandler.register(signal.SIGUSR1, all_threads=True)` near startup, then `kill -USR1 "$pypid"` dumps every thread to stderr and the process keeps running. Send SIGUSR1 only once the handler is known to be installed: its default action terminates the process.
+
+**faulthandler on SIGABRT (process dies).**
+Works only if the reproducer was started with `-X faulthandler` (or `PYTHONFAULTHANDLER=1`); SIGABRT then prints every thread's stack before dying:
 
 ```bash
-kill -ABRT "$pypid"
-wait
+kill -ABRT "$pypid"; wait
 ```
 
-In-code variants when you can edit the program:
+**Watchdog from the start (needs a code edit):** `faulthandler.dump_traceback_later(30, exit=True)` prints all stacks and exits if the program is still alive after 30 seconds.
 
-- Non-fatal, dump on demand: `faulthandler.register(signal.SIGUSR1)` near startup, then `kill -USR1 "$pypid"` dumps all threads and the process keeps running.
-- Watchdog from the start: `faulthandler.dump_traceback_later(30, exit=True)` prints all stacks and exits if the program is still alive after 30 seconds.
-- Periodic self-dump for long-lived services:
+**Periodic self-dump (needs a code edit)** for long-lived services:
 
 ```python
 def dump_all_stacks():
@@ -111,5 +118,5 @@ loop = asyncio.get_running_loop()
 loop.add_signal_handler(signal.SIGUSR1, dump_tasks, loop)
 ```
 
-then `kill -USR1 "$pypid"` prints where every task is suspended.
+then, once the handler is installed, `kill -USR1 "$pypid"` prints where every task is suspended.
 A periodic variant (a coroutine that sleeps and calls `dump_tasks` in a loop, started with `create_task`) works where signals are awkward, such as on worker threads.
