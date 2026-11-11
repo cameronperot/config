@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 
 // Exercise the real guard modules without starting Pi or contacting a provider.
@@ -43,7 +43,9 @@ registerHooks({
 		if (url === "mock:node:child_process") return { format: "module", shortCircuit: true, source: "export const spawn = (...args) => globalThis.piTestSpawn(...args);" };
 		if (url === "mock:agents") return { format: "module", shortCircuit: true, source: `
 			export const discoverAgents = () => ({ projectAgentsDir: null, warnings: [], agents: [
-				{ name: 'engineer', source: 'user', systemPrompt: '', tools: ['bash'] }
+				{ name: 'engineer', source: 'user', systemPrompt: '', tools: ['bash'] },
+				{ name: 'reviewer', source: 'user', systemPrompt: '', tools: ['read', 'grep', 'find', 'ls'], isolated: true },
+				{ name: 'untooled', source: 'user', systemPrompt: '', isolated: true }
 			] });
 		` };
 		return nextLoad(url, context);
@@ -301,6 +303,78 @@ test("subagent chain passes {previous} output through literally", async () => {
 	await agent.tool("subagent", { chain: [{ agent: "engineer", task: "first" }, { agent: "engineer", task: "Review: {previous}" }] });
 	assert.deepEqual(tasks, ["Task: first", `Task: Review: ${output}`]);
 	delete globalThis.piTestSpawn;
+});
+
+test("confinement blocks paths outside the root, symlink escapes and non-file tools", async () => {
+	const cwd = fixture();
+	const confined = join(cwd, "stage");
+	mkdirSync(join(confined, "target"), { recursive: true });
+	writeFileSync(join(confined, "target/setup.py"), "");
+	mkdirSync(join(cwd, "stage-sibling"));
+	symlinkSync(join(cwd, "agent"), join(confined, "target/escape"));
+	process.env.PI_CONFINE_ROOT = confined;
+	try {
+		for (const [tool, path] of [
+			["read", "target/setup.py"], ["read", join(confined, "target/setup.py")], ["read", "target/missing.py"],
+			["grep", undefined], ["find", "target"], ["ls", "."],
+		]) assert.equal(rules.policyDecision(tool, path === undefined ? {} : { path }, confined), undefined, `${tool} ${path}`);
+		for (const [tool, path] of [
+			["read", "../agent/guard-rules.json"], ["read", "~/.bashrc"], ["read", "target/escape/guard-rules.json"],
+			["grep", "/"], ["find", join(cwd, "stage-sibling")], ["ls", "target/escape"], ["ls", ".."],
+			["read", "@../agent/guard-rules.json"], ["read", `file://${cwd}/agent/guard-rules.json`],
+		]) assert.equal(rules.policyDecision(tool, { path }, confined)?.ask, false, `${tool} ${path}`);
+		for (const tool of ["bash", "write", "edit", "subagent"]) {
+			assert.match(rules.policyDecision(tool, { command: "true", path: "target/setup.py" }, confined).reason, /not available while confined/);
+		}
+		const gate = harness(permissionGate, confined, false);
+		assert.equal((await gate.call("read", { path: "../agent/guard-rules.json" })).block, true);
+		assert.equal(gate.audit[0].action, "blocked");
+	} finally {
+		delete process.env.PI_CONFINE_ROOT;
+	}
+	assert.equal(rules.policyDecision("read", { path: "../agent/guard-rules.json" }, confined), undefined);
+});
+
+test("isolated subagents start locked down and confined, or not at all", async () => {
+	const cwd = fixture();
+	const calls = [];
+	globalThis.piTestSpawn = (command, args, options) => {
+		calls.push({ args, options });
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		queueMicrotask(() => child.emit("close", 0, null));
+		return child;
+	};
+	try {
+		const agent = harness(subagent, cwd);
+		const missingGate = await agent.tool("subagent", { agent: "reviewer", task: "review", cwd: "stage" });
+		assert.match(missingGate.details.results[0].stderr, /requires the guard extension/);
+		const gatePath = join(process.env.PI_TEST_AGENT_DIR, "extensions", "permission-gate.ts");
+		mkdirSync(dirname(gatePath));
+		writeFileSync(gatePath, "");
+		const noCwd = await agent.tool("subagent", { agent: "reviewer", task: "review" });
+		assert.match(noCwd.details.results[0].stderr, /requires an explicit cwd/);
+		const noTools = await agent.tool("subagent", { agent: "untooled", task: "review", cwd: "stage" });
+		assert.match(noTools.details.results[0].stderr, /requires a tools allowlist/);
+		assert.equal(calls.length, 0);
+
+		await agent.tool("subagent", { agent: "reviewer", task: "review", cwd: "stage" });
+		const [{ args, options }] = calls;
+		for (const flag of ["--no-context-files", "--no-skills", "--no-prompt-templates", "--no-extensions", "--no-mcp", "--no-approve"]) {
+			assert.ok(args.includes(flag), flag);
+		}
+		assert.equal(args[args.indexOf("-e") + 1], gatePath);
+		assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
+		assert.equal(options.cwd, join(cwd, "stage"));
+		assert.equal(options.env.PI_CONFINE_ROOT, join(cwd, "stage"));
+
+		await agent.tool("subagent", { agent: "engineer", task: "task" });
+		assert.ok(!calls[1].args.includes("--no-extensions"));
+		assert.equal(calls[1].options.env.PI_CONFINE_ROOT, undefined);
+	} finally {
+		delete globalThis.piTestSpawn;
+	}
 });
 
 test("approve-all gates ungoverned commands and defers to ask rules", async () => {

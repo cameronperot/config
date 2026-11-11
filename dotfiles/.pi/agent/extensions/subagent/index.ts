@@ -305,6 +305,40 @@ async function runSingleAgent(
 	}
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	if (agent.isolated) {
+		const gatePath = path.join(getAgentDir(), "extensions", "permission-gate.ts");
+		const isolationError = !cwd
+			? "an explicit cwd naming the directory its file tools are confined to"
+			: !agent.tools
+				? "a tools allowlist in its definition"
+				: !fs.existsSync(gatePath)
+					? `the guard extension at ${gatePath}`
+					: undefined;
+		if (isolationError) {
+			return {
+				agent: agentName,
+				agentSource: agent.source,
+				task,
+				exitCode: 1,
+				messages: [],
+				stderr: `Isolated agent "${agentName}" requires ${isolationError}; it was not started.`,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				step,
+			};
+		}
+		// Nothing the child would discover from its cwd or config may load: target code can carry
+		// its own AGENTS.md, skills and extensions, and MCP tools survive --tools
+		args.push(
+			"--no-context-files",
+			"--no-skills",
+			"--no-prompt-templates",
+			"--no-extensions",
+			"--no-mcp",
+			"--no-approve",
+			"-e",
+			gatePath,
+		);
+	}
 	const inheritsDispatchConfig = !agent.model;
 	const model = agent.model ?? dispatchDefaults.model;
 	if (model) args.push("--model", model);
@@ -354,6 +388,7 @@ async function runSingleAgent(
 			const resolvedCwd = path.resolve(defaultCwd, cwd ?? ".");
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: resolvedCwd,
+				env: agent.isolated ? { ...process.env, PI_CONFINE_ROOT: resolvedCwd } : process.env,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});

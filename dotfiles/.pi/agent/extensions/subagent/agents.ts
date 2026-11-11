@@ -13,6 +13,8 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	/** Run without discovered context, skills, MCP or extensions, file tools confined to the task cwd. */
+	isolated: boolean;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -38,6 +40,7 @@ type AgentFrontmatter = {
 	description?: unknown;
 	tools?: unknown;
 	model?: unknown;
+	isolated?: unknown;
 };
 
 /**
@@ -102,11 +105,18 @@ function loadAgentsFromDir(dir: string, source: "user" | "project", warnings: st
 			continue;
 		}
 
+		// A misspelled value must not quietly run the agent unisolated
+		if (frontmatter.isolated !== undefined && typeof frontmatter.isolated !== "boolean") {
+			warnings.push(`Skipped agent file ${filePath}: isolated must be true or false`);
+			continue;
+		}
+
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools: parseToolList(frontmatter.tools),
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
+			isolated: frontmatter.isolated === true,
 			systemPrompt: body,
 			source,
 			filePath,

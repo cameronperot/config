@@ -22,6 +22,7 @@ Beyond the built-ins, three tools are registered and active by default:
 - `debugger` — diagnoses and fixes one specific bug (reproduce → isolate → fix → verify); edits files but does not implement features.
 - `reviewer` — independent severity-ranked code review of a diff/change for correctness, security, and maintainability.
 - `security-auditor` — read-only security audit of specified code/diff; reachable vulnerabilities with attack scenarios and remediation.
+- `malware-reviewer` — isolated static review of staged untrusted code for malicious behavior; dispatched by the `malicious-code-review` skill with `cwd` set to the staging directory, never directly on a project.
 - `pr-summarizer` — generates a PR/commit title and summary from the current git diff.
 
 Children cannot see this conversation and cannot delegate further — make each task well-defined and self-contained with appropriate context.

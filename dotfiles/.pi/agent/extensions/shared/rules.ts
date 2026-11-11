@@ -28,9 +28,9 @@
  * recursion) does not try to load it as an extension.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
@@ -332,6 +332,52 @@ export function noDeleteMatch(target: string, cwd: string): string | undefined {
 	return firstMatch(target, getRules(cwd).rules.noDeletePaths, cwd);
 }
 
+// --- Confinement ------------------------------------------------------------
+
+/** The only tools an isolated subagent may call while `PI_CONFINE_ROOT` is set. */
+const CONFINED_TOOLS = ["read", "grep", "find", "ls"];
+
+/**
+ * `target` with symlinks resolved through its longest existing prefix, so a link
+ * inside the root cannot name a file outside it. A path that does not exist yet
+ * keeps its missing tail, which cannot contain a link. Undefined when the path
+ * cannot be resolved for any reason other than not existing.
+ */
+function canonicalPath(target: string): string | undefined {
+	const missing: string[] = [];
+	for (let existing = target; ; existing = dirname(existing)) {
+		try {
+			return join(realpathSync(existing), ...missing.reverse());
+		} catch (err) {
+			const code = (err as NodeJS.ErrnoException).code;
+			if ((code !== "ENOENT" && code !== "ENOTDIR") || dirname(existing) === existing) return undefined;
+			missing.push(basename(existing));
+		}
+	}
+}
+
+/**
+ * Block any tool outside `CONFINED_TOOLS`, and any path that does not resolve
+ * inside `root`. The subagent extension sets the root for isolated agents, whose
+ * input is hostile code that may try to steer them towards credentials.
+ *
+ * Pi's grep (rg) and find (fd) do not follow symlinks while walking a tree, so
+ * checking the starting path covers the walk.
+ */
+function confinementDecision(tool: string, input: Record<string, unknown>, cwd: string, root: string): PolicyDecision | undefined {
+	if (!CONFINED_TOOLS.includes(tool)) {
+		return { ask: false, reason: `tool "${tool}" is not available while confined to ${root}` };
+	}
+	const requested = resolveTarget(toolPath((input.path as string | undefined) ?? "."), cwd);
+	const target = canonicalPath(requested);
+	const canonicalRoot = canonicalPath(root);
+	const inside =
+		target !== undefined &&
+		canonicalRoot !== undefined &&
+		(target === canonicalRoot || target.startsWith(canonicalRoot.endsWith(sep) ? canonicalRoot : `${canonicalRoot}${sep}`));
+	return inside ? undefined : { ask: false, reason: `path outside the confinement root ${root}`, blockedAccess: requested };
+}
+
 // --- Bash command inspection ----------------------------------------------
 
 /**
@@ -527,6 +573,11 @@ export interface PolicyDecision {
 }
 
 export function policyDecision(tool: string, input: Record<string, unknown>, cwd: string): PolicyDecision | undefined {
+	const confineRoot = process.env.PI_CONFINE_ROOT;
+	if (confineRoot) {
+		const confined = confinementDecision(tool, input, cwd, confineRoot);
+		if (confined) return confined;
+	}
 	if (["read", "write", "edit", "grep"].includes(tool)) {
 		const path = toolPath((input.path as string | undefined) ?? ".");
 		const secret = zeroAccessMatch(path, cwd);

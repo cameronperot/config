@@ -1,6 +1,6 @@
 # Pi Sub-Agents
 
-Ten sub-agent definitions for the Pi coding harness, loaded by this repo's [subagent extension](../extensions/subagent/index.ts). `install.py` deploys the definitions to `~/.pi/agent/agents/` and the extension to `~/.pi/agent/extensions/subagent/`. The `agents` directory is included in the `.pi/agent` scope in `dotfiles.yaml`.
+Eleven sub-agent definitions for the Pi coding harness, loaded by this repo's [subagent extension](../extensions/subagent/index.ts). `install.py` deploys the definitions to `~/.pi/agent/agents/` and the extension to `~/.pi/agent/extensions/subagent/`. The `agents` directory is included in the `.pi/agent` scope in `dotfiles.yaml`.
 
 ## How the extension runs agents
 
@@ -12,12 +12,13 @@ pi --mode json -p --no-session [--model <model>] [--thinking <level>] [--tools <
 
 Consequences for the agent files:
 
-- Frontmatter fields the extension reads: `name` and `description` (required strings) and `tools` / `model` (optional). Any other field (e.g. `thinking`, `systemPromptMode`) is ignored.
+- Frontmatter fields the extension reads: `name` and `description` (required strings) and `tools` / `model` / `isolated` (optional). Any other field (e.g. `thinking`, `systemPromptMode`) is ignored. A non-boolean `isolated` skips the file with a warning rather than running the agent unisolated.
 - `description` is what the parent agent sees when deciding which agent to delegate to — keep it specific about when to use the agent and what it returns.
 - The markdown body is written to a temporary file and appended to Pi's system prompt. AGENTS.md context files, skills, and extensions still load; this README is not appended as shared agent instructions.
 - `model` is passed through to Pi, including any `:<thinking>` suffix. Without a `model` field, the extension passes the dispatching session's model and thinking level. With a model pin, it does not separately pass `--thinking`. There is no dedicated `thinking` frontmatter field.
 - `tools` is a strict allowlist over built-in, extension, and custom tools. Names that aren't registered are silently ignored (they do not cause an error).
 - Agents run in the dispatching session's working directory, or an explicit `cwd` per task. Separate processes share the workspace; they do not get separate checkouts or filesystems.
+- `isolated: true` is for agents that read hostile content. The child additionally gets `--no-context-files --no-skills --no-prompt-templates --no-extensions --no-mcp --no-approve`, loads only `~/.pi/agent/extensions/permission-gate.ts` through `-e`, and runs with `PI_CONFINE_ROOT` set to its cwd, so the guard blocks every tool except `read`, `grep`, `find` and `ls` and every path that does not resolve (symlinks included) inside that directory. The extension refuses to start an isolated agent without an explicit `cwd`, a `tools` list, or the deployed guard. MCP tools survive a plain `--tools` allowlist, which is why `--no-mcp` is part of isolation.
 - None of these definitions grants `todo`, `questionnaire`, or `subagent`. Children return material questions and suggested handoffs in their final output; the parent handles interaction and further delegation.
 
 ## Install
@@ -38,9 +39,10 @@ Consequences for the agent files:
 | debugger | read, grep, find, ls, bash, edit | Yes (existing files only) | Reproduce → isolate → fix one bug using py-debug |
 | reviewer | read, grep, find, ls, bash | No | Independent severity-ranked review |
 | security-auditor | read, grep, find, ls, bash | No | Vulnerability audit with attack scenarios |
+| malware-reviewer | read, grep, find, ls (isolated) | No | Static review of staged untrusted code for malicious behavior |
 | pr-summarizer | read, grep, find, ls, bash | No | PR/commit summary from git diff |
 
-`scout`, `docs-researcher`, `test-runner`, and `pr-summarizer` pin `openrouter/z-ai/glm-5.3-flash:low`; `engineer` and `linter` pin `openrouter/z-ai/glm-5.3-flash:max`; `planner`, `debugger`, `reviewer`, and `security-auditor` pin `openrouter/z-ai/glm-5.3:high`. These are configured model choices, not a guarantee of provider availability. Remove `model:` to inherit the dispatching session's model and thinking level.
+`scout`, `docs-researcher`, `test-runner`, and `pr-summarizer` pin `openrouter/z-ai/glm-5.3-flash:low`; `engineer` and `linter` pin `openrouter/z-ai/glm-5.3-flash:max`; `planner`, `debugger`, `reviewer`, `security-auditor`, and `malware-reviewer` pin `openrouter/z-ai/glm-5.3:high`. These are configured model choices, not a guarantee of provider availability. Remove `model:` to inherit the dispatching session's model and thinking level.
 
 ## Dev-container boundaries
 

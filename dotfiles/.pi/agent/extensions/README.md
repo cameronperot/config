@@ -10,7 +10,7 @@ The extensions themselves, by what they do:
   - [Guard policy](#guard-policy) — the `guard-rules.json` classes they enforce
 - [Tools](#tools) — `built-in-tool-renderer.ts`, `todo.ts`, `questionnaire.ts`
 - [Workflow](#workflow) — `preset.ts`, `tools.ts`, `handoff.ts`, `commands.ts`, `subagent/`
-  - [Subagent roles](#subagent-roles) — where `subagent/` reads its agent definitions (ten, in `~/.pi/agent/agents/`)
+  - [Subagent roles](#subagent-roles) — where `subagent/` reads its agent definitions (eleven, in `~/.pi/agent/agents/`)
 - [Worktree](#worktree) — `worktree.ts`
 - [Display](#display) — `notify.ts`, `system-prompt-header.ts`, `system-prompt-dump.ts.disabled`
 - [Context](#context) — `rules-loader.ts`, `shake.ts`
@@ -29,7 +29,7 @@ The guards are the *mechanism*; the policy they enforce is data, in [`guard-rule
 
 | Extension | What it does | Registers |
 |---|---|---|
-| `permission-gate.ts` | Enforces path and command policy for `read`, `write`, `edit`, `grep` and `bash`, using `shared/rules.ts`. Hard blocks win; otherwise one confirmation lists all reasons. | — |
+| `permission-gate.ts` | Enforces path and command policy for `read`, `write`, `edit`, `grep` and `bash`, using `shared/rules.ts`, plus confinement while `PI_CONFINE_ROOT` is set. Hard blocks win; otherwise one confirmation lists all reasons. | — |
 | `approve-gate.ts` | Two opt-in modes, both off by default: `/approve` confirms every `write`/`edit`, `/approve-all` confirms every tool bar the read-only ones. | `/approve`, `/approve-all` |
 
 `permission-gate.ts` is the single policy-enforcement extension. `approve-gate.ts` adds optional confirmations for otherwise permitted side effects and uses the same policy decision implementation to defer to policy blocks or confirmations. Neither optional mode prompts for `read`, `grep`, `find`, `ls`, `todo` or `questionnaire`. `/approve-all` gates every `bash` call, including commands that only read.
@@ -46,6 +46,8 @@ Every block and every answered confirmation — including a blocked `read` — i
 - Recursive `grep` or shell searches can read protected files without naming them as the search target. Paths are normalized the way Pi's file tools resolve them, but symlinks are not followed. Filename guards cannot identify secrets in otherwise permitted files such as `.envrc` or `server.pem`.
 - Secrets held in **environment variables** cannot be protected at all. The `bash` tool inherits the process environment and `echo $TOKEN` is indistinguishable from any other `echo`. Anything in the environment is readable by the agent; treat it that way when deciding what to export.
 - Overriding a built-in tool does **not** bypass the guards: `tool_call` fires on the tool *name*, before execution, regardless of which implementation backs it.
+
+**Confinement.** While the process starts with `PI_CONFINE_ROOT` set (the subagent extension sets it for `isolated` agents), the guard hard-blocks every tool other than `read`, `grep`, `find` and `ls`, and every path for those four that does not resolve inside the root. Paths are canonicalized with `realpath` through their longest existing prefix, so a symlink inside the root cannot name a file outside it; Pi's `grep` (rg) and `find` (fd) do not follow links while walking, so checking the starting path covers the walk. A path that cannot be resolved for a reason other than not existing is blocked. The zero-access, read-only and no-delete classes still apply inside the root. This is a policy check in the same process as the agent, not an OS boundary; it relies on the child having no shell and no other extensions.
 
 ## Guard policy
 
@@ -136,9 +138,9 @@ Two consequences to plan around. Rewriting an old message invalidates the provid
 
 ## Subagent roles
 
-`subagent/` reads its agent definitions from `~/.pi/agent/agents/*.md` (user scope) and the nearest `.pi/agents/` directory up the tree (project scope), outside this directory. Ten roles are defined in `~/.pi/agent/agents/` — scout, docs-researcher, planner, engineer, linter, test-runner, debugger, reviewer, security-auditor, pr-summarizer — matching the descriptions in `../AGENTS.md`; tool grants, model pins and output contracts are tabulated in [`../agents/README.md`](../agents/README.md). On a name conflict under the `both` scope, the project definition wins.
+`subagent/` reads its agent definitions from `~/.pi/agent/agents/*.md` (user scope) and the nearest `.pi/agents/` directory up the tree (project scope), outside this directory. Eleven roles are defined in `~/.pi/agent/agents/` — scout, docs-researcher, planner, engineer, linter, test-runner, debugger, reviewer, security-auditor, malware-reviewer, pr-summarizer — matching the descriptions in `../AGENTS.md`; tool grants, model pins and output contracts are tabulated in [`../agents/README.md`](../agents/README.md). On a name conflict under the `both` scope, the project definition wins.
 
-A `tools:` list in frontmatter becomes the child's `--tools` allowlist, so a role without `subagent` cannot recurse and a role without `bash` cannot run commands. A `model:` string is passed to the child as `--model` and needs the provider prefix (`provider/model`) — all ten roles pin one.
+A `tools:` list in frontmatter becomes the child's `--tools` allowlist, so a role without `subagent` cannot recurse and a role without `bash` cannot run commands. A `model:` string is passed to the child as `--model` and needs the provider prefix (`provider/model`) — all eleven roles pin one. `isolated: true` starts the child without context files, skills, prompt templates, extensions or MCP, loads only `permission-gate.ts`, and confines its file tools to its cwd through `PI_CONFINE_ROOT`; see [`../agents/README.md`](../agents/README.md).
 
 ## npm packages
 
