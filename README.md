@@ -1,6 +1,6 @@
 # Development Environment
 
-Configuration and setup scripts for a Linux development environment built around Zsh, tmux, Neovim, and ranger, with additional dotfiles for sway/i3, kitty, and related desktop tooling. Also includes a [dev container](dev-container/README.md) for sandboxed LLM-assisted coding and instructions for a [KVM/QEMU dev VM](dev-vm/README.md).
+Configuration and setup scripts for a Linux development environment built around Zsh, tmux, Neovim, and ranger, with additional dotfiles for sway/i3, kitty, Ghostty, and related desktop tooling. Also includes a [dev container](dev-container/README.md) for sandboxed LLM-assisted coding and instructions for a [KVM/QEMU dev VM](dev-vm/README.md).
 
 ## Layout
 
@@ -53,6 +53,7 @@ The installer preserves existing `~/.gitconfig`, `~/.config/sway`, `~/.config/wa
 | [VS Code](docs/vscode.md) | Neovim integration, Python, notebooks, and host-specific paths |
 | [ranger](docs/ranger.md) | Fuzzy selection, previews, and file-opening rules |
 | [kitty](docs/kitty.md) | Terminal appearance, windows, tabs, clipboard, and hints |
+| [Ghostty](docs/ghostty.md) | Kitty-compatible terminal settings, shortcuts, and migration differences |
 | [Desktop](docs/desktop.md) | Sway/i3 bindings, status bars, locking, and host-specific setup |
 | [Compose](docs/compose.md) | Greek letters, accents, subscripts, and mathematical symbols |
 | [Git and worktrees](docs/git.md) | Identity, signing, delta, and the git-bareify layout |

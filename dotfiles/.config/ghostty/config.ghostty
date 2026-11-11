@@ -1,0 +1,101 @@
+# Linux, Ghostty 1.3.1+; mappings and limitations: docs/ghostty.md
+# Font size 12 and background #282c34 already match the Linux defaults
+font-family = JetBrainsMonoNL Nerd Font
+foreground = #dddddd
+background-opacity = 0.90
+selection-foreground = #000000
+selection-background = #fffacd
+faint-opacity = 0.75
+
+# Kitty's ANSI palette differs from Ghostty's defaults
+palette = 0=#000000
+palette = 1=#cc0403
+palette = 2=#19cb00
+palette = 3=#cecb00
+palette = 4=#0d73cc
+palette = 5=#cb1ed1
+palette = 6=#0dcdcd
+palette = 7=#dddddd
+palette = 8=#767676
+palette = 9=#f2201f
+palette = 10=#23fd00
+palette = 11=#fffd00
+palette = 12=#1a8fff
+palette = 13=#fd28ff
+palette = 14=#14ffff
+palette = 15=#ffffff
+
+# Reverse-video block cursor, including at shell prompts
+cursor-color = cell-foreground
+cursor-text = cell-background
+cursor-style-blink = false
+shell-integration-features = no-cursor
+
+window-padding-x = 0
+window-padding-y = 0
+window-padding-balance = true
+unfocused-split-opacity = 1
+split-divider-color = #cccccc
+gtk-tabs-location = bottom
+window-new-tab-position = end
+confirm-close-surface = false
+
+# Kitty's plain new_window/new_tab actions do not follow the active shell's cwd
+window-inherit-working-directory = false
+tab-inherit-working-directory = false
+split-inherit-working-directory = false
+
+# Byte budget per pane, not an exact translation of 100,000 lines
+scrollback-limit = 100000000
+mouse-scroll-multiplier = discrete:5
+clipboard-read = deny
+clipboard-trim-trailing-spaces = false
+
+# Copy/paste, new-tab and previous/next-tab shortcuts already match on Linux
+keybind = ctrl+shift+s=paste_from_selection
+keybind = ctrl+shift+arrow_up=scroll_page_lines:-1
+keybind = ctrl+shift+k=scroll_page_lines:-1
+keybind = ctrl+shift+arrow_down=scroll_page_lines:1
+keybind = ctrl+shift+j=scroll_page_lines:1
+keybind = ctrl+shift+u=scroll_page_up
+keybind = ctrl+shift+d=scroll_page_down
+keybind = ctrl+shift+home=scroll_to_top
+keybind = ctrl+shift+end=scroll_to_bottom
+keybind = ctrl+shift+h=write_scrollback_file:open
+
+keybind = ctrl+shift+enter=new_split:auto
+keybind = ctrl+shift+w=close_surface
+keybind = ctrl+shift+]=goto_split:next
+keybind = ctrl+shift+[=goto_split:previous
+keybind = ctrl+shift+q=close_tab
+keybind = ctrl+shift+.=move_tab:1
+keybind = ctrl+shift+,=move_tab:-1
+keybind = ctrl+shift+alt+t=prompt_tab_title
+
+# Resize in 10-pixel steps; keep other input out of the shell until Escape
+keybind = ctrl+shift+r=activate_key_table:resize
+keybind = resize/arrow_up=resize_split:up,10
+keybind = resize/arrow_down=resize_split:down,10
+keybind = resize/arrow_left=resize_split:left,10
+keybind = resize/arrow_right=resize_split:right,10
+keybind = resize/escape=deactivate_key_table
+keybind = resize/catch_all=ignore
+
+keybind = all:ctrl+shift+equal=increase_font_size:2
+keybind = all:ctrl+shift+plus=increase_font_size:2
+keybind = all:ctrl+shift+numpad_add=increase_font_size:2
+keybind = all:ctrl+shift+minus=decrease_font_size:2
+keybind = all:ctrl+shift+numpad_subtract=decrease_font_size:2
+keybind = all:ctrl+shift+backspace=reset_font_size
+keybind = ctrl+shift+f11=toggle_fullscreen
+keybind = ctrl+shift+f10=toggle_maximize
+keybind = ctrl+shift+f2=open_config
+keybind = ctrl+shift+delete=reset
+
+# Remove Ghostty actions that conflict with unsupported Kitty actions/prefixes
+keybind = ctrl+shift+a=unbind
+keybind = ctrl+shift+e=unbind
+keybind = ctrl+shift+f=unbind
+keybind = ctrl+shift+n=unbind
+keybind = ctrl+shift+o=unbind
+keybind = ctrl+shift+p=unbind

@@ -130,6 +130,8 @@ include:
       - herdr/config.toml
       - herdr-app/keys.json
       - herdr-app/settings.json
+      - path: ghostty/config.ghostty
+        optional: true
       - htop
       - i3/config
       - i3status-rust
