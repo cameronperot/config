@@ -18,6 +18,7 @@ Install Zsh and Git separately; [`install.py`](../install.py) deploys the config
 ## Shell behavior
 
 - Vi editing starts in insert mode. `Esc` enters command mode, shown by a yellow `+`; `i` returns to insert mode.
+- Pasting goes through oh-my-zsh's `bracketed-paste-magic`, which escapes URLs. Zsh 5.9's helper replays pasted text through the current keymap and fails to leave the vi command keymap first, which drops `g` characters when pasting after `Esc`. A `paste-init` hook in `.zshrc` switches to insert mode for the paste, and the helper restores command mode afterwards.
 - The prompt shows user, host, the last two directory components, and Git branch information with `*` for a dirty working tree.
 - History uses `~/.zsh_history`, with a limit of 1,000,000 entries. Completed commands are saved with timestamps and duration; other running shells' commands are not imported automatically. Duplicate entries and excess blanks are removed.
 - Commands containing `password` or `secret`, in any letter case, are excluded from interactive history and the history file. Leading-space commands are omitted from saved history. These rules do not detect arbitrary credentials or remove previously saved entries.

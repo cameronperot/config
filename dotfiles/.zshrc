@@ -44,6 +44,15 @@ zstyle :omz:update mode disabled
     source "$bundle_zsh"
 } || print -u2 -- "zshrc: plugins unavailable; continuing with the basic shell configuration"
 
+# zsh 5.9 bracketed-paste-magic tests $bmp_keymap instead of $bpm_keymap, so it never leaves
+# vicmd before replaying pasted text as keystrokes, where g is a prefix key and pasted g's are
+# lost; the helper saves the keymap before paste-init hooks run and restores it afterwards
+_zsh_paste_viins() {
+    [[ $KEYMAP == vicmd ]] && zle -K viins
+    return 0
+}
+zstyle :bracketed-paste-magic paste-init _zsh_paste_viins
+
 # history-substring-search
 if (( $+widgets[history-substring-search-up] )); then
     bindkey -M vicmd "k" history-substring-search-up
