@@ -13,6 +13,7 @@ The extensions themselves, by what they do:
   - [Subagent roles](#subagent-roles) — where `subagent/` reads its agent definitions (eleven, in `~/.pi/agent/agents/`)
 - [Worktree](#worktree) — `worktree.ts`
 - [Display](#display) — `notify.ts`, `system-prompt-header.ts`, `system-prompt-dump.ts.disabled`
+- [Editor](#editor) — `vim-mode/`
 - [Context](#context) — `rules-loader.ts`, `shake.ts`
 - [Session](#session) — `bookmark.ts`
 - [npm packages](#npm-packages) — `pi-rewind` and `@plannotator/pi-extension`, installed rather than staged here
@@ -117,6 +118,25 @@ Two choices are worth knowing. Glyphs are Nerd Font with no ascii fallback, and 
 | `system-prompt-header.ts` | Status widget showing system prompt length in chars — a watchdog on prompt bloat. | — |
 | `system-prompt-dump.ts.disabled` | **Not loaded** — renamed so Pi's loader skips it. When re-enabled, it appends the **full** system prompt to `~/.pi/agent/system-prompt.log` on every model request; `/system-prompt` prints the current one to standard out. | `/system-prompt` |
 
+## Editor
+
+| Extension | What it does | Registers |
+|---|---|---|
+| `vim-mode/` | Neovim-style modal editing for the prompt editor: a `CustomEditor` subclass (`editor.ts`) drives a pure vim engine (`engine.ts`, `motions.ts`, `textobjects.ts`, `operators.ts`). The prompt starts in insert mode. Normal mode has the motions, insert entries, operators, text objects, counts, `u`, `.` and the unnamed register of Neovim's defaults; visual mode, named registers, redo, `/` search and `{ } R gu gU g~` are not implemented. `j`/`k` browse history, `vv` opens `$EDITOR` and Enter submits. The mode and the pending keys show in the bottom border. | — |
+
+- **Escape.** Insert mode forwards Escape to Pi only when autocomplete is showing or the text starts with `!` after any leading whitespace, so closing autocomplete and leaving bash mode keep working. Any other Escape in insert mode only switches to normal mode, even while a response streams, so leaving insert mode never aborts the run. Normal mode always forwards Escape: it aborts a streaming response (Esc Esc from insert mode), and Esc Esc on an empty idle prompt still opens `/tree`. This is the reverse of the shipped `modal-editor.ts`, which swallowed Escape.
+- **Public API only.** The extension touches no private member of Pi's `Editor`; typechecking against the pinned Pi version and the adapter tests catch an incompatible upgrade. The cost is that every normal-mode edit is applied with `setText()` plus a bounded walk of `←`, `→`, `ctrl+a` and `ctrl+e` to the new cursor position, which assumes those keys keep their default bindings. A walk that stalls restores the previous text and shows an error notice.
+- **Large pastes show in full.** Pi collapses a large paste into a `[paste #N]` marker whose content only Pi can see, which breaks cursor coordinates and loses the content on any `setText()`. The extension replaces the marker with its content immediately, so what Pi submits is the text on screen. A paste in normal mode switches to insert mode first.
+- **Cursor shapes need `showHardwareCursor`.** The bar (insert), block (normal) and underline (operator pending) are DECSCUSR sequences, which only show while Pi draws the hardware cursor, so `settings.json` sets `showHardwareCursor: true`. The terminal's default shape is restored on shutdown, on process exit, and around `vv`, `ctrl+g` and `ctrl+z`; it is reapplied after those return and on `SIGCONT`.
+- **Clipboard is write-only.** `"+y` (and `"+d`, `"+c`) writes OSC 52 and also fills the unnamed register. `"+p` and `"+P` change nothing and show a notice, because reading the clipboard is not available; Ghostty denies it with `clipboard-read = deny`. Any other register name cancels the command.
+- **One undo history.** Pi's undo key (`ctrl+-`) runs the same undo as `u` in both modes, so the two never diverge. Pi's own undo stack still fills but is unreachable. An insert session is one undo entry, and insert `ctrl+w` and `ctrl+u` start a new one. Text changes Pi makes itself (history recall, `setText` from another extension, the external editor) are single undo entries. `.` replays an insert session only when it held typed text, Backspace, `ctrl+w`, `ctrl+u` or pastes; any other key (an arrow, an accepted completion) makes it report "not repeatable" instead of replaying part of it.
+- **`j` and `k`.** Uncounted, they are Pi's down and up: visual lines, and history at the first and last line. Counted (`3j`) they are logical-line motions capped at the buffer edges, as in Neovim, and never browse history. Under an operator they are linewise.
+- **Put size limit.** A `p` or `P` whose copies total more than 10,000,000 characters (for example `yy999999999p`) changes nothing and shows a warning notice, because materializing that text would exhaust memory and end the Pi process. Neovim has no such limit. `.` replays a put through the same check.
+- **Refuses to share the editor.** If another extension already installed an editor component, `vim-mode/` leaves it in place and shows an error notice. Only one extension can own the prompt editor.
+- **Known gap.** Pressing Escape from insert mode cannot cancel a `!` command that is still running after you re-enter insert mode.
+
+Checks run from `extensions/`: `npm run typecheck`, `npm test` (the engine and adapter tests, plus an oracle that compares every non-Pi case with `nvim --clean --headless`, so `nvim` must be on `PATH`) and `bash vim-mode/test/tmux-smoke.sh` (a scripted tmux session against a real Pi).
+
 ## Context
 
 | Extension | What it does | Registers |
@@ -146,7 +166,7 @@ A `tools:` list in frontmatter becomes the child's `--tools` allowlist, so a rol
 
 | Package | Version | What it does | Registers |
 |---|---|---|---|
-| `pi-rewind` | 0.5.0 | Git-based checkpoints per turn, restore via `/rewind`. MIT, zero dependencies, registers **no tools**. | `/rewind`, Esc Esc |
+| `pi-rewind` | 0.5.0 | Git-based checkpoints per turn, restore via `/rewind`. MIT, zero dependencies, registers **no tools**. | `/rewind` |
 | `@plannotator/pi-extension` | 0.27.9 | File-based plan mode with browser review: the agent drafts the plan as a markdown file and submits it via `plannotator_submit_plan` for annotation and approval. While planning, writes are gated to markdown inside the working directory. Also `/plannotator-review` (code review) and `/plannotator-annotate`. | `plannotator_submit_plan` tool, `/plannotator-plan-mode`, `/plannotator-review`, `/plannotator-annotate`, `/plannotator-last`, `--plan`, Ctrl+Alt+P |
 
 Installed via `packages` in `../settings.json` rather than as a file here.
@@ -183,7 +203,7 @@ These diverge from their `examples/extensions/` counterparts:
 - **`shared/rules.ts`**, **`shared/access-log.ts`**, **`shared/render.ts`**, **`shake.ts`** and **`approve-gate.ts`** — authored here, no upstream equivalent.
 - **`system-prompt-dump.ts`** — authored here, no upstream equivalent. Currently staged as `system-prompt-dump.ts.disabled`, so it does not load. The `context` hook (before every model call) calls `ctx.getSystemPrompt()` and appends the prompt to `~/.pi/agent/system-prompt.log`; `/system-prompt` prints the current prompt to stdout on demand. It writes to a file rather than the TUI/console because the prompt is large and a per-call dump into a live render or a `-p` protocol stream would be unusable. Note `ctx.getSystemPrompt()` reflects Pi's system prompt, not provider-payload rewrites other extensions make later in the chain.
 
-Two shipped examples were staged and later removed: `inline-bash.ts` (its `!{cmd}` expansion runs through `pi.exec`, which is not a `tool_call`, so it bypassed every guard on this page including plan mode) and `modal-editor.ts` (it swallowed the first Escape, breaking single-Escape abort, `doubleEscapeAction` and `pi-rewind`'s Esc Esc at once).
+Two shipped examples were staged and later removed: `inline-bash.ts` (its `!{cmd}` expansion runs through `pi.exec`, which is not a `tool_call`, so it bypassed every guard on this page including plan mode) and `modal-editor.ts` (it swallowed the first Escape, breaking single-Escape abort and `doubleEscapeAction`). [`vim-mode/`](#editor) replaces it.
 
 ## Interactions
 

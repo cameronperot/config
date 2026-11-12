@@ -13,7 +13,7 @@ Project-level files layer on top rather than replacing this: a repo's `AGENTS.md
 | `guard-rules.json` | Path and bash-command policy enforced by `permission-gate.ts` |
 | `plannotator.json` | Plannotator's planning-phase instructions — the prompt spliced in while its planning mode is active |
 | `AGENTS.md` | Prepended to every request; describes the extension tools and the subagent roles |
-| `extensions/` | 18 local extensions plus shared modules — see [`extensions/README.md`](extensions/README.md) |
+| `extensions/` | 17 local extensions plus shared modules — see [`extensions/README.md`](extensions/README.md) |
 
 ## Models and providers
 
@@ -81,7 +81,7 @@ On the verified Pi 0.85.1 runtime, `defaultTools` selects the seven built-ins: `
 
 ## Extensions
 
-Sixteen local extensions load from `extensions/`, plus two npm packages installed via `packages` in `settings.json`.
+Seventeen local extensions load from `extensions/`, plus two npm packages installed via `packages` in `settings.json`.
 
 | Group | Extensions | Adds |
 |---|---|---|
@@ -90,9 +90,10 @@ Sixteen local extensions load from `extensions/`, plus two npm packages installe
 | Workflow | `preset`, `tools`, `handoff`, `commands`, `subagent/` | tool `subagent`; `/preset`, `/tools`, `/handoff`, `/commands` |
 | Git | `worktree` | `/worktree`, `pi --gwt <name>` |
 | Display | `notify`, `system-prompt-header` | — |
+| Editor | `vim-mode/` | — |
 | Context | `rules-loader`, `shake` | `/shake`, `/unshake` |
 | Session | `bookmark` | `/bookmark`, `/unbookmark` |
-| npm | `pi-rewind` 0.5.0, `@plannotator/pi-extension` 0.27.9 | `/rewind`, Esc Esc; `plannotator_submit_plan` tool, `/plannotator-plan-mode`, `/plannotator-review`, `/plannotator-annotate`, `/plannotator-last`, `--plan`, Ctrl+Alt+P |
+| npm | `pi-rewind` 0.5.0, `@plannotator/pi-extension` 0.27.9 | `/rewind`; `plannotator_submit_plan` tool, `/plannotator-plan-mode`, `/plannotator-review`, `/plannotator-annotate`, `/plannotator-last`, `--plan`, Ctrl+Alt+P |
 
 Mechanism, per-request token cost, known gaps, local modifications and extension interactions are in [`extensions/README.md`](extensions/README.md).
 
