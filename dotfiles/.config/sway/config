@@ -289,6 +289,20 @@ exec swaybg -i $HOME/Pictures/background.png -m fill
 # Night light
 exec gammastep-indicator
 
+# Browsers
+assign [app_id="^firefox-default$"] workspace number 1
+exec flatpak run org.mozilla.firefox --no-remote --name firefox-default -p default
+
+assign [app_id="^firefox-proton$"] workspace number 13
+exec flatpak run org.mozilla.firefox --no-remote --name firefox-proton -p proton
+
+assign [app_id="^chromium-browser$"] workspace number 0
+exec chromium-browser --profile-directory="Profile 1"
+
+# Password manager
+for_window [app_id="^org\.keepassxc\.KeePassXC$"] move scratchpad
+exec $HOME/bin/kee
+
 # Network Manager
 exec nm-applet --indicator
 
